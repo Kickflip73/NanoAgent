@@ -1,6 +1,6 @@
 {
   "name": "nano-agent",
-  "version": "0.7.1",
+  "version": "0.8.0",
   "description": "A lightweight, general-purpose AI agent for real work, built with TypeScript and the OpenAI Agents SDK.",
   "license": "MIT",
   "repository": {
@@ -35,6 +35,7 @@
     "knowledge",
     "evals",
     "docs/ARCHITECTURE.md",
+    "NANO.md",
     ".env.example",
     "mcp.json",
     "mcp.example.json",

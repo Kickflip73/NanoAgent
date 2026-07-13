@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.8.0] - 2026-07-14
+
+### Added
+
+- add user-level `~/.nano-agent/NANO.md` and project-level `<workspace>/NANO.md` persistent instructions
+- reload both instruction files before every Agent turn, with explicit project-over-user precedence
+- add `/instructions` discovery and truncation status plus a project `NANO.md` example
+
 ## [0.7.1] - 2026-07-14
 
 ### Fixed

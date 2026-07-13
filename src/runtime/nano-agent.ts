@@ -8,6 +8,7 @@ import {
 import OpenAI from 'openai';
 import type { AppConfig } from '../config.js';
 import { ContextManager, estimateTokens } from '../core/context.js';
+import { GuidanceLoader } from '../core/guidance.js';
 import { MemoryStore } from '../core/memory.js';
 import { PlanStore } from '../core/plan.js';
 import { FileSession } from '../core/session.js';
@@ -27,6 +28,7 @@ export type { AgentMode } from './instructions.js';
 export class NanoAgent {
   private readonly runner: Runner;
   private readonly context: ContextManager;
+  private readonly guidance: GuidanceLoader;
   private readonly memory: MemoryStore;
   private readonly skills: SkillLoader;
   private readonly rag: RagStore;
@@ -45,6 +47,7 @@ export class NanoAgent {
     private model: AgentModel,
     components: {
       context: ContextManager;
+      guidance: GuidanceLoader;
       memory: MemoryStore;
       skills: SkillLoader;
       rag: RagStore;
@@ -56,6 +59,7 @@ export class NanoAgent {
     },
   ) {
     this.context = components.context;
+    this.guidance = components.guidance;
     this.memory = components.memory;
     this.skills = components.skills;
     this.rag = components.rag;
@@ -107,6 +111,7 @@ export class NanoAgent {
     await mcp.connect();
     const agent = new NanoAgent(config, modelRuntime.model, {
       context: new ContextManager(config.historyLimit, config.contextWindow),
+      guidance: new GuidanceLoader(config.workspaceRoot),
       memory,
       skills,
       rag,
@@ -122,15 +127,17 @@ export class NanoAgent {
   async stream(input: string, signal?: AbortSignal) {
     await this.session.cleanupGeneratedSummaries();
     await this.session.repairToolPairs();
-    const [memories, documents, plan, goal, history] = await Promise.all([
+    const [memories, documents, plan, goal, history, guidance] = await Promise.all([
       this.memory.search(input),
       this.rag.search(input, 4, false),
       this.plans.get(),
       this.plans.getGoal(),
       this.session.getItems(),
+      this.guidance.load(),
     ]);
     const instructions = this.context.buildInstructions({
       baseInstructions: `${BASE_INSTRUCTIONS}\n当前模式：${this.currentMode.label}。${this.currentMode.instruction}`,
+      persistentInstructions: guidance.instructions,
       historySummary: this.context.summarizeHistory(history),
       skillCatalog: this.skills.catalog(),
       memories,
@@ -145,6 +152,7 @@ export class NanoAgent {
     const subAgentTools = createSubAgentTools({
       model: this.model,
       tools: this.tools,
+      persistentInstructions: guidance.instructions,
       onEvent: async (agent, eventType) => this.hooks.emit({
         type: 'subagent_event',
         sessionId: this.sessionId,
@@ -223,7 +231,7 @@ export class NanoAgent {
   }
 
   async runtimeInfo() {
-    const sessionSummary = await this.session.summary();
+    const [sessionSummary, guidance] = await Promise.all([this.session.summary(), this.guidance.load()]);
     return {
       provider: this.config.provider,
       model: this.modelName,
@@ -236,7 +244,12 @@ export class NanoAgent {
       memoryCount: (await this.memory.list()).length,
       mcpServers: this.mcpServerNames,
       mcpStatuses: this.mcp.statuses(),
+      guidanceFiles: guidance.files.map((file) => ({ scope: file.scope, path: file.path, truncated: file.truncated })),
     };
+  }
+
+  async guidanceInfo() {
+    return this.guidance.load();
   }
 
   availableModels(): string[] {

@@ -19,6 +19,7 @@ export const COMMANDS = [
   { value: '/tools', description: '列出可用工具' },
   { value: '/mcp', description: '查看 MCP 连接' },
   { value: '/context', description: '查看上下文用量' },
+  { value: '/instructions', description: '查看持久指令文件' },
   { value: '/memories', description: '列出长期记忆' },
   { value: '/plan', description: '查看任务计划' },
   { value: '/goal', description: '查看或设置长期目标' },
@@ -43,6 +44,7 @@ const HELP = `内置命令：
   /tools              列出当前可用工具
   /mcp [reload]       查看或重新连接 MCP Server
   /context            查看上下文、记忆和计划用量
+  /instructions       查看用户级与项目级 NANO.md
   /memories           列出长期记忆
   /plan               查看当前任务计划
   /goal [objective]   查看或设置当前长期目标
@@ -98,6 +100,7 @@ export class CommandHandler {
         `Skills    ${info.skillCount}`,
         `Memories  ${info.memoryCount}`,
         `MCP       ${info.mcpServers.join(', ') || '未连接'}`,
+        `NANO.md   ${info.guidanceFiles.length ? `${info.guidanceFiles.length} 个已加载` : '未配置'}`,
       ].join('\n'));
     }
     if (command === '/model') {
@@ -186,6 +189,13 @@ export class CommandHandler {
         `长期目标  ${info.goal ?? '未设置'}`,
         '更早历史会按 Token Budget 结构化压缩。',
       ].join('\n'));
+    }
+    if (command === '/instructions') {
+      const guidance = await this.agent.guidanceInfo();
+      if (!guidance.files.length) return this.handled('未找到 NANO.md。用户级：~/.nano-agent/NANO.md · 项目级：<workspace>/NANO.md');
+      return this.handled(guidance.files.map((file) =>
+        `${file.scope === 'project' ? '项目' : '用户'}  ${file.path}${file.truncated ? '（已截断）' : ''}`,
+      ).join('\n'));
     }
     if (command === '/memories') {
       const memories = await this.agent.listMemories();

@@ -5,6 +5,7 @@ import type { RagMatch } from '../extensions/rag.js';
 
 export interface ContextParts {
   baseInstructions: string;
+  persistentInstructions?: string;
   historySummary: string;
   skillCatalog: string;
   memories: Memory[];
@@ -40,6 +41,7 @@ export class ContextManager {
 
   buildInstructions(parts: ContextParts): string {
     const candidates = [parts.baseInstructions];
+    if (parts.persistentInstructions) candidates.push(parts.persistentInstructions);
     if (parts.goal) {
       candidates.push([
         `当前长期目标：[${parts.goal.status}] ${parts.goal.objective}`,

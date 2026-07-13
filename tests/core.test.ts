@@ -5,6 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 import type { AgentInputItem } from '@openai/agents';
 import { ContextManager, estimateTokens } from '../src/core/context.js';
+import { GuidanceLoader } from '../src/core/guidance.js';
 import { MemoryStore } from '../src/core/memory.js';
 import { PlanStore } from '../src/core/plan.js';
 import { FileSession } from '../src/core/session.js';
@@ -26,6 +27,23 @@ test('persists sessions and returns the latest items', async () => {
 
   assert.deepEqual(await new FileSession(root, 'demo').getItems(1), [items[1]]);
   assert.deepEqual(await FileSession.list(root), ['demo']);
+});
+
+test('loads user and project NANO.md on every turn with project precedence', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'nano-guidance-'));
+  const userFile = path.join(root, 'home', 'NANO.md');
+  await mkdir(path.dirname(userFile), { recursive: true });
+  await writeFile(userFile, 'Use tabs.');
+  await writeFile(path.join(root, 'NANO.md'), 'Use two spaces.');
+  const loader = new GuidanceLoader(root, userFile);
+
+  const first = await loader.load();
+  assert.deepEqual(first.files.map((file) => file.scope), ['user', 'project']);
+  assert.match(first.instructions, /项目级指令优先于用户级指令/);
+  assert.ok(first.instructions.indexOf('Use two spaces.') < first.instructions.indexOf('Use tabs.'));
+
+  await writeFile(path.join(root, 'NANO.md'), 'Run npm test.');
+  assert.match((await loader.load()).instructions, /Run npm test/);
 });
 
 test('serializes concurrent session writes and keeps an in-process cache', async () => {

@@ -15,6 +15,7 @@ NanoAgent 使用 OpenAI Agents SDK 作为运行内核，覆盖工具调用、流
 - OpenAI Agents SDK 驱动的 Agent Loop
 - OpenAI Responses API 与 DeepSeek OpenAI-compatible API
 - 持久化多轮会话，可新建、切换和恢复
+- 用户级与项目级 `NANO.md` 持久指令，每轮自动加载且项目级优先
 - 按 Token Budget 裁剪历史、结构化压缩旧上下文和动态上下文组装
 - 可检索、可删除的本地长期记忆
 - 兼容 Agent Skills 开放规范的发现、激活、资源读取与热重载
@@ -44,6 +45,7 @@ src/
 ├── config.ts             # 环境配置
 ├── core/
 │   ├── context.ts        # 上下文裁剪、压缩与组装
+│   ├── guidance.ts       # 用户级与项目级 NANO.md
 │   ├── session.ts        # JSON 持久会话
 │   ├── memory.ts         # 长期记忆及工具
 │   ├── plan.ts           # Plan、Goal、Checkpoint 与 Resume
@@ -174,6 +176,7 @@ NanoAgent 始终从 `~/.nano-agent/.env` 读取模型和 API Key 配置，因此
 | `/tools` | 列出当前可用工具 |
 | `/mcp [reload]` | 查看状态或重新连接 MCP Server |
 | `/context` | 查看历史、记忆和计划用量 |
+| `/instructions` | 查看当前加载的用户级和项目级 `NANO.md` |
 | `/memories` | 列出长期记忆 |
 | `/plan` | 查看当前任务计划 |
 | `/goal [objective]` | 查看或设置跨多轮长期目标 |
@@ -235,6 +238,21 @@ NanoAgent 始终从 `~/.nano-agent/.env` 读取模型和 API Key 配置，因此
 颜色只在 TTY 中启用，管道和日志输出不会包含 ANSI 控制符。最终回答会定时增量刷新，并按行渲染 Markdown：标题不再显示 `###`，列表、引用、代码块、表格、粗体、行内代码和链接会转换为适合终端阅读的形式。
 
 Agent 的基础 Instructions 使用“终端优先”输出约束：普通回答默认不超过约 12 行，优先采用少量紧凑段落，避免 Markdown 表格、连续标题、频繁空行和手工空格对齐；列表通常不超过 5 项且每项保持单行。渲染层还会压缩异常的横向空白和连续空行，作为模型输出不稳定时的显示兜底。用户明确要求详细内容时，模型仍可按任务需要展开。
+
+## NANO.md 持久指令
+
+NanoAgent 使用两层纯 Markdown 指令文件，把需要在每次任务中生效的约定附加到 Agent 上下文：
+
+```text
+~/.nano-agent/NANO.md   用户级：个人偏好，适用于所有工作区
+<workspace>/NANO.md     项目级：项目约定，优先级高于用户级
+```
+
+两个文件都会在每一轮任务开始前重新读取，修改后无需重启或新建会话。若两层存在冲突，项目级 `NANO.md` 生效；主 Agent 和受控 SubAgent 都能看到这些指令，但 SubAgent 的只读边界不会被覆盖。空文件会被忽略，单个文件注入上限为 20000 字符，超出时 `/instructions` 会显示截断状态。
+
+适合放入 `NANO.md` 的内容包括构建与测试命令、代码规范、项目结构、常用工作流和回答偏好。一次性的任务要求应留在当前对话，可复用的多步骤流程应写成 Skill，事实和用户偏好则可交给 Memory。仓库中的 [NANO.md](NANO.md) 可作为项目级示例。
+
+该设计参考了 [Codex AGENTS.md](https://developers.openai.com/codex/concepts/customization#agents-guidance)、[Claude Code CLAUDE.md](https://code.claude.com/docs/zh-CN/memory) 和 [OpenClaw workspace bootstrap](https://docs.openclaw.ai/agent-workspace) 的持久上下文模式，同时只保留 NanoAgent 当前需要的两层结构。
 
 ## 长期记忆
 

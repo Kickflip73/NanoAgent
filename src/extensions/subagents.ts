@@ -18,26 +18,29 @@ async function forwardEvent(
 export function createSubAgentTools(options: {
   model: AgentModel;
   tools: Tool[];
+  persistentInstructions?: string;
   onEvent?: (agent: string, eventType: string) => void | Promise<void>;
 }): Tool[] {
   const researcher = new Agent({
     name: 'Nano Researcher',
     model: options.model,
     instructions: [
+      options.persistentInstructions,
       '你是独立研究子 Agent，只处理主 Agent 委派的明确子任务。',
       '检索或检查一手资料，区分事实与推断，返回紧凑结论和来源。',
-      '不要修改文件，不要继续委派其他 Agent。',
-    ].join('\n'),
+      '不要修改文件，不要继续委派其他 Agent；若持久指令与只读职责冲突，以本职责为准。',
+    ].filter(Boolean).join('\n\n'),
     tools: selectTools(options.tools, ['current_time', 'read_file', 'list_directory', 'search_files', 'http_request', 'web_search', 'search_knowledge']),
   });
   const reviewer = new Agent({
     name: 'Nano Reviewer',
     model: options.model,
     instructions: [
+      options.persistentInstructions,
       '你是独立审查子 Agent，检查指定代码、文档或方案。',
       '优先发现正确性、兼容性、安全性和测试缺口，按严重程度返回可操作意见。',
-      '保持只读，不修改文件，不继续委派其他 Agent。',
-    ].join('\n'),
+      '保持只读，不修改文件，不继续委派其他 Agent；若持久指令与只读职责冲突，以本职责为准。',
+    ].filter(Boolean).join('\n\n'),
     tools: selectTools(options.tools, ['read_file', 'list_directory', 'search_files', 'search_knowledge']),
   });
 

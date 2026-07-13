@@ -17,6 +17,7 @@ function fakeAgent(): NanoAgent {
       skillCount: 2,
       memoryCount: 1,
       mcpServers: [],
+      guidanceFiles: [{ scope: 'project', path: '/tmp/demo/NANO.md', truncated: false }],
     }),
     listSessions: async () => ['demo'],
     listSessionSummaries: async () => [{
@@ -49,6 +50,10 @@ function fakeAgent(): NanoAgent {
     mcpServerNames: [],
     mcpStatuses: () => [],
     reloadMcp: async () => [],
+    guidanceInfo: async () => ({
+      files: [{ scope: 'project', path: '/tmp/demo/NANO.md', content: 'Run tests.', truncated: false }],
+      instructions: 'Run tests.',
+    }),
   } as unknown as NanoAgent;
 }
 
@@ -63,10 +68,12 @@ test('handles status and high-frequency inspection commands', async () => {
     assert.equal(await handler.execute('/skills'), 'handled');
     assert.equal(await handler.execute('/memories'), 'handled');
     assert.equal(await handler.execute('/plan'), 'handled');
+    assert.equal(await handler.execute('/instructions'), 'handled');
     assert.match(output.join('\n'), /deepseek-chat/);
     assert.match(output.join('\n'), /Review code/);
     assert.match(output.join('\n'), /uses TS/);
     assert.match(output.join('\n'), /running/);
+    assert.match(output.join('\n'), /NANO\.md/);
   } finally {
     console.log = original;
   }
