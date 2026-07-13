@@ -12,6 +12,13 @@ export interface SelectItem {
   detail?: string;
 }
 
+export interface RuntimeStatus {
+  mode: string;
+  model: string;
+  contextUsed: number;
+  contextWindow: number;
+}
+
 type Key = { name?: string; ctrl?: boolean; shift?: boolean; sequence?: string };
 
 const clearLine = '\r\x1b[2K';
@@ -19,8 +26,11 @@ const selectionCursor = '\x1b[38;2;0;0;0m›\x1b[0m';
 
 function displayWidth(value: string): number {
   const plain = value.replace(/\x1b\[[0-9;]*m/g, '');
-  return Array.from(plain).reduce((width, character) =>
-    width + (/[^\u0000-\u00ff]/.test(character) ? 2 : 1), 0);
+  return Array.from(plain).reduce((width, character) => {
+    const codePoint = character.codePointAt(0) ?? 0;
+    const wide = codePoint >= 0x1f300 || /[\u1100-\u115f\u2e80-\ua4cf\uac00-\ud7a3\uf900-\ufaff\ufe10-\ufe19\ufe30-\ufe6f\uff00-\uff60\uffe0-\uffe6]/u.test(character);
+    return width + (wide ? 2 : 1);
+  }, 0);
 }
 
 export class InteractiveTerminal {
@@ -31,8 +41,13 @@ export class InteractiveTerminal {
   private completionIndex = 0;
   private busy = false;
   private transient = '';
+  private runtime: RuntimeStatus = { mode: '标准', model: '未配置', contextUsed: 0, contextWindow: 0 };
+  private statusFrame = 0;
+  private statusTimer?: NodeJS.Timeout;
+  private queued: string[] = [];
   private outputOpen = false;
-  private suggestionRows = 0;
+  private renderedRows = 0;
+  private started = false;
   private closed = false;
   private selectState?: {
     items: SelectItem[];
@@ -48,6 +63,7 @@ export class InteractiveTerminal {
   ) {}
 
   start(handlers: { onLine: (line: string) => void; onEscape: () => void; onExit: () => void }): void {
+    this.started = true;
     readline.emitKeypressEvents(this.input);
     if (this.input.isTTY) this.input.setRawMode(true);
     this.input.resume();
@@ -121,7 +137,8 @@ export class InteractiveTerminal {
   write(chunk: string, stream: WriteStream = this.output): void {
     if (this.closed) return;
     if (chunk.startsWith(clearLine) && !chunk.includes('\n')) {
-      this.transient = chunk === clearLine ? '' : chunk.slice(clearLine.length);
+      const plain = chunk.slice(clearLine.length).replace(/\x1b\[[0-9;]*m/g, '').trim();
+      this.transient = chunk === clearLine ? '' : plain.replace(/^\S+\s*/, '');
       this.redraw();
       return;
     }
@@ -137,9 +154,38 @@ export class InteractiveTerminal {
     this.write(`${message}\n`);
   }
 
+  recordInput(input: string): void {
+    const text = input.replace(/\x1b/g, '').replace(/\s+/g, ' ').trim();
+    if (!text) return;
+    const marker = this.output.isTTY ? '\x1b[38;2;148;166;173m>\x1b[0m' : '>';
+    this.write(`${marker} ${text}\n`);
+  }
+
   setBusy(value: boolean): void {
+    if (this.busy === value) return;
     this.busy = value;
-    if (!value) this.transient = '';
+    if (this.statusTimer) clearInterval(this.statusTimer);
+    this.statusTimer = undefined;
+    if (value) {
+      this.statusTimer = setInterval(() => {
+        this.statusFrame += 1;
+        this.redraw();
+      }, 80);
+      this.statusTimer.unref();
+    } else {
+      this.transient = '';
+      this.statusFrame = 0;
+    }
+    this.redraw();
+  }
+
+  setRuntimeStatus(status: RuntimeStatus): void {
+    this.runtime = status;
+    this.redraw();
+  }
+
+  setQueue(items: string[]): void {
+    this.queued = [...items];
     this.redraw();
   }
 
@@ -161,8 +207,9 @@ export class InteractiveTerminal {
 
   close(): void {
     if (this.closed) return;
-    this.closed = true;
+    if (this.statusTimer) clearInterval(this.statusTimer);
     this.eraseUi();
+    this.closed = true;
     this.output.write('\n');
     if (this.input.isTTY) this.input.setRawMode(false);
     this.input.pause();
@@ -198,49 +245,120 @@ export class InteractiveTerminal {
   }
 
   private redraw(): void {
-    if (this.closed) return;
+    if (this.closed || !this.started) return;
     this.eraseUi();
     this.draw();
   }
 
   private eraseUi(): void {
-    if (this.closed) return;
+    if (this.closed || !this.started) return;
     this.output.write(clearLine);
-    for (let row = 0; row < this.suggestionRows; row += 1) this.output.write('\x1b[1B\r\x1b[2K');
-    if (this.suggestionRows) this.output.write(`\x1b[${this.suggestionRows}A`);
-    this.suggestionRows = 0;
+    for (let row = 1; row < this.renderedRows; row += 1) this.output.write('\x1b[1A\r\x1b[2K');
+    this.renderedRows = 0;
   }
 
   private draw(): void {
-    if (this.closed) return;
+    if (this.closed || !this.started) return;
+    const rows: string[] = [];
+    rows.push(...this.queued.map((item) => `\x1b[2m↳ 排队  ${this.compactQueueItem(item)}\x1b[0m`));
+
     if (this.selectState) {
       const state = this.selectState;
       const visible = this.window(state.items, state.index, 7);
-      this.output.write(`${state.title} · ↑↓ 移动，Enter 确认，Esc 取消`);
+      rows.push(`${state.title} · ↑↓ 移动，Enter 确认，Esc 取消`);
       for (const { item, index } of visible) {
         const marker = index === state.index ? selectionCursor : ' ';
-        this.output.write(`\n${marker} ${item.label}${item.detail ? `  \x1b[2m${item.detail}\x1b[0m` : ''}`);
+        rows.push(`${marker} ${item.label}${item.detail ? `  \x1b[2m${item.detail}\x1b[0m` : ''}`);
       }
-      this.suggestionRows = visible.length;
-      this.output.write(`\x1b[${visible.length}A\r\x1b[999C`);
+      rows.push(this.statusLine());
+      const input = this.inputBox();
+      rows.push(input.line);
+      this.output.write(rows.join('\n'));
+      this.renderedRows = rows.length;
+      this.output.write(`\r\x1b[${input.cursorColumn}C`);
       return;
     }
 
-    const status = this.transient || (this.busy ? '\x1b[38;2;126;156;196m⠿ 运行中\x1b[0m' : '');
-    const prefix = `${status ? `${status}  ` : ''}你> `;
-    const value = this.buffer.join('');
-    this.output.write(`${prefix}${value}`);
     const suggestions = this.suggestions;
     const visible = this.window(suggestions, this.completionIndex, 7);
     for (const { item, index } of visible) {
       const active = index === this.completionIndex;
-      this.output.write(`\n${active ? selectionCursor : ' '} ${item.value.padEnd(12)} \x1b[2m${item.description}\x1b[0m`);
+      rows.push(`${active ? selectionCursor : ' '} ${item.value.padEnd(12)} \x1b[2m${item.description}\x1b[0m`);
     }
-    this.suggestionRows = visible.length;
-    if (visible.length) this.output.write(`\x1b[${visible.length}A`);
-    this.output.write('\r');
-    const position = displayWidth(prefix) + displayWidth(this.buffer.slice(0, this.cursor).join(''));
-    if (position) this.output.write(`\x1b[${position}C`);
+    rows.push(this.statusLine());
+    const input = this.inputBox();
+    rows.push(input.line);
+    this.output.write(rows.join('\n'));
+    this.renderedRows = rows.length;
+    this.output.write(`\r\x1b[${input.cursorColumn}C`);
+  }
+
+  private inputBox(): { line: string; cursorColumn: number } {
+    const width = Math.max(24, (this.output.columns ?? 80) - 1);
+    const prefix = '┊ > ';
+    const suffix = ' ┊';
+    const available = width - displayWidth(prefix) - displayWidth(suffix);
+    let start = this.cursor;
+    while (start > 0 && displayWidth(this.buffer.slice(start - 1, this.cursor).join('')) <= available) start -= 1;
+    if (displayWidth(this.buffer.slice(start, this.cursor).join('')) > available) start += 1;
+    const visible: string[] = [];
+    let used = 0;
+    for (const character of this.buffer.slice(start)) {
+      const characterWidth = displayWidth(character);
+      if (used + characterWidth > available) break;
+      visible.push(character);
+      used += characterWidth;
+    }
+    const value = visible.join('');
+    const padding = ' '.repeat(Math.max(0, available - displayWidth(value)));
+    return {
+      line: `\x1b[38;2;145;151;158m┊\x1b[0m > ${value}${padding} \x1b[38;2;145;151;158m┊\x1b[0m`,
+      cursorColumn: displayWidth(prefix) + displayWidth(this.buffer.slice(start, this.cursor).join('')),
+    };
+  }
+
+  private compactQueueItem(value: string): string {
+    const clean = value.replace(/\s+/g, ' ').trim();
+    const width = Math.max(20, (this.output.columns ?? 80) - 14);
+    if (displayWidth(clean) <= width) return clean;
+    const visible: string[] = [];
+    let used = 0;
+    for (const character of Array.from(clean)) {
+      const characterWidth = displayWidth(character);
+      if (used + characterWidth > width - 3) break;
+      visible.push(character);
+      used += characterWidth;
+    }
+    return `${visible.join('')}...`;
+  }
+
+  private statusLine(): string {
+    const frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    const icon = this.busy ? frames[this.statusFrame % frames.length] : '◇';
+    const state = this.busy ? (this.transient || '运行中') : '就绪';
+    const model = this.truncateDisplay(this.runtime.model, 24);
+    const text = `${icon} ${state} · 模式 ${this.runtime.mode} · 模型 ${model} · 上下文 ${this.formatTokens(this.runtime.contextUsed)}/${this.formatTokens(this.runtime.contextWindow)}`;
+    const color = this.busy ? '126;156;196' : '145;151;158';
+    return `\x1b[38;2;${color}m${this.truncateDisplay(text, Math.max(24, (this.output.columns ?? 80) - 1))}\x1b[0m`;
+  }
+
+  private formatTokens(value: number): string {
+    if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(value >= 10_000_000 ? 0 : 1)}m`;
+    if (value >= 1_000) return `${(value / 1_000).toFixed(value >= 10_000 ? 0 : 1)}k`;
+    return String(value);
+  }
+
+  private truncateDisplay(value: string, width: number): string {
+    if (displayWidth(value) <= width) return value;
+    const visible: string[] = [];
+    let used = 0;
+    for (const character of Array.from(value)) {
+      const characterWidth = displayWidth(character);
+      if (used + characterWidth > width - 3) break;
+      visible.push(character);
+      used += characterWidth;
+    }
+    return `${visible.join('')}...`;
   }
 
   private window<T>(items: T[], selected: number, size: number): Array<{ item: T; index: number }> {

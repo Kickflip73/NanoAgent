@@ -23,6 +23,10 @@ NanoAgent 使用 OpenAI Agents SDK 作为运行内核，在少量代码中展示
 - 没有 Embedding Key 时自动使用轻量词法检索
 - 多步骤任务 Plan
 - Spinner、分块事件、Reasoning Summary 和最终回答流式输出
+- 非阻塞输入队列、Esc 中止和永久用户输入记录
+- 标准、规划、编码、调研四种运行模式
+- 从仅答案到完整工具详情的四级终端事件过滤
+- 常驻状态栏、内容摘要会话选择器和斜杠命令补全
 - Claude Code 风格的低饱和事件配色与终端友好 Markdown 渲染
 - 本地 JSONL Trace 和最小 Retrieval Eval
 
@@ -32,6 +36,7 @@ NanoAgent 使用 OpenAI Agents SDK 作为运行内核，在少量代码中展示
 src/
 ├── index.ts              # CLI 与运行事件消费
 ├── commands.ts           # 斜杠命令解析与执行
+├── interactive.ts        # 输入框、队列、选择器与常驻状态栏
 ├── agent.ts              # Agent 组装和一次运行
 ├── config.ts             # 环境配置
 ├── core/
@@ -129,11 +134,16 @@ NanoAgent 始终从 `~/.nano-agent/.env` 读取模型和 API Key 配置，因此
 |---|---|---|
 | `MAX_TURNS` | `200` | 单次 Agent 运行最大轮数 |
 | `HISTORY_LIMIT` | `40` | 送入模型的近期历史条数；会从完整用户轮次开始截取 |
+| `CONTEXT_WINDOW` | OpenAI `400000` / DeepSeek `128000` | 状态栏用于展示上下文占用的 Token 窗口 |
+| `OUTPUT_LEVEL` | `tools` | 启动时的事件展示等级：`answer`、`thinking`、`tools`、`trace` |
+| `OPENAI_MODELS` / `DEEPSEEK_MODELS` | 内置常用模型 | `/model` 选择器追加的逗号分隔模型列表 |
+| `AGENT_SESSION` | `default` | 启动时使用的本地会话 ID |
 | `AGENT_WORKSPACE` | 当前目录 | 文件、Shell、Skill 和知识库的工作区 |
 | `AGENT_DATA_DIR` | `<workspace>/.nano-agent` | 会话、记忆、计划、索引和 Trace 目录 |
 | `AGENT_SKILLS_DIR` | `<workspace>/skills` | Skill 根目录 |
 | `MCP_CONFIG` | `<workspace>/mcp.json` | MCP Server 配置文件 |
 | `EMBEDDING_MODEL` | `text-embedding-3-small` | RAG Embedding 模型 |
+| `DOTENV_CONFIG_PATH` | `~/.nano-agent/.env` | 显式指定统一环境配置文件 |
 
 ## 会话与上下文
 
@@ -142,6 +152,8 @@ NanoAgent 始终从 `~/.nano-agent/.env` 读取模型和 API Key 配置，因此
 | 命令 | 作用 |
 |---|---|
 | `/model [name]` | 查看或切换当前 Provider 下的模型；无参数时使用选择器 |
+| `/mode [name]` | 在标准、规划、编码和调研模式之间切换 |
+| `/output [level]` | 切换终端执行事件的展示详细度 |
 | `/new [id]` | 新建并切换会话 |
 | `/sessions` | 按内容摘要列出最近对话，使用 ↑↓ 和 Enter 切换 |
 | `/switch <id>` | 切换已有会话 |
@@ -161,15 +173,34 @@ NanoAgent 始终从 `~/.nano-agent/.env` 读取模型和 API Key 配置，因此
 
 完整会话保存在 `.nano-agent/sessions/`。发送给模型时会从最近的完整用户轮次开始保留约 `HISTORY_LIMIT` 条历史，避免拆散工具调用与工具结果；更早的人类对话压缩到动态 Instructions，且不会反向写入会话。完整原始历史不会因此删除。
 
-交互模式不会阻塞输入：Agent 执行时仍可继续提交消息，消息会进入 FIFO 队列并在当前任务结束后依次执行。按 `Esc` 可停止当前任务，队列中的后续消息不受影响。输入 `/` 会展示命令面板，使用黑色活动光标配合 `↑` / `↓` 选择、`Tab` 补全。`/new`、`/clear` 和会话切换会清理终端画面，并重新展示包含机器人标识、模型、对话、扩展和工作区的项目 Banner。
+交互模式不会阻塞输入：Agent 执行时仍可继续提交消息，消息会进入 FIFO 队列并在当前任务结束后依次执行。按 `Esc` 可停止当前任务，队列中的后续消息不受影响。输入 `/` 会展示命令面板，使用黑色活动光标配合 `↑` / `↓` 选择、`Tab` 补全。`/new`、`/clear` 和会话切换会清理终端画面，并重新展示精简的版本、介绍、模型、对话、扩展和工作区信息。
+
+输入框固定在终端交互区域的最底部，以单行虚线方框和 `>` 提示符展示。输入框正上方是常驻状态栏：空闲时显示就绪状态，执行时显示动态 Spinner，并持续展示当前模式、模型以及估算上下文 Token/窗口。如果存在等待消息，更上方会常驻显示 FIFO 队列中的每条对话内容，过长内容以 `...` 省略，消息开始执行后自动从队列区域移除。
+
+用户提交的内容不会随输入框清空而消失：空闲消息开始执行时会立即以 `> 内容` 写入终端对话历史；执行期间提交的消息先常驻等待队列，轮到执行时再移入历史区，避免插入并打断上一条流式回答。
+
+内置模式会直接补充 Agent 的运行指令：`standard` 平衡速度与完整性，`plan` 强调先规划后执行，`code` 强调检查、修改和验证代码，`research` 强调多来源检索与交叉验证。`/mode` 无参数时可通过选择器切换。
+
+终端事件支持四个轻量输出等级，可通过 `/output` 选择或使用 `OUTPUT_LEVEL` 设置启动默认值：
+
+| 等级 | 展示内容 |
+|---|---|
+| `answer` | 只流式显示最终答案 |
+| `thinking` | 增加模型公开的思考过程 |
+| `tools` | 增加工具调用名称，不展示参数和结果；默认等级 |
+| `trace` | 展示输入任务、思考、工具参数和工具完整结果 |
+
+`trace` 适合学习和排查 Agent 执行过程，例如 `read_file` 会显示读取到的文件内容。为避免意外输出超大内容，单条详情最多展示 20000 个字符；此限制只作用于终端显示，不改变工具实际返回给模型的数据。
 
 `/model` 默认展示当前 Provider 的常用模型，也会合并 `OPENAI_MODELS` 或 `DEEPSEEK_MODELS` 中以逗号分隔的自定义模型名称。`/model <name>` 可以直接切换未列出的兼容模型；切换只影响当前进程，不修改 `.env`。
 
 ## 终端展示
 
-交互输出使用低饱和前景色和简洁符号区分事件，并在事件块之间保留空行：
+交互输出使用低饱和前景色和简洁符号区分事件，并在事件块之间保留空行。下面是 `trace` 详细等级的示例：
 
 ```text
+> 读取 package.json 并介绍项目
+
 ✦ 思考
 需要读取项目配置。
 
@@ -185,7 +216,11 @@ NanoAgent 始终从 `~/.nano-agent/.env` 读取模型和 API Key 配置，因此
 ✓ 完成  2.1s
 ```
 
+默认 `tools` 等级只显示思考、工具名称和最终答案，不会展示上例中的工具参数与 `└ 结果` 内容。
+
 颜色只在 TTY 中启用，管道和日志输出不会包含 ANSI 控制符。最终回答会定时增量刷新，并按行渲染 Markdown：标题不再显示 `###`，列表、引用、代码块、表格、粗体、行内代码和链接会转换为适合终端阅读的形式。
+
+Agent 的基础 Instructions 使用“终端优先”输出约束：普通回答默认不超过约 12 行，优先采用少量紧凑段落，避免 Markdown 表格、连续标题、频繁空行和手工空格对齐；列表通常不超过 5 项且每项保持单行。渲染层还会压缩异常的横向空白和连续空行，作为模型输出不稳定时的显示兜底。用户明确要求详细内容时，模型仍可按任务需要展开。
 
 ## 长期记忆
 

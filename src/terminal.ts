@@ -7,6 +7,19 @@ type Writable = {
 
 type StatusTone = 'agent' | 'thinking' | 'tool' | 'success';
 
+export const OUTPUT_LEVELS = [
+  { id: 'answer', label: '答案', description: '只显示最终答案', rank: 0 },
+  { id: 'thinking', label: '思考', description: '显示思考过程和最终答案', rank: 1 },
+  { id: 'tools', label: '工具', description: '增加工具调用名称', rank: 2 },
+  { id: 'trace', label: '详细', description: '显示输入、工具参数和完整结果', rank: 3 },
+] as const;
+
+export type OutputLevel = typeof OUTPUT_LEVELS[number]['id'];
+
+export function normalizeOutputLevel(value?: string): OutputLevel {
+  return OUTPUT_LEVELS.some((level) => level.id === value) ? value as OutputLevel : 'tools';
+}
+
 export type DisplayEvent =
   | { kind: 'answer'; text: string }
   | { kind: 'reasoning'; text: string }
@@ -15,6 +28,7 @@ export type DisplayEvent =
       tone: StatusTone;
       title: string;
       detail?: string;
+      fullDetail?: string;
       next: string;
     };
 
@@ -47,20 +61,15 @@ export interface BannerInfo {
 }
 
 export function renderBanner(info: BannerInfo, tty = true): string {
-  const accent = (text: string) => tty ? `\x1b[38;2;93;170;160m${text}${ansi.reset}` : text;
   const muted = (text: string) => tty ? `${ansi.gray}${text}${ansi.reset}` : text;
   const strong = (text: string) => tty ? `${ansi.bold}${text}${ansi.reset}` : text;
   return [
-    `  ${accent('╭──────╮')}   ${strong('NanoAgent')} ${muted(`v${info.version}`)}`,
-    `  ${accent('│  ◉ ◉ │')}   轻量级 Agent 助手`,
-    `  ${accent('│   ᴗ  │')}`,
-    `  ${accent('╰──┬───╯')}   ${muted('Esc 中止 · / 查看命令')}`,
-    `     ${accent('╵')}`,
-    '',
-    `  模型    ${info.provider} · ${info.model}`,
-    `  对话    ${info.sessionTitle}`,
-    `  扩展    Skills ${info.skillCount} · MCP ${info.mcpServers.length || '未连接'}`,
-    `  工作区  ${info.workspaceRoot}`,
+    `${strong('NanoAgent')} ${muted(`v${info.version}`)}`,
+    '轻量级 Agent 助手',
+    `模型    ${info.provider} · ${info.model}`,
+    `对话    ${info.sessionTitle}`,
+    `扩展    Skills ${info.skillCount} · MCP ${info.mcpServers.length || '未连接'}`,
+    `工作区  ${info.workspaceRoot}`,
   ].join('\n');
 }
 
@@ -75,6 +84,15 @@ function compact(value: unknown, limit = 160): string {
   if (!text) return '';
   const singleLine = text.replace(/\s+/g, ' ').trim();
   return singleLine.length <= limit ? singleLine : `${singleLine.slice(0, limit)}…`;
+}
+
+function detailed(value: unknown): string {
+  if (typeof value === 'string') return value;
+  try {
+    return JSON.stringify(value, null, 2) ?? '';
+  } catch {
+    return String(value);
+  }
 }
 
 function rawItem(event: RunStreamEvent): Record<string, unknown> | undefined {
@@ -101,6 +119,7 @@ export function parseRunEvent(event: RunStreamEvent): DisplayEvent | undefined {
         tone: 'tool',
         title: name,
         detail: compact(raw?.arguments),
+        fullDetail: detailed(raw?.arguments),
         next: `正在执行 ${name}`,
       };
     }
@@ -112,6 +131,7 @@ export function parseRunEvent(event: RunStreamEvent): DisplayEvent | undefined {
         tone: 'success',
         title: name,
         detail: compact(item?.output, 120),
+        fullDetail: detailed(item?.output),
         next: '模型继续思考',
       };
     }
@@ -149,7 +169,7 @@ export function parseRunEvent(event: RunStreamEvent): DisplayEvent | undefined {
 }
 
 function inlineMarkdown(text: string, tty: boolean): string {
-  let value = text.replace(/\x1b/g, '');
+  let value = text.replace(/\x1b/g, '').replace(/[ \t]{3,}/g, ' ');
   value = value.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '$1 ($2)');
   value = value.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, label: string, url: string) =>
     tty ? `${label} ${ansi.dim}(${url})${ansi.reset}` : `${label} (${url})`,
@@ -220,6 +240,7 @@ class MarkdownStream {
   private buffer = '';
   private readonly state = { code: false };
   private timer?: NodeJS.Timeout;
+  private previousBlank = false;
 
   constructor(
     private readonly output: Writable,
@@ -232,7 +253,11 @@ class MarkdownStream {
     while (newline >= 0) {
       const line = this.buffer.slice(0, newline);
       this.buffer = this.buffer.slice(newline + 1);
-      this.output.write(`${renderMarkdownLine(line, this.tty, this.state)}\n`);
+      const blank = line.trim() === '';
+      if (!blank || !this.previousBlank) {
+        this.output.write(`${renderMarkdownLine(line, this.tty, this.state)}\n`);
+      }
+      this.previousBlank = blank;
       newline = this.buffer.indexOf('\n');
     }
     this.scheduleFlush();
@@ -244,6 +269,7 @@ class MarkdownStream {
     if (!this.buffer) return false;
     this.output.write(renderMarkdownLine(this.buffer, this.tty, this.state));
     this.buffer = '';
+    this.previousBlank = false;
     return true;
   }
 
@@ -286,18 +312,28 @@ export class TerminalRenderer {
   private markdown?: MarkdownStream;
   private hasBlock = false;
   private readonly startedAt = Date.now();
+  private readonly levelRank: number;
 
   constructor(
     private readonly status: Writable = process.stderr,
     private readonly answer: Writable = process.stdout,
-  ) {}
+    private readonly level: OutputLevel = 'tools',
+  ) {
+    this.levelRank = OUTPUT_LEVELS.find((item) => item.id === level)?.rank ?? 2;
+  }
 
-  start(label = '模型思考中'): void {
+  start(label = '模型思考中', input?: string): void {
     this.stopSpinner();
+    if (this.levelRank >= 3 && input) {
+      this.beginBlock(this.status);
+      this.status.write(`${badge('agent', Boolean(this.status.isTTY))}  任务\n  ${this.limitDetail(input)}\n`);
+    }
     this.label = label;
     if (!this.status.isTTY) {
-      this.status.write(`[运行] ${label}\n`);
-      this.hasBlock = true;
+      if (this.levelRank > 0) {
+        this.status.write(`[运行] ${label}\n`);
+        this.hasBlock = true;
+      }
       return;
     }
     this.draw();
@@ -309,11 +345,20 @@ export class TerminalRenderer {
     const display = parseRunEvent(event);
     if (!display) return;
 
+    if (display.kind === 'reasoning' && this.levelRank < 1) return;
+    if (display.kind === 'status') {
+      if (display.tone === 'agent' && this.levelRank < 3) return;
+      if (display.tone === 'thinking' && this.levelRank < 1) return;
+      if (display.tone === 'tool' && this.levelRank < 2) return;
+      if (display.tone === 'success' && this.levelRank < 3) return;
+    }
+
     if (display.kind === 'status') {
       this.stopSpinner();
       this.closeActive();
       this.beginBlock(this.status);
-      this.status.write(`${badge(display.tone, Boolean(this.status.isTTY))}  ${display.title}${display.detail ? `\n  ${this.muted(display.detail, this.status)}` : ''}\n`);
+      const detail = this.levelRank >= 3 ? display.fullDetail : undefined;
+      this.status.write(`${badge(display.tone, Boolean(this.status.isTTY))}  ${display.title}${detail ? `\n${this.renderDetail(detail)}` : ''}\n`);
       this.start(display.next);
       return;
     }
@@ -333,8 +378,10 @@ export class TerminalRenderer {
 
     if (this.active !== 'answer') {
       this.closeActive();
-      this.beginBlock(this.answer);
-      this.answer.write(`${badge('answer', Boolean(this.answer.isTTY))}\n`);
+      if (this.levelRank > 0) {
+        this.beginBlock(this.answer);
+        this.answer.write(`${badge('answer', Boolean(this.answer.isTTY))}\n`);
+      }
       this.active = 'answer';
       this.markdown = new MarkdownStream(this.answer, Boolean(this.answer.isTTY));
     }
@@ -344,9 +391,11 @@ export class TerminalRenderer {
   finish(): void {
     this.stopSpinner();
     this.closeActive();
-    const seconds = ((Date.now() - this.startedAt) / 1_000).toFixed(1);
-    this.beginBlock(this.status);
-    this.status.write(`${badge('done', Boolean(this.status.isTTY))}  ${this.muted(`${seconds}s`, this.status)}\n`);
+    if (this.levelRank > 0) {
+      const seconds = ((Date.now() - this.startedAt) / 1_000).toFixed(1);
+      this.beginBlock(this.status);
+      this.status.write(`${badge('done', Boolean(this.status.isTTY))}  ${this.muted(`${seconds}s`, this.status)}\n`);
+    }
   }
 
   stop(): void {
@@ -369,6 +418,18 @@ export class TerminalRenderer {
 
   private muted(text: string, output: Writable): string {
     return output.isTTY ? `${ansi.gray}${text}${ansi.reset}` : text;
+  }
+
+  private renderDetail(value: string): string {
+    return this.limitDetail(value)
+      .split(/\r?\n/)
+      .map((line) => `  ${this.muted(`│ ${line}`, this.status)}`)
+      .join('\n');
+  }
+
+  private limitDetail(value: string): string {
+    const limit = 20_000;
+    return value.length <= limit ? value : `${value.slice(0, limit)}\n...[详情已截断，共 ${value.length} 字符]`;
   }
 
   private draw(): void {

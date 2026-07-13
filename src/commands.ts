@@ -1,12 +1,15 @@
 import { randomUUID } from 'node:crypto';
 import type { NanoAgent } from './agent.js';
 import type { SessionSummary } from './core/session.js';
+import { OUTPUT_LEVELS, type OutputLevel } from './terminal.js';
 
 export type CommandResult = 'handled' | 'exit' | 'pass';
 
 export const COMMANDS = [
   { value: '/status', description: '查看运行状态' },
   { value: '/model', description: '查看或切换模型' },
+  { value: '/mode', description: '查看或切换运行模式' },
+  { value: '/output', description: '调整执行过程展示等级' },
   { value: '/new', description: '新建对话' },
   { value: '/sessions', description: '选择最近对话' },
   { value: '/switch', description: '按 ID 切换对话' },
@@ -27,6 +30,8 @@ export const COMMANDS = [
 const HELP = `内置命令：
   /status             查看模型、会话和扩展状态
   /model [name]       查看或切换当前模型
+  /mode [name]        查看或切换运行模式
+  /output [level]     调整答案、思考、工具或详细事件展示
   /new [id]           新建并切换对话
   /sessions           选择并切换最近对话
   /switch <id>        按 ID 切换对话
@@ -50,6 +55,10 @@ export interface CommandUI {
   resetScreen?: () => void | Promise<void>;
   selectSession?: (sessions: SessionSummary[]) => Promise<string | undefined>;
   selectModel?: (models: string[], current: string) => Promise<string | undefined>;
+  selectMode?: (modes: ReturnType<NanoAgent['availableModes']>, current: string) => Promise<string | undefined>;
+  getOutputLevel?: () => OutputLevel;
+  setOutputLevel?: (level: OutputLevel) => void;
+  selectOutputLevel?: (current: OutputLevel) => Promise<string | undefined>;
 }
 
 export class CommandHandler {
@@ -76,6 +85,8 @@ export class CommandHandler {
       const info = await this.agent.runtimeInfo();
       return this.handled([
         `模型      ${info.provider} / ${info.model}`,
+        `模式      ${info.mode.label}`,
+        `输出      ${this.ui.getOutputLevel?.() ?? 'tools'}`,
         `会话      ${info.sessionId}`,
         `工作区    ${info.workspaceRoot}`,
         `最大轮数  ${info.maxTurns}`,
@@ -90,6 +101,23 @@ export class CommandHandler {
       if (!selected) return this.ui.selectModel ? 'handled' : this.handled(`当前模型：${current}`);
       this.agent.switchModel(selected);
       return this.handled(`已切换模型：${selected}`);
+    }
+    if (command === '/mode') {
+      const current = (await this.agent.runtimeInfo()).mode;
+      const selected = argument || await this.ui.selectMode?.(this.agent.availableModes(), current.id);
+      if (!selected) return this.ui.selectMode ? 'handled' : this.handled(`当前模式：${current.label}`);
+      this.agent.switchMode(selected);
+      const mode = this.agent.availableModes().find((item) => item.id === selected);
+      return this.handled(`已切换模式：${mode?.label ?? selected}`);
+    }
+    if (command === '/output') {
+      const current = this.ui.getOutputLevel?.() ?? 'tools';
+      const selected = argument || await this.ui.selectOutputLevel?.(current);
+      if (!selected) return this.ui.selectOutputLevel ? 'handled' : this.handled(`当前输出等级：${current}`);
+      const level = OUTPUT_LEVELS.find((item) => item.id === selected);
+      if (!level) throw new Error(`未知输出等级：${selected}`);
+      this.ui.setOutputLevel?.(level.id);
+      return this.handled(`已切换输出等级：${level.label}（${level.id}）`);
     }
     if (command === '/new') {
       await this.agent.switchSession(argument || randomUUID().slice(0, 8));
@@ -141,6 +169,7 @@ export class CommandHandler {
       const info = await this.agent.contextInfo();
       return this.handled([
         `历史条目  ${info.historyItems} / ${info.historyLimit}`,
+        `上下文    ~${info.estimatedTokens} / ${info.contextWindow} tokens`,
         `长期记忆  ${info.memories}`,
         `计划步骤  ${info.planSteps}`,
         '更早历史会在发送模型前自动压缩。',

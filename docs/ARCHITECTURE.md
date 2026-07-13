@@ -16,6 +16,7 @@ NanoAgent 的目标是用尽量少的层次解释现代 Agent 的核心组成，
 ```text
 CLI (index.ts)
   ├─ CommandHandler
+  ├─ InteractiveTerminal
   ├─ TerminalRenderer
   └─ NanoAgent (agent.ts)
       ├─ Core
@@ -53,7 +54,7 @@ CLI (index.ts)
 
 ```text
 1. CLI 接收用户输入
-2. FileSession 清理旧版本生成的无效摘要记录
+2. FileSession 清理旧版本生成的无效摘要，并修复中断留下的孤立工具调用/结果
 3. Memory、RAG、Plan 与完整 Session 并行读取
 4. ContextManager 构建动态 Instructions
 5. ContextManager 从完整用户轮次边界裁剪近期历史
@@ -110,6 +111,8 @@ npm install / npm link
 
 模型选择属于运行时状态：`/model` 更新 `NanoAgent` 当前的模型实例，Provider 和 API Key 仍由启动配置决定。OpenAI 使用 SDK 模型名，DeepSeek 则重建兼容的 `OpenAIChatCompletionsModel`，不会重建会话、工具、MCP 或其他核心组件。顶部 Banner 和清屏后的重新渲染仍由终端层负责。
 
+`/mode` 只切换一段轻量的模式指令，并在每轮构建 Instructions 时注入；标准、规划、编码、调研模式复用同一 Runner、会话和工具集合。状态栏中的上下文长度通过序列化会话近似估算 Token 数，窗口来自 `CONTEXT_WINDOW`，未配置时按 Provider 使用保守默认值。
+
 内置命令只做运行时管理和高频查看；需要模型推理的能力应实现为 Tool、Skill 或 MCP，而不是 CLI 命令。
 
 ## 终端事件流
@@ -122,6 +125,13 @@ npm install / npm link
 - Markdown 按行转换为终端文本。
 - 没有换行的回答每约 45ms 增量刷新，避免整段完成后才出现。
 - 非 TTY 输出不包含 ANSI 控制符。
+- 基础 Instructions 引导模型生成紧凑的终端内容，默认限制行数并避免表格、碎片化标题和手工对齐。
+- 渲染器压缩普通文本中的异常连续空格，并把多个连续空行收敛为一个空行；代码块内容保持原样。
+- 交互区按“等待队列 → 命令候选 → 常驻状态栏 → 单行输入框”排列，输入框始终位于最底部。
+- 等待队列由调度器同步给终端层，只展示尚未开始执行的消息，并按终端宽度生成单行省略预览。
+- 调度器取出消息时先调用终端层记录 `> 用户输入`，再启动命令或 Agent；排队消息因此只在开始执行时进入永久终端历史，不会打断上一条流式回答。
+
+事件详细度同样只存在于展示层。`answer`、`thinking`、`tools`、`trace` 四级过滤复用同一个 `RunStreamEvent` 流，不改变 Runner、会话记录、工具执行或 Trace 持久化。最高等级直接渲染工具参数和结果，单条详情设置 20000 字符的显示上限；默认 `tools` 只暴露工具名称。
 
 Trace 只记录高层展示事件和最终答案，不保存模型隐藏思维链。
 

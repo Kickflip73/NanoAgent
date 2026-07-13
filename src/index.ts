@@ -8,7 +8,7 @@ import { NanoAgent } from './agent.js';
 import { COMMANDS, CommandHandler, commandHelp } from './commands.js';
 import { loadConfig, loadEnvironment } from './config.js';
 import { InteractiveTerminal } from './interactive.js';
-import { parseRunEvent, renderBanner, TerminalRenderer } from './terminal.js';
+import { normalizeOutputLevel, OUTPUT_LEVELS, parseRunEvent, renderBanner, TerminalRenderer, type OutputLevel } from './terminal.js';
 
 loadEnvironment();
 
@@ -73,14 +73,15 @@ async function main(): Promise<void> {
   configureOpenAI();
   const agent = await NanoAgent.create(config);
   const oneShotInput = args.join(' ').trim();
+  let outputLevel: OutputLevel = normalizeOutputLevel(process.env.OUTPUT_LEVEL);
 
   const runTask = async (
     input: string,
     signal?: AbortSignal,
-    renderer = new TerminalRenderer(),
+    renderer = new TerminalRenderer(process.stderr, process.stdout, outputLevel),
   ): Promise<void> => {
     let finalAnswer = '';
-    renderer.start();
+    renderer.start('模型思考中', input);
     try {
       const stream = await agent.stream(input, signal);
       for await (const event of stream) {
@@ -121,11 +122,20 @@ async function main(): Promise<void> {
         mcpServers: info.mcpServers,
       }, Boolean(process.stdout.isTTY));
     };
+    const refreshRuntimeStatus = async () => {
+      const [info, context] = await Promise.all([agent.runtimeInfo(), agent.contextInfo()]);
+      terminal.setRuntimeStatus({
+        mode: info.mode.label,
+        model: info.model,
+        contextUsed: context.estimatedTokens,
+        contextWindow: context.contextWindow,
+      });
+    };
     let currentAbort: AbortController | undefined;
     let drainPromise: Promise<void> | undefined;
     let exitRequested = false;
     const queue: string[] = [];
-    const queuedRunTask = (input: string) => runTask(input, currentAbort?.signal, new TerminalRenderer(stderr, stdout));
+    const queuedRunTask = (input: string) => runTask(input, currentAbort?.signal, new TerminalRenderer(stderr, stdout, outputLevel));
     const commands = new CommandHandler(agent, queuedRunTask, {
       write: (text) => terminal.notify(text),
       resetScreen: async () => terminal.clearScreen(await banner()),
@@ -139,7 +149,20 @@ async function main(): Promise<void> {
         label: `${model === current ? '● ' : ''}${model}`,
         detail: model === current ? '当前模型' : config.provider,
       })), '选择模型'),
+      selectMode: async (modes, current) => terminal.select(modes.map((mode) => ({
+        value: mode.id,
+        label: `${mode.id === current ? '● ' : ''}${mode.label}`,
+        detail: mode.description,
+      })), '选择模式'),
+      getOutputLevel: () => outputLevel,
+      setOutputLevel: (level) => { outputLevel = level; },
+      selectOutputLevel: async (current) => terminal.select(OUTPUT_LEVELS.map((level) => ({
+        value: level.id,
+        label: `${level.id === current ? '● ' : ''}${level.label}`,
+        detail: level.description,
+      })), '选择输出等级'),
     });
+    await refreshRuntimeStatus();
     console.log(await banner());
 
     const drain = async (): Promise<void> => {
@@ -148,12 +171,15 @@ async function main(): Promise<void> {
         terminal.setBusy(true);
         while (queue.length && !exitRequested) {
           const input = queue.shift()!;
+          terminal.setQueue(queue);
+          terminal.recordInput(input);
           currentAbort = new AbortController();
           try {
             const result = await commands.execute(input);
             if (result === 'exit') {
               exitRequested = true;
               queue.length = 0;
+              terminal.setQueue(queue);
               terminal.close();
               resolveClosed();
               break;
@@ -169,6 +195,7 @@ async function main(): Promise<void> {
             }
           } finally {
             currentAbort = undefined;
+            await refreshRuntimeStatus();
           }
         }
         terminal.setBusy(false);
@@ -184,7 +211,7 @@ async function main(): Promise<void> {
     terminal.start({
       onLine: (input) => {
         queue.push(input);
-        if (currentAbort || queue.length > 1) terminal.notify(`已加入队列 · 等待 ${queue.length} 条`);
+        terminal.setQueue(queue);
         void drain();
       },
       onEscape: () => {
@@ -194,6 +221,7 @@ async function main(): Promise<void> {
       onExit: () => {
         exitRequested = true;
         queue.length = 0;
+        terminal.setQueue(queue);
         currentAbort?.abort(new Error('用户退出'));
         terminal.close();
         resolveClosed();

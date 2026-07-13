@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.6.0] - 2026-07-13 23:06
+
+### Added
+
+- add standard, planning, coding, and research presets through `/mode`
+- add four lightweight `/output` event visibility levels from final-answer-only to full tool traces
+- add configurable terminal event visibility (@Kickflip73)
+
+### Changed
+
+- keep the dashed single-line input box at the bottom, separate from runtime status
+- replace transient queue counts with persistent one-line queued conversation previews
+- simplify the startup header and add an animated runtime bar with mode, model, and context usage
+- guide model responses toward compact terminal-first prose and defensively collapse excessive whitespace
+- preserve every submitted user message in the terminal transcript when execution begins
+
 ## [0.5.0] - 2026-07-13 22:28
 
 ### Added

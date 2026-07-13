@@ -9,6 +9,7 @@ function fakeAgent(): NanoAgent {
     runtimeInfo: async () => ({
       provider: 'deepseek',
       model: 'deepseek-chat',
+      mode: { id: 'standard', label: '标准', description: '平衡速度与完整性', instruction: '' },
       sessionId: 'demo',
       sessionTitle: '讨论 NanoAgent',
       workspaceRoot: '/tmp/demo',
@@ -34,7 +35,12 @@ function fakeAgent(): NanoAgent {
     indexKnowledge: async () => ({ files: 1, chunks: 1, embeddings: false }),
     availableModels: () => ['deepseek-chat', 'deepseek-reasoner'],
     switchModel: () => undefined,
-    contextInfo: async () => ({ historyItems: 4, historyLimit: 40, memories: 1, planSteps: 1 }),
+    contextInfo: async () => ({ historyItems: 4, historyLimit: 40, estimatedTokens: 1200, contextWindow: 128000, memories: 1, planSteps: 1 }),
+    availableModes: () => [
+      { id: 'standard', label: '标准', description: '平衡速度与完整性' },
+      { id: 'code', label: '编码', description: '代码任务' },
+    ],
+    switchMode: () => undefined,
     toolNames: ['read_file', 'run_shell'],
     mcpServerNames: [],
   } as unknown as NanoAgent;
@@ -115,4 +121,31 @@ test('selects a model and exposes common runtime inspection commands', async () 
   assert.match(output.join('\n'), /历史条目/);
   assert.match(output.join('\n'), /run_shell/);
   assert.match(output.join('\n'), /MCP 未连接/);
+});
+
+test('selects a preset Agent mode', async () => {
+  const switched: string[] = [];
+  const agent = fakeAgent() as NanoAgent & { switchMode: (mode: string) => void };
+  agent.switchMode = (mode) => switched.push(mode);
+  const handler = new CommandHandler(agent, async () => undefined, {
+    write: () => undefined,
+    selectMode: async () => 'code',
+  });
+
+  assert.equal(await handler.execute('/mode'), 'handled');
+  assert.deepEqual(switched, ['code']);
+});
+
+test('switches terminal output detail level', async () => {
+  let current: 'answer' | 'thinking' | 'tools' | 'trace' = 'tools';
+  const handler = new CommandHandler(fakeAgent(), async () => undefined, {
+    write: () => undefined,
+    getOutputLevel: () => current,
+    setOutputLevel: (level) => { current = level; },
+    selectOutputLevel: async () => 'trace',
+  });
+
+  assert.equal(await handler.execute('/output'), 'handled');
+  assert.equal(current, 'trace');
+  await assert.rejects(handler.execute('/output everything'), /未知输出等级/);
 });

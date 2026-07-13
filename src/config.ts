@@ -9,6 +9,7 @@ export interface AppConfig {
   skillsRoot: string;
   mcpConfig: string;
   historyLimit: number;
+  contextWindow: number;
   maxTurns: number;
 }
 
@@ -27,6 +28,7 @@ export function loadConfig(): AppConfig {
     skillsRoot: path.resolve(process.env.AGENT_SKILLS_DIR ?? path.join(workspaceRoot, 'skills')),
     mcpConfig: path.resolve(process.env.MCP_CONFIG ?? path.join(workspaceRoot, 'mcp.json')),
     historyLimit: Number(process.env.HISTORY_LIMIT ?? 40),
+    contextWindow: Number(process.env.CONTEXT_WINDOW ?? (process.env.MODEL_PROVIDER === 'deepseek' ? 128_000 : 400_000)),
     maxTurns: Number(process.env.MAX_TURNS ?? 200),
   };
 }

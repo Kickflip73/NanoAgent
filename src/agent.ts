@@ -20,12 +20,25 @@ import { createTools } from './tools.js';
 const BASE_INSTRUCTIONS = [
   '你是运行在用户电脑上的轻量级个人助手。',
   '默认使用中文，回答简洁、直接。',
+  '所有回答会显示在终端中：默认控制在 12 行以内，简单问题优先使用 1～3 个紧凑段落；只有用户明确要求详细展开时才增加篇幅。',
+  '避免 Markdown 表格、连续标题、频繁空行和每句单独换行；短信息使用“标签：内容 · 标签：内容”的紧凑形式。',
+  '列表通常不超过 5 项，每项保持单行；不要用空格手工对齐，不要在数值与单位之间换行，例如写成 34°C、5km、20%。',
+  '除非能明显帮助阅读，否则不要使用 Emoji、引用块或多级列表；回答结论优先，补充说明随后。',
   '需要实时信息、文件内容、计算或系统操作时必须调用工具，不要猜测。',
   '你可以使用 Skill 学习特定任务的工作流，使用知识库和长期记忆补充上下文。',
   '复杂任务先使用 update_plan 给出简短计划，并在执行过程中更新状态；简单问题不要创建计划。',
   '用户明确要求记住某件事时调用 remember；不要保存密码、密钥等敏感信息。',
   '执行任务后说明实际完成了什么；不要声称完成了未实际执行的操作。',
 ].join('\n');
+
+export const AGENT_MODES = [
+  { id: 'standard', label: '标准', description: '平衡速度与完整性', instruction: '按任务需要自主选择直接回答或调用工具。' },
+  { id: 'plan', label: '规划', description: '先分析和规划再执行', instruction: '除简单问题外，先明确目标并使用 update_plan 制定步骤，再开始执行。' },
+  { id: 'code', label: '编码', description: '面向代码修改与验证', instruction: '优先检查现有代码，实施最小清晰改动，并运行相关检查和测试。' },
+  { id: 'research', label: '调研', description: '多来源检索与归纳', instruction: '先收集可靠信息并交叉验证，再区分事实、推断与不确定项。' },
+] as const;
+
+export type AgentMode = typeof AGENT_MODES[number]['id'];
 
 export class NanoAgent {
   private readonly runner: Runner;
@@ -39,6 +52,7 @@ export class NanoAgent {
   private readonly tools: ReturnType<typeof createTools>;
   private session: FileSession;
   private sessionId: string;
+  private mode: AgentMode = 'standard';
 
   private constructor(
     private readonly config: AppConfig,
@@ -132,7 +146,7 @@ export class NanoAgent {
       this.session.getItems(),
     ]);
     const instructions = this.context.buildInstructions({
-      baseInstructions: BASE_INSTRUCTIONS,
+      baseInstructions: `${BASE_INSTRUCTIONS}\n当前模式：${this.currentMode.label}。${this.currentMode.instruction}`,
       historySummary: this.context.summarizeHistory(history),
       skillCatalog: this.skills.catalog(),
       memories,
@@ -197,6 +211,7 @@ export class NanoAgent {
     return {
       provider: this.config.provider,
       model: this.modelName,
+      mode: this.currentMode,
       sessionId: this.sessionId,
       sessionTitle: sessionSummary.title,
       workspaceRoot: this.config.workspaceRoot,
@@ -236,6 +251,15 @@ export class NanoAgent {
       : modelName;
   }
 
+  availableModes() {
+    return AGENT_MODES.map(({ id, label, description }) => ({ id, label, description }));
+  }
+
+  switchMode(mode: string): void {
+    if (!AGENT_MODES.some((item) => item.id === mode)) throw new Error(`未知模式：${mode}`);
+    this.mode = mode as AgentMode;
+  }
+
   async contextInfo() {
     const [history, memories, plan] = await Promise.all([
       this.session.getItems(),
@@ -245,6 +269,8 @@ export class NanoAgent {
     return {
       historyItems: history.length,
       historyLimit: this.config.historyLimit,
+      estimatedTokens: history.length ? Math.ceil(JSON.stringify(history).length / 4) : 0,
+      contextWindow: this.config.contextWindow,
       memories: memories.length,
       planSteps: plan.length,
     };
@@ -252,6 +278,10 @@ export class NanoAgent {
 
   get toolNames(): string[] {
     return this.tools.map((item) => item.name).sort();
+  }
+
+  private get currentMode() {
+    return AGENT_MODES.find((item) => item.id === this.mode)!;
   }
 
   async indexKnowledge(target?: string) {

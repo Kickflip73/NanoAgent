@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { RunStreamEvent } from '@openai/agents';
-import { parseRunEvent, renderBanner, renderMarkdownLine, TerminalRenderer } from '../src/terminal.js';
+import { parseRunEvent, renderBanner, renderMarkdownLine, TerminalRenderer, type OutputLevel } from '../src/terminal.js';
 
 class BufferWriter {
   isTTY = false;
@@ -62,6 +62,22 @@ test('renders common Markdown as readable terminal text', () => {
   assert.equal(renderMarkdownLine('```ts', false, state), '  ┌─ ts');
   assert.equal(renderMarkdownLine('const ok = true;', false, state), '  │ const ok = true;');
   assert.equal(renderMarkdownLine('```', false, state), '  └─');
+  assert.equal(renderMarkdownLine('风向 |          东南风，2~5级', false, state), '风向 | 东南风，2~5级');
+});
+
+test('collapses repeated blank lines in streamed terminal answers', () => {
+  const status = new BufferWriter();
+  const answer = new BufferWriter();
+  const renderer = new TerminalRenderer(status, answer);
+  renderer.start();
+  renderer.handle({
+    type: 'raw_model_stream_event',
+    data: { type: 'output_text_delta', delta: '第一段\n\n\n\n第二段\n' },
+  } as RunStreamEvent);
+  renderer.finish();
+
+  assert.match(answer.value, /第一段\n\n第二段/);
+  assert.doesNotMatch(answer.value, /第一段\n{3,}第二段/);
 });
 
 test('separates event blocks and uses subtle ANSI badges in a TTY', () => {
@@ -108,7 +124,7 @@ test('flushes a one-line answer incrementally before completion', async () => {
   renderer.stop();
 });
 
-test('renders a compact robot banner without ANSI in plain output', () => {
+test('renders a compact project banner without ANSI in plain output', () => {
   const banner = renderBanner({
     version: '0.5.0',
     provider: 'deepseek',
@@ -119,8 +135,54 @@ test('renders a compact robot banner without ANSI in plain output', () => {
     mcpServers: ['filesystem'],
   }, false);
 
-  assert.match(banner, /◉ ◉/);
-  assert.match(banner, /NanoAgent/);
+  assert.match(banner, /^NanoAgent v0\.5\.0\n轻量级 Agent 助手\n模型/m);
   assert.match(banner, /优化终端交互/);
+  assert.doesNotMatch(banner, /◉|╭|Esc/);
   assert.doesNotMatch(banner, /\x1b/);
+});
+
+test('filters execution events by output level', () => {
+  const render = (level: OutputLevel) => {
+    const status = new BufferWriter();
+    const answer = new BufferWriter();
+    const renderer = new TerminalRenderer(status, answer, level);
+    renderer.start('模型思考中', '读取 README.md 并总结');
+    renderer.handle({
+      type: 'raw_model_stream_event',
+      data: { type: 'model', event: { choices: [{ delta: { reasoning_content: '需要先读取文件' } }] } },
+    } as unknown as RunStreamEvent);
+    renderer.handle({
+      type: 'run_item_stream_event',
+      name: 'tool_called',
+      item: { rawItem: { name: 'read_file', arguments: '{"path":"README.md"}' } },
+    } as unknown as RunStreamEvent);
+    renderer.handle({
+      type: 'run_item_stream_event',
+      name: 'tool_output',
+      item: { rawItem: { name: 'read_file' }, output: 'NanoAgent 文件正文' },
+    } as unknown as RunStreamEvent);
+    renderer.handle({
+      type: 'raw_model_stream_event',
+      data: { type: 'output_text_delta', delta: '总结完成' },
+    } as RunStreamEvent);
+    renderer.finish();
+    return { status: status.value, answer: answer.value };
+  };
+
+  const answer = render('answer');
+  assert.equal(answer.status, '');
+  assert.equal(answer.answer, '总结完成\n');
+
+  const thinking = render('thinking');
+  assert.match(thinking.status, /需要先读取文件/);
+  assert.doesNotMatch(thinking.status, /read_file|README\.md/);
+
+  const tools = render('tools');
+  assert.match(tools.status, /read_file/);
+  assert.doesNotMatch(tools.status, /README\.md|NanoAgent 文件正文/);
+
+  const trace = render('trace');
+  assert.match(trace.status, /读取 README\.md 并总结/);
+  assert.match(trace.status, /\{"path":"README\.md"\}/);
+  assert.match(trace.status, /NanoAgent 文件正文/);
 });
