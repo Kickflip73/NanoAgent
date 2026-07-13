@@ -8,7 +8,7 @@ import { NanoAgent } from './agent.js';
 import { COMMANDS, CommandHandler, commandHelp } from './commands.js';
 import { loadConfig, loadEnvironment } from './config.js';
 import { InteractiveTerminal } from './interactive.js';
-import { normalizeOutputLevel, OUTPUT_LEVELS, parseRunEvent, renderBanner, TerminalRenderer, type OutputLevel } from './terminal.js';
+import { normalizeOutputLevel, OUTPUT_LEVELS, parseRunEvent, renderBanner, renderSessionTranscript, TerminalRenderer, type OutputLevel } from './terminal.js';
 
 loadEnvironment();
 
@@ -122,6 +122,11 @@ async function main(): Promise<void> {
         mcpServers: info.mcpServers,
       }, Boolean(process.stdout.isTTY));
     };
+    const sessionView = async () => {
+      const [header, history] = await Promise.all([banner(), agent.history()]);
+      const transcript = renderSessionTranscript(history, Boolean(process.stdout.isTTY));
+      return [header, transcript].filter(Boolean).join('\n\n');
+    };
     const refreshRuntimeStatus = async () => {
       const [info, context] = await Promise.all([agent.runtimeInfo(), agent.contextInfo()]);
       terminal.setRuntimeStatus({
@@ -139,6 +144,7 @@ async function main(): Promise<void> {
     const commands = new CommandHandler(agent, queuedRunTask, {
       write: (text) => terminal.notify(text),
       resetScreen: async () => terminal.clearScreen(await banner()),
+      restoreSession: async () => terminal.clearScreen(await sessionView()),
       selectSession: async (sessions) => terminal.select(sessions.map((session) => ({
         value: session.id,
         label: `${session.id === agent.currentSessionId ? '● ' : ''}${session.title}`,
@@ -163,7 +169,7 @@ async function main(): Promise<void> {
       })), '选择输出等级'),
     });
     await refreshRuntimeStatus();
-    console.log(await banner());
+    console.log(await sessionView());
 
     const drain = async (): Promise<void> => {
       if (drainPromise) return drainPromise;

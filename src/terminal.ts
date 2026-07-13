@@ -1,4 +1,4 @@
-import type { RunStreamEvent } from '@openai/agents';
+import type { AgentInputItem, RunStreamEvent } from '@openai/agents';
 
 type Writable = {
   write(chunk: string): unknown;
@@ -71,6 +71,38 @@ export function renderBanner(info: BannerInfo, tty = true): string {
     `扩展    Skills ${info.skillCount} · MCP ${info.mcpServers.length || '未连接'}`,
     `工作区  ${info.workspaceRoot}`,
   ].join('\n');
+}
+
+function sessionItemText(content: unknown): string {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content.map((part) => {
+    const value = record(part);
+    if (typeof value?.text === 'string') return value.text;
+    if (value?.type === 'input_image') return '[图片]';
+    if (value?.type === 'input_file') return '[附件]';
+    return '';
+  }).filter(Boolean).join('\n');
+}
+
+/** Render persisted user/assistant messages for terminal scrollback after a session switch. */
+export function renderSessionTranscript(items: AgentInputItem[], tty = true): string {
+  const blocks: string[] = [];
+  for (const item of items) {
+    if (!('role' in item) || (item.role !== 'user' && item.role !== 'assistant') || !('content' in item)) continue;
+    const text = sessionItemText(item.content).replace(/\x1b/g, '').trim();
+    if (!text) continue;
+    if (item.role === 'user') {
+      const lines = text.split(/\r?\n/);
+      const marker = tty ? `\x1b[38;2;148;166;173m>\x1b[0m` : '>';
+      blocks.push(lines.map((line, index) => `${index === 0 ? marker : ' '} ${line}`).join('\n'));
+      continue;
+    }
+    const state = { code: false };
+    const answer = text.split(/\r?\n/).map((line) => renderMarkdownLine(line, tty, state)).join('\n');
+    blocks.push(`${badge('answer', tty)}\n${answer}`);
+  }
+  return blocks.join('\n\n');
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {

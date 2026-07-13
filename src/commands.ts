@@ -57,6 +57,7 @@ const HELP = `内置命令：
 export interface CommandUI {
   write?: (text: string) => void;
   resetScreen?: () => void | Promise<void>;
+  restoreSession?: () => void | Promise<void>;
   selectSession?: (sessions: SessionSummary[]) => Promise<string | undefined>;
   selectModel?: (models: string[], current: string) => Promise<string | undefined>;
   selectMode?: (modes: ReturnType<NanoAgent['availableModes']>, current: string) => Promise<string | undefined>;
@@ -135,10 +136,9 @@ export class CommandHandler {
         ? await this.ui.selectSession(sessions)
         : undefined;
       if (selected) {
-        const summary = sessions.find((item) => item.id === selected);
         await this.agent.switchSession(selected);
-        await this.ui.resetScreen?.();
-        return this.handled(`已切换到：${summary?.title ?? '最近对话'}`);
+        await (this.ui.restoreSession?.() ?? this.ui.resetScreen?.());
+        return 'handled';
       }
       if (this.ui.selectSession) return 'handled';
       return this.handled(sessions.map((item) => `${item.id === this.agent.currentSessionId ? '*' : ' '} ${item.title}  ${item.preview}`).join('\n'));
@@ -146,8 +146,8 @@ export class CommandHandler {
     if (command === '/switch') {
       if (!argument) throw new Error('用法：/switch <session-id>');
       await this.agent.switchSession(argument);
-      await this.ui.resetScreen?.();
-      return this.handled('对话已切换。');
+      await (this.ui.restoreSession?.() ?? this.ui.resetScreen?.());
+      return 'handled';
     }
     if (command === '/history') {
       const items = await this.agent.history();

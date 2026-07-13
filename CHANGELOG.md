@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.7.1] - 2026-07-14
+
+### Fixed
+
+- replay persisted user and assistant messages after `/sessions` and `/switch`
+- restore the active session transcript on startup, with the newest messages above the bottom input area
+- keep tool calls and raw tool results out of the normal conversation replay
+
 ## [0.7.0] - 2026-07-13
 
 ### Added

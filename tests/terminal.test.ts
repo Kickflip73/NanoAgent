@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import type { RunStreamEvent } from '@openai/agents';
-import { parseRunEvent, renderBanner, renderMarkdownLine, TerminalRenderer, type OutputLevel } from '../src/terminal.js';
+import type { AgentInputItem, RunStreamEvent } from '@openai/agents';
+import { parseRunEvent, renderBanner, renderMarkdownLine, renderSessionTranscript, TerminalRenderer, type OutputLevel } from '../src/terminal.js';
 
 class BufferWriter {
   isTTY = false;
@@ -139,6 +139,33 @@ test('renders a compact project banner without ANSI in plain output', () => {
   assert.match(banner, /优化终端交互/);
   assert.doesNotMatch(banner, /◉|╭|Esc/);
   assert.doesNotMatch(banner, /\x1b/);
+});
+
+test('replays persisted user and assistant messages in chronological order', () => {
+  const transcript = renderSessionTranscript([
+    { type: 'message', role: 'user', content: '第一条问题' },
+    { type: 'function_call', callId: 'call-1', name: 'read_file', arguments: '{}' },
+    { type: 'function_call_result', callId: 'call-1', name: 'read_file', status: 'completed', output: 'secret tool output' },
+    {
+      type: 'message',
+      role: 'assistant',
+      status: 'completed',
+      content: [{ type: 'output_text', text: '### 第一条回答\n\n- 已完成' }],
+    },
+    { type: 'message', role: 'user', content: '最新问题' },
+    {
+      type: 'message',
+      role: 'assistant',
+      status: 'completed',
+      content: [{ type: 'output_text', text: '最新回答' }],
+    },
+  ] as AgentInputItem[], false);
+
+  assert.match(transcript, /^> 第一条问题/m);
+  assert.match(transcript, /◆ 回答\n\s*第一条回答\n\n• 已完成/);
+  assert.ok(transcript.indexOf('第一条问题') < transcript.indexOf('最新问题'));
+  assert.ok(transcript.indexOf('最新问题') < transcript.indexOf('最新回答'));
+  assert.doesNotMatch(transcript, /secret tool output|###/);
 });
 
 test('filters execution events by output level', () => {

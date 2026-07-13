@@ -91,22 +91,23 @@ test('retries the previous user input without sending slash commands to the mode
   }
 });
 
-test('selects sessions by summary and clears the terminal for clean context changes', async () => {
+test('selects sessions and restores their persisted transcript', async () => {
   const switched: string[] = [];
-  const output: string[] = [];
-  let clears = 0;
+  let restores = 0;
   const agent = fakeAgent() as NanoAgent & { switchSession: (id: string) => Promise<void> };
   agent.switchSession = async (id) => { switched.push(id); };
   const handler = new CommandHandler(agent, async () => undefined, {
-    write: (text) => output.push(text),
-    resetScreen: () => { clears += 1; },
+    restoreSession: () => { restores += 1; },
     selectSession: async () => 'demo',
   });
 
   assert.equal(await handler.execute('/sessions'), 'handled');
   assert.deepEqual(switched, ['demo']);
-  assert.equal(clears, 1);
-  assert.match(output.join('\n'), /讨论 NanoAgent/);
+  assert.equal(restores, 1);
+
+  assert.equal(await handler.execute('/switch archived'), 'handled');
+  assert.deepEqual(switched, ['demo', 'archived']);
+  assert.equal(restores, 2);
 });
 
 test('selects a model and exposes common runtime inspection commands', async () => {

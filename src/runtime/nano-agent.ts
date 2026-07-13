@@ -185,7 +185,7 @@ export class NanoAgent {
     return FileSession.listSummaries(path.join(this.config.dataRoot, 'sessions'));
   }
 
-  async history(): Promise<unknown[]> {
+  async history(): Promise<AgentInputItem[]> {
     return this.session.getItems();
   }
 
