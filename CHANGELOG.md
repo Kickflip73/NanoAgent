@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.4.0] - 2026-07-13 22:05
+
+### Added
+
+- installable `nano` executable with interactive, one-shot, help, and version modes
+- `/status`, `/skills`, `/memories`, `/plan`, and `/retry` CLI commands
+- `search_files`, `edit_file`, `move_file`, and `http_request` tools
+- dedicated TypeScript build configuration and CLI regression tests
+
+### Changed
+
+- move slash-command routing from the CLI entrypoint into `commands.ts`
+- package only the two built-in example Skills while preserving locally installed Skills
+
+### Documentation
+
+- document installation, PATH conflicts, commands, tools, build flow, and security boundaries
+
 ## [0.3.0] - 2026-07-13 21:51
 
 ### Added

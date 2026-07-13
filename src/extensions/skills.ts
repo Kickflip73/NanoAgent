@@ -59,6 +59,10 @@ export class SkillLoader {
       .join('\n');
   }
 
+  list(): Array<Pick<Skill, 'name' | 'description'>> {
+    return [...this.skills.values()].map(({ name, description }) => ({ name, description }));
+  }
+
   get(name: string): Skill | undefined {
     return this.skills.get(name);
   }
@@ -79,7 +83,7 @@ export class SkillLoader {
         name: 'list_skills',
         description: '列出可用 Skills 及其描述。',
         parameters: z.object({}),
-        execute: async () => [...this.skills.values()].map(({ name, description }) => ({ name, description })),
+        execute: async () => this.list(),
       }),
     ];
   }

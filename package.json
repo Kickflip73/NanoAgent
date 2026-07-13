@@ -1,6 +1,6 @@
 {
   "name": "nano-agent",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "A tiny, educational AI agent built with TypeScript and the OpenAI Agents SDK.",
   "license": "MIT",
   "repository": {
@@ -8,6 +8,9 @@
     "url": "git+https://github.com/Kickflip73/NanoAgent.git"
   },
   "homepage": "https://github.com/Kickflip73/NanoAgent#readme",
+  "bin": {
+    "nano": "dist/index.js"
+  },
   "bugs": {
     "url": "https://github.com/Kickflip73/NanoAgent/issues"
   },
@@ -23,7 +26,9 @@
   ],
   "files": [
     "src",
-    "skills",
+    "dist",
+    "skills/code-review",
+    "skills/research",
     "knowledge",
     "evals",
     "docs",
@@ -35,14 +40,18 @@
     "CONTRIBUTING.md",
     "SECURITY.md",
     "LICENSE",
-    "tsconfig.json"
+    "tsconfig.json",
+    "tsconfig.build.json"
   ],
   "type": "module",
   "engines": {
     "node": ">=22"
   },
   "scripts": {
-    "start": "tsx src/index.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "prepare": "npm run build",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
     "eval": "tsx src/eval.ts",
     "check": "tsc --noEmit",
     "test": "node --import tsx --test tests/*.test.ts"

@@ -52,6 +52,7 @@ export class NanoAgent {
       traces: TraceStore;
       mcp: MCPManager;
       sessionId: string;
+      modelName: string;
     },
   ) {
     this.context = components.context;
@@ -62,6 +63,7 @@ export class NanoAgent {
     this.traces = components.traces;
     this.mcp = components.mcp;
     this.sessionId = components.sessionId;
+    this.modelName = components.modelName;
     this.session = this.createSession(this.sessionId);
     this.runner = new Runner({
       workflowName: 'NanoAgent CLI',
@@ -78,6 +80,8 @@ export class NanoAgent {
     ];
   }
 
+  private readonly modelName: string;
+
   static async create(config: AppConfig): Promise<NanoAgent> {
     const model = config.provider === 'deepseek'
       ? new OpenAIChatCompletionsModel(
@@ -88,6 +92,9 @@ export class NanoAgent {
           }),
           process.env.DEEPSEEK_MODEL ?? 'deepseek-v4-flash',
         )
+      : (process.env.OPENAI_MODEL ?? 'gpt-5.4-mini');
+    const modelName = config.provider === 'deepseek'
+      ? (process.env.DEEPSEEK_MODEL ?? 'deepseek-v4-flash')
       : (process.env.OPENAI_MODEL ?? 'gpt-5.4-mini');
     const embeddingClient = process.env.OPENAI_API_KEY
       ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY, fetch: globalThis.fetch })
@@ -110,6 +117,7 @@ export class NanoAgent {
       traces,
       mcp,
       sessionId,
+      modelName,
     });
     return agent;
   }
@@ -164,6 +172,31 @@ export class NanoAgent {
 
   async clearSession(): Promise<void> {
     await this.session.clearSession();
+  }
+
+  listSkills() {
+    return this.skills.list();
+  }
+
+  async listMemories() {
+    return this.memory.list();
+  }
+
+  async currentPlan() {
+    return this.plans.get();
+  }
+
+  async runtimeInfo() {
+    return {
+      provider: this.config.provider,
+      model: this.modelName,
+      sessionId: this.sessionId,
+      workspaceRoot: this.config.workspaceRoot,
+      maxTurns: this.config.maxTurns,
+      skillCount: this.skills.list().length,
+      memoryCount: (await this.memory.list()).length,
+      mcpServers: this.mcpServerNames,
+    };
   }
 
   async indexKnowledge(target?: string) {

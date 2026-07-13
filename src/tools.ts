@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, readFile, readdir, rename, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { codeInterpreterTool, tool, webSearchTool } from '@openai/agents';
@@ -8,6 +8,7 @@ import { z } from 'zod';
 const execFileAsync = promisify(execFile);
 const MAX_TEXT_BYTES = 200_000;
 const MAX_SHELL_OUTPUT = 100_000;
+const SKIPPED_DIRECTORIES = new Set(['.git', '.nano-agent', 'node_modules', 'dist']);
 
 function resolvePath(workspaceRoot: string, requestedPath: string): string {
   return path.isAbsolute(requestedPath)
@@ -40,6 +41,131 @@ export async function writeLocalFile(
   await mkdir(path.dirname(target), { recursive: true });
   await writeFile(target, content, 'utf8');
   return `已写入 ${target}（${Buffer.byteLength(content, 'utf8')} 字节）`;
+}
+
+export async function editLocalFile(
+  workspaceRoot: string,
+  requestedPath: string,
+  oldText: string,
+  newText: string,
+  replaceAll = false,
+): Promise<{ path: string; replacements: number }> {
+  if (!oldText) throw new Error('oldText 不能为空');
+  const target = resolvePath(workspaceRoot, requestedPath);
+  const content = await readLocalFile(workspaceRoot, requestedPath);
+  const occurrences = content.split(oldText).length - 1;
+  if (occurrences === 0) throw new Error('未找到要替换的原文');
+  const next = replaceAll ? content.split(oldText).join(newText) : content.replace(oldText, newText);
+  await writeFile(target, next, 'utf8');
+  return { path: target, replacements: replaceAll ? occurrences : 1 };
+}
+
+export async function moveLocalFile(
+  workspaceRoot: string,
+  sourcePath: string,
+  destinationPath: string,
+  overwrite = false,
+): Promise<{ from: string; to: string }> {
+  const source = resolvePath(workspaceRoot, sourcePath);
+  const destination = resolvePath(workspaceRoot, destinationPath);
+  if (!overwrite) {
+    try {
+      await stat(destination);
+      throw new Error(`目标已存在：${destination}`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+  }
+  await mkdir(path.dirname(destination), { recursive: true });
+  await rename(source, destination);
+  return { from: source, to: destination };
+}
+
+export interface FileSearchMatch {
+  path: string;
+  line?: number;
+  text?: string;
+  match: 'path' | 'content';
+}
+
+export async function searchLocalFiles(
+  workspaceRoot: string,
+  query: string,
+  requestedPath = '.',
+  maxResults = 50,
+): Promise<FileSearchMatch[]> {
+  const root = resolvePath(workspaceRoot, requestedPath);
+  const needle = query.toLowerCase();
+  const results: FileSearchMatch[] = [];
+
+  const visit = async (target: string): Promise<void> => {
+    if (results.length >= maxResults) return;
+    let info;
+    try {
+      info = await lstat(target);
+    } catch {
+      return;
+    }
+    if (info.isSymbolicLink()) return;
+    if (info.isDirectory()) {
+      if (target !== root && SKIPPED_DIRECTORIES.has(path.basename(target))) return;
+      for (const entry of await readdir(target)) {
+        await visit(path.join(target, entry));
+        if (results.length >= maxResults) break;
+      }
+      return;
+    }
+    if (!info.isFile() || info.size > MAX_TEXT_BYTES) return;
+    const relativePath = path.relative(workspaceRoot, target);
+    if (relativePath.toLowerCase().includes(needle)) {
+      results.push({ path: relativePath, match: 'path' });
+      if (results.length >= maxResults) return;
+    }
+    let content: string;
+    try {
+      content = await readFile(target, 'utf8');
+    } catch {
+      return;
+    }
+    if (content.includes('\0')) return;
+    const lines = content.split(/\r?\n/);
+    for (let index = 0; index < lines.length; index += 1) {
+      if (!lines[index]!.toLowerCase().includes(needle)) continue;
+      results.push({
+        path: relativePath,
+        line: index + 1,
+        text: truncate(lines[index]!.trim(), 240),
+        match: 'content',
+      });
+      if (results.length >= maxResults) break;
+    }
+  };
+
+  await visit(root);
+  return results;
+}
+
+export async function requestUrl(
+  url: string,
+  method: string,
+  headers: Record<string, string>,
+  body: string | undefined,
+  timeoutSeconds: number,
+) {
+  const target = new URL(url);
+  if (!['http:', 'https:'].includes(target.protocol)) throw new Error('只支持 HTTP 和 HTTPS URL');
+  const response = await fetch(target, {
+    method,
+    headers,
+    body: method === 'GET' || method === 'HEAD' ? undefined : body,
+    signal: AbortSignal.timeout(timeoutSeconds * 1_000),
+  });
+  return {
+    status: response.status,
+    ok: response.ok,
+    headers: Object.fromEntries(response.headers),
+    body: truncate(await response.text()),
+  };
 }
 
 export async function runShellCommand(
@@ -100,6 +226,31 @@ export function createTools(workspaceRoot: string, includeOpenAIHostedTools = tr
       writeLocalFile(workspaceRoot, requestedPath, content),
   });
 
+  const editFile = tool({
+    name: 'edit_file',
+    description: '在文本文件中精确替换一段原文，适合小范围修改而无需重写整个文件。',
+    parameters: z.object({
+      path: z.string().min(1),
+      oldText: z.string().min(1),
+      newText: z.string(),
+      replaceAll: z.boolean().default(false),
+    }),
+    execute: async ({ path: requestedPath, oldText, newText, replaceAll }) =>
+      editLocalFile(workspaceRoot, requestedPath, oldText, newText, replaceAll),
+  });
+
+  const moveFile = tool({
+    name: 'move_file',
+    description: '移动或重命名文件；默认不覆盖已有目标。',
+    parameters: z.object({
+      source: z.string().min(1),
+      destination: z.string().min(1),
+      overwrite: z.boolean().default(false),
+    }),
+    execute: async ({ source, destination, overwrite }) =>
+      moveLocalFile(workspaceRoot, source, destination, overwrite),
+  });
+
   const listDirectory = tool({
     name: 'list_directory',
     description: '列出本机目录内容，支持绝对路径或相对当前工作区的路径。',
@@ -121,6 +272,18 @@ export function createTools(workspaceRoot: string, includeOpenAIHostedTools = tr
               : 'file',
         }));
     },
+  });
+
+  const searchFiles = tool({
+    name: 'search_files',
+    description: '在工作区中按文件名和文本内容搜索，自动跳过 .git、node_modules、dist 和运行数据。',
+    parameters: z.object({
+      query: z.string().min(1),
+      path: z.string().default('.'),
+      maxResults: z.number().int().min(1).max(200).default(50),
+    }),
+    execute: async ({ query, path: requestedPath, maxResults }) =>
+      searchLocalFiles(workspaceRoot, query, requestedPath, maxResults),
   });
 
   const shell = tool({
@@ -155,13 +318,31 @@ export function createTools(workspaceRoot: string, includeOpenAIHostedTools = tr
     },
   });
 
+  const httpRequest = tool({
+    name: 'http_request',
+    description: '发送 HTTP/HTTPS 请求并返回状态、响应头和正文，适合调用 JSON API 或读取网页。',
+    parameters: z.object({
+      url: z.url(),
+      method: z.enum(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD']).default('GET'),
+      headers: z.record(z.string(), z.string()).default({}),
+      body: z.string().optional(),
+      timeoutSeconds: z.number().int().min(1).max(120).default(30),
+    }),
+    execute: async ({ url, method, headers, body, timeoutSeconds }) =>
+      requestUrl(url, method, headers, body, timeoutSeconds),
+  });
+
   const localTools = [
     currentTime,
     readFileTool,
     writeFileTool,
+    editFile,
+    moveFile,
     listDirectory,
+    searchFiles,
     shell,
     calculate,
+    httpRequest,
   ];
 
   if (!includeOpenAIHostedTools) return localTools;

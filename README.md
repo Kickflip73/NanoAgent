@@ -31,6 +31,7 @@ NanoAgent 使用 OpenAI Agents SDK 作为运行内核，在少量代码中展示
 ```text
 src/
 ├── index.ts              # CLI 与运行事件消费
+├── commands.ts           # 斜杠命令解析与执行
 ├── agent.ts              # Agent 组装和一次运行
 ├── config.ts             # 环境配置
 ├── core/
@@ -74,6 +75,7 @@ git clone https://github.com/Kickflip73/NanoAgent.git
 cd NanoAgent
 npm install
 cp .env.example .env
+npm link
 ```
 
 使用 OpenAI：
@@ -93,17 +95,28 @@ DEEPSEEK_BASE_URL=https://api.deepseek.com
 DEEPSEEK_MODEL=deepseek-v4-flash
 ```
 
-启动交互模式：
+安装完成后使用项目专属命令启动：
 
 ```bash
-npm start
+nano
 ```
 
 执行单次任务：
 
 ```bash
-npm start -- "读取 package.json 并介绍这个项目"
+nano "读取 package.json 并介绍这个项目"
 ```
+
+查看命令帮助和版本不需要 API Key：
+
+```bash
+nano --help
+nano --version
+```
+
+开发时也可以不建立全局链接，直接运行 `npm run dev`。`npm install`/`npm link` 会自动构建 `dist/`，`npm start` 则执行已构建版本。
+
+> macOS 和 Linux 通常已经安装 GNU nano 编辑器。执行 `type -a nano` 可以查看命令解析顺序；如果系统编辑器排在前面，请运行 `export PATH="$(npm prefix -g)/bin:$PATH"`，并把它加入 shell 配置。运行 `npm unlink --global nano-agent` 可移除项目链接并恢复原编辑器命令。
 
 `.env` 和运行目录 `.nano-agent/` 已被 Git 忽略。不要将真实 API Key 写入代码、配置示例或提交记录。
 
@@ -130,7 +143,13 @@ npm start -- "读取 package.json 并介绍这个项目"
 | `/switch <id>` | 切换已有会话 |
 | `/history` | 查看当前完整历史 |
 | `/clear` | 清空当前会话 |
+| `/status` | 查看模型、会话、Skills、Memory 和 MCP 状态 |
+| `/skills` | 列出可用 Skills |
+| `/memories` | 列出长期记忆 |
+| `/plan` | 查看当前任务计划 |
 | `/index [path]` | 构建 RAG 索引，默认 `knowledge/` |
+| `/retry` | 重新执行上一条用户输入 |
+| `/help` | 查看全部命令 |
 | `/exit` | 退出 |
 
 完整会话保存在 `.nano-agent/sessions/`。发送给模型时会从最近的完整用户轮次开始保留约 `HISTORY_LIMIT` 条历史，避免拆散工具调用与工具结果；更早的人类对话压缩到动态 Instructions，且不会反向写入会话。完整原始历史不会因此删除。
@@ -244,13 +263,16 @@ npm run eval
 
 | 类别 | 工具 |
 |---|---|
-| 本机 | `current_time`、`read_file`、`write_file`、`list_directory`、`run_shell`、`calculate` |
+| 文件 | `read_file`、`write_file`、`edit_file`、`move_file`、`list_directory`、`search_files` |
+| 系统与网络 | `run_shell`、`http_request`、`current_time`、`calculate` |
 | 记忆 | `remember`、`recall`、`list_memories`、`forget` |
 | Skill | `use_skill`、`list_skills` |
 | RAG | `search_knowledge`、`index_knowledge` |
 | Plan | `update_plan`、`show_plan` |
 | OpenAI 托管 | `web_search`、`code_interpreter` |
 | MCP | 来自 `mcp.json` 中已连接的 Server |
+
+新增的四个高频工具保持原子化：`search_files` 同时搜索文件名和文本内容，`edit_file` 做精确局部替换，`move_file` 默认拒绝覆盖目标，`http_request` 支持常见 HTTP 方法并复用代理配置。更复杂的 Git、数据库或业务能力应优先通过 Skill、MCP 或现有 Shell 工具组合，而不是继续堆内置工具。
 
 ## 有意保留的边界
 

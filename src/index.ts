@@ -1,11 +1,13 @@
+#!/usr/bin/env node
 import 'dotenv/config';
 import process from 'node:process';
+import { readFile } from 'node:fs/promises';
 import readline from 'node:readline/promises';
-import { randomUUID } from 'node:crypto';
 import { setDefaultOpenAIClient, setTracingDisabled } from '@openai/agents';
 import OpenAI from 'openai';
 import { EnvHttpProxyAgent, fetch as undiciFetch } from 'undici';
 import { NanoAgent } from './agent.js';
+import { CommandHandler, commandHelp } from './commands.js';
 import { loadConfig } from './config.js';
 import { parseRunEvent, TerminalRenderer } from './terminal.js';
 
@@ -22,8 +24,23 @@ globalThis.fetch = proxyAwareFetch;
 setTracingDisabled(true);
 
 const config = loadConfig();
-if (config.provider === 'openai') {
-  setDefaultOpenAIClient(new OpenAI({ apiKey: process.env.OPENAI_API_KEY, fetch: proxyAwareFetch }));
+
+async function version(): Promise<string> {
+  const file = new URL('../package.json', import.meta.url);
+  const manifest = JSON.parse(await readFile(file, 'utf8')) as { version: string };
+  return manifest.version;
+}
+
+function cliHelp(): string {
+  return `NanoAgent - 轻量级 Agent 学习助手
+
+用法：
+  nano                    启动交互模式
+  nano "任务"             执行单次任务
+  nano --help             查看帮助
+  nano --version          查看版本
+
+${commandHelp()}`;
 }
 
 function requireApiKey(): void {
@@ -34,14 +51,27 @@ function requireApiKey(): void {
   }
 }
 
-function compactHistory(items: unknown[]): string {
-  return items.map((item, index) => `${index + 1}. ${JSON.stringify(item)}`).join('\n');
+function configureOpenAI(): void {
+  if (config.provider === 'openai') {
+    setDefaultOpenAIClient(new OpenAI({ apiKey: process.env.OPENAI_API_KEY, fetch: proxyAwareFetch }));
+  }
 }
 
 async function main(): Promise<void> {
+  const args = process.argv.slice(2);
+  if (args.includes('--help') || args.includes('-h')) {
+    console.log(cliHelp());
+    return;
+  }
+  if (args.includes('--version') || args.includes('-v')) {
+    console.log(await version());
+    return;
+  }
+
   requireApiKey();
+  configureOpenAI();
   const agent = await NanoAgent.create(config);
-  const oneShotInput = process.argv.slice(2).join(' ').trim();
+  const oneShotInput = args.join(' ').trim();
 
   const runTask = async (input: string): Promise<void> => {
     const renderer = new TerminalRenderer();
@@ -72,7 +102,8 @@ async function main(): Promise<void> {
     }
 
     const terminal = readline.createInterface({ input: process.stdin, output: process.stdout });
-    console.log('NanoAgent 已启动。输入 /help 查看命令。');
+    const commands = new CommandHandler(agent, runTask);
+    console.log(`NanoAgent v${await version()} · 输入 /help 查看命令`);
     console.log(`模型：${config.provider} · 会话：${agent.currentSessionId}`);
     console.log(`工作区：${config.workspaceRoot}`);
     if (agent.mcpServerNames.length) console.log(`MCP：${agent.mcpServerNames.join(', ')}`);
@@ -81,43 +112,11 @@ async function main(): Promise<void> {
       while (true) {
         const input = (await terminal.question('\n你> ')).trim();
         if (!input) continue;
-        if (input === '/exit') break;
-        if (input === '/help') {
-          console.log('/new [id]  /sessions  /switch <id>  /history  /clear  /index [path]  /exit');
-          continue;
-        }
-        if (input === '/clear') {
-          await agent.clearSession();
-          console.log('当前会话已清空。');
-          continue;
-        }
-        if (input === '/sessions') {
-          console.log((await agent.listSessions()).map((id) => `${id === agent.currentSessionId ? '*' : ' '} ${id}`).join('\n') || '暂无会话');
-          continue;
-        }
-        if (input === '/history') {
-          console.log(compactHistory(await agent.history()) || '当前会话为空');
-          continue;
-        }
-        if (input.startsWith('/new')) {
-          const id = input.split(/\s+/)[1] ?? randomUUID().slice(0, 8);
-          await agent.switchSession(id);
-          console.log(`已创建并切换到会话：${id}`);
-          continue;
-        }
-        if (input.startsWith('/switch ')) {
-          const id = input.slice('/switch '.length).trim();
-          await agent.switchSession(id);
-          console.log(`已切换到会话：${id}`);
-          continue;
-        }
-        if (input === '/index' || input.startsWith('/index ')) {
-          const target = input.slice('/index'.length).trim() || 'knowledge';
-          console.log('正在构建知识库索引...');
-          console.log(await agent.indexKnowledge(target));
-          continue;
-        }
         try {
+          const result = await commands.execute(input);
+          if (result === 'exit') break;
+          if (result === 'handled') continue;
+          commands.remember(input);
           await runTask(input);
         } catch (error) {
           console.error(`\n运行失败：${error instanceof Error ? error.message : String(error)}`);
