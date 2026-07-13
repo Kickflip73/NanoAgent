@@ -5,10 +5,36 @@ type Writable = {
   isTTY?: boolean;
 };
 
+type StatusTone = 'agent' | 'thinking' | 'tool' | 'success';
+
 export type DisplayEvent =
   | { kind: 'answer'; text: string }
   | { kind: 'reasoning'; text: string }
-  | { kind: 'status'; text: string; next: string };
+  | {
+      kind: 'status';
+      tone: StatusTone;
+      title: string;
+      detail?: string;
+      next: string;
+    };
+
+const ansi = {
+  reset: '\x1b[0m',
+  bold: '\x1b[1m',
+  dim: '\x1b[2m',
+  italic: '\x1b[3m',
+  code: '\x1b[38;2;214;157;101m',
+  gray: '\x1b[38;2;145;141;135m',
+};
+
+const badges: Record<StatusTone | 'answer' | 'done', { icon: string; label: string; rgb: string }> = {
+  agent: { icon: '◆', label: 'Agent', rgb: '165;158;148' },
+  thinking: { icon: '✦', label: '思考', rgb: '165;158;148' },
+  tool: { icon: '●', label: '工具', rgb: '217;149;85' },
+  success: { icon: '└', label: '结果', rgb: '111;174;130' },
+  answer: { icon: '◆', label: '回答', rgb: '217;119;87' },
+  done: { icon: '✓', label: '完成', rgb: '111;174;130' },
+};
 
 function record(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === 'object'
@@ -20,9 +46,7 @@ function compact(value: unknown, limit = 160): string {
   const text = typeof value === 'string' ? value : JSON.stringify(value);
   if (!text) return '';
   const singleLine = text.replace(/\s+/g, ' ').trim();
-  return singleLine.length <= limit
-    ? singleLine
-    : `${singleLine.slice(0, limit)}…`;
+  return singleLine.length <= limit ? singleLine : `${singleLine.slice(0, limit)}…`;
 }
 
 function rawItem(event: RunStreamEvent): Record<string, unknown> | undefined {
@@ -34,7 +58,8 @@ export function parseRunEvent(event: RunStreamEvent): DisplayEvent | undefined {
   if (event.type === 'agent_updated_stream_event') {
     return {
       kind: 'status',
-      text: `🤖 当前 Agent：${event.agent.name}`,
+      tone: 'agent',
+      title: event.agent.name,
       next: 'Agent 工作中',
     };
   }
@@ -43,25 +68,32 @@ export function parseRunEvent(event: RunStreamEvent): DisplayEvent | undefined {
     const raw = rawItem(event);
     if (event.name === 'tool_called') {
       const name = typeof raw?.name === 'string' ? raw.name : 'unknown';
-      const args = compact(raw?.arguments);
       return {
         kind: 'status',
-        text: `🔧 调用工具 ${name}${args ? ` ${args}` : ''}`,
+        tone: 'tool',
+        title: name,
+        detail: compact(raw?.arguments),
         next: `正在执行 ${name}`,
       };
     }
     if (event.name === 'tool_output') {
       const item = record(event.item);
       const name = typeof raw?.name === 'string' ? raw.name : 'tool';
-      const output = compact(item?.output, 120);
       return {
         kind: 'status',
-        text: `✓ 工具完成 ${name}${output ? ` → ${output}` : ''}`,
+        tone: 'success',
+        title: name,
+        detail: compact(item?.output, 120),
         next: '模型继续思考',
       };
     }
     if (event.name === 'reasoning_item_created') {
-      return { kind: 'status', text: '💭 推理阶段完成', next: '生成回答' };
+      return {
+        kind: 'status',
+        tone: 'thinking',
+        title: '推理阶段完成',
+        next: '生成回答',
+      };
     }
     return undefined;
   }
@@ -73,15 +105,12 @@ export function parseRunEvent(event: RunStreamEvent): DisplayEvent | undefined {
   if (event.data.type !== 'model') return undefined;
 
   const providerEvent = record(event.data.event);
-  const choices = Array.isArray(providerEvent?.choices)
-    ? providerEvent.choices
-    : undefined;
+  const choices = Array.isArray(providerEvent?.choices) ? providerEvent.choices : undefined;
   const choice = record(choices?.[0]);
   const delta = record(choice?.delta);
   if (typeof delta?.reasoning_content === 'string') {
     return { kind: 'reasoning', text: delta.reasoning_content };
   }
-
   if (
     providerEvent?.type === 'response.reasoning_summary_text.delta' &&
     typeof providerEvent.delta === 'string'
@@ -91,12 +120,143 @@ export function parseRunEvent(event: RunStreamEvent): DisplayEvent | undefined {
   return undefined;
 }
 
+function inlineMarkdown(text: string, tty: boolean): string {
+  let value = text.replace(/\x1b/g, '');
+  value = value.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '$1 ($2)');
+  value = value.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_, label: string, url: string) =>
+    tty ? `${label} ${ansi.dim}(${url})${ansi.reset}` : `${label} (${url})`,
+  );
+  value = value.replace(/`([^`]+)`/g, (_, code: string) =>
+    tty ? `${ansi.code}${code}${ansi.reset}` : code,
+  );
+  value = value.replace(/\*\*([^*]+)\*\*/g, (_, content: string) =>
+    tty ? `${ansi.bold}${content}${ansi.reset}` : content,
+  );
+  value = value.replace(/__([^_]+)__/g, (_, content: string) =>
+    tty ? `${ansi.bold}${content}${ansi.reset}` : content,
+  );
+  value = value.replace(/~~([^~]+)~~/g, '$1');
+  value = value.replace(/(?<!\*)\*([^*]+)\*(?!\*)/g, (_, content: string) =>
+    tty ? `${ansi.italic}${content}${ansi.reset}` : content,
+  );
+  return value;
+}
+
+export function renderMarkdownLine(
+  source: string,
+  tty = true,
+  state: { code: boolean } = { code: false },
+): string {
+  const line = source.replace(/\x1b/g, '');
+  const fence = line.match(/^\s*```\s*([^`]*)$/);
+  if (fence) {
+    state.code = !state.code;
+    const language = fence[1]?.trim();
+    if (state.code) return language ? `  ┌─ ${language}` : '  ┌─';
+    return '  └─';
+  }
+  if (state.code) {
+    return tty ? `  ${ansi.gray}│ ${line}${ansi.reset}` : `  │ ${line}`;
+  }
+
+  const heading = line.match(/^\s{0,3}(#{1,6})\s+(.+)$/);
+  if (heading) {
+    const text = inlineMarkdown(heading[2]!, tty);
+    const indent = heading[1]!.length > 2 ? '  ' : '';
+    return tty ? `${indent}${ansi.bold}${text}${ansi.reset}` : `${indent}${text}`;
+  }
+  if (/^\s{0,3}([-*_])(?:\s*\1){2,}\s*$/.test(line)) {
+    return tty ? `${ansi.dim}${'─'.repeat(48)}${ansi.reset}` : '─'.repeat(48);
+  }
+
+  const tableDivider = line.match(/^\s*\|?(?:\s*:?-+:?\s*\|)+\s*:?-+:?\s*\|?\s*$/);
+  if (tableDivider) return tty ? `${ansi.dim}${'─'.repeat(48)}${ansi.reset}` : '─'.repeat(48);
+  if (line.trim().startsWith('|') && line.trim().endsWith('|')) {
+    const cells = line.trim().slice(1, -1).split('|').map((cell) => inlineMarkdown(cell.trim(), tty));
+    return `  ${cells.join('  │  ')}`;
+  }
+
+  const quote = line.match(/^\s*>\s?(.*)$/);
+  if (quote) {
+    const text = inlineMarkdown(quote[1]!, tty);
+    return tty ? `${ansi.gray}│ ${text}${ansi.reset}` : `│ ${text}`;
+  }
+  const task = line.match(/^(\s*)[-*+]\s+\[([ xX])\]\s+(.*)$/);
+  if (task) return `${task[1]}${task[2]!.toLowerCase() === 'x' ? '✓' : '○'} ${inlineMarkdown(task[3]!, tty)}`;
+  const bullet = line.match(/^(\s*)[-*+]\s+(.*)$/);
+  if (bullet) return `${bullet[1]}• ${inlineMarkdown(bullet[2]!, tty)}`;
+  return inlineMarkdown(line, tty);
+}
+
+class MarkdownStream {
+  private buffer = '';
+  private readonly state = { code: false };
+  private timer?: NodeJS.Timeout;
+
+  constructor(
+    private readonly output: Writable,
+    private readonly tty: boolean,
+  ) {}
+
+  write(chunk: string): void {
+    this.buffer += chunk;
+    let newline = this.buffer.indexOf('\n');
+    while (newline >= 0) {
+      const line = this.buffer.slice(0, newline);
+      this.buffer = this.buffer.slice(newline + 1);
+      this.output.write(`${renderMarkdownLine(line, this.tty, this.state)}\n`);
+      newline = this.buffer.indexOf('\n');
+    }
+    this.scheduleFlush();
+  }
+
+  flush(): boolean {
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = undefined;
+    if (!this.buffer) return false;
+    this.output.write(renderMarkdownLine(this.buffer, this.tty, this.state));
+    this.buffer = '';
+    return true;
+  }
+
+  private scheduleFlush(): void {
+    if (!this.buffer || this.timer) return;
+    this.timer = setTimeout(() => {
+      this.timer = undefined;
+      if (!this.canFlushPartial()) {
+        this.scheduleFlush();
+        return;
+      }
+      this.output.write(renderMarkdownLine(this.buffer, this.tty, this.state));
+      this.buffer = '';
+    }, 45);
+    this.timer.unref();
+  }
+
+  private canFlushPartial(): boolean {
+    const trimmed = this.buffer.trim();
+    if (!trimmed) return false;
+    if (/^#{1,6}$/.test(trimmed) || trimmed.startsWith('```')) return false;
+    const boldMarkers = (this.buffer.match(/\*\*/g) ?? []).length;
+    const codeMarkers = (this.buffer.match(/(?<!`)`(?!`)/g) ?? []).length;
+    return boldMarkers % 2 === 0 && codeMarkers % 2 === 0;
+  }
+}
+
+function badge(tone: keyof typeof badges, tty: boolean): string {
+  const item = badges[tone];
+  if (!tty) return `${item.icon} ${item.label}`;
+  return `\x1b[38;2;${item.rgb}m${item.icon} ${item.label}${ansi.reset}`;
+}
+
 export class TerminalRenderer {
   private readonly frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
   private timer?: NodeJS.Timeout;
   private frame = 0;
   private label = '';
-  private line: 'answer' | 'reasoning' | undefined;
+  private active?: 'answer' | 'reasoning';
+  private markdown?: MarkdownStream;
+  private hasBlock = false;
   private readonly startedAt = Date.now();
 
   constructor(
@@ -109,6 +269,7 @@ export class TerminalRenderer {
     this.label = label;
     if (!this.status.isTTY) {
       this.status.write(`[运行] ${label}\n`);
+      this.hasBlock = true;
       return;
     }
     this.draw();
@@ -122,47 +283,70 @@ export class TerminalRenderer {
 
     if (display.kind === 'status') {
       this.stopSpinner();
-      this.closeLine();
-      this.status.write(`${display.text}\n`);
+      this.closeActive();
+      this.beginBlock(this.status);
+      this.status.write(`${badge(display.tone, Boolean(this.status.isTTY))}  ${display.title}${display.detail ? `\n  ${this.muted(display.detail, this.status)}` : ''}\n`);
       this.start(display.next);
       return;
     }
 
     this.stopSpinner();
     if (display.kind === 'reasoning') {
-      if (this.line !== 'reasoning') {
-        this.closeLine();
-        this.status.write('💭 思考> ');
-        this.line = 'reasoning';
+      if (this.active !== 'reasoning') {
+        this.closeActive();
+        this.beginBlock(this.status);
+        this.status.write(`${badge('thinking', Boolean(this.status.isTTY))}\n`);
+        this.active = 'reasoning';
+        this.markdown = new MarkdownStream(this.status, Boolean(this.status.isTTY));
       }
-      this.status.write(display.text);
+      this.markdown?.write(display.text);
       return;
     }
 
-    if (this.line !== 'answer') {
-      this.closeLine();
-      this.answer.write('助手> ');
-      this.line = 'answer';
+    if (this.active !== 'answer') {
+      this.closeActive();
+      this.beginBlock(this.answer);
+      this.answer.write(`${badge('answer', Boolean(this.answer.isTTY))}\n`);
+      this.active = 'answer';
+      this.markdown = new MarkdownStream(this.answer, Boolean(this.answer.isTTY));
     }
-    this.answer.write(display.text);
+    this.markdown?.write(display.text);
   }
 
   finish(): void {
     this.stopSpinner();
-    this.closeLine();
+    this.closeActive();
     const seconds = ((Date.now() - this.startedAt) / 1_000).toFixed(1);
-    this.status.write(`✓ 任务完成 · ${seconds}s\n`);
+    this.beginBlock(this.status);
+    this.status.write(`${badge('done', Boolean(this.status.isTTY))}  ${this.muted(`${seconds}s`, this.status)}\n`);
   }
 
   stop(): void {
     this.stopSpinner();
-    this.closeLine();
+    this.closeActive();
+  }
+
+  private beginBlock(output: Writable): void {
+    if (this.hasBlock) output.write('\n');
+    this.hasBlock = true;
+  }
+
+  private closeActive(): void {
+    if (!this.active) return;
+    const wroteTail = this.markdown?.flush() ?? false;
+    if (wroteTail) (this.active === 'answer' ? this.answer : this.status).write('\n');
+    this.active = undefined;
+    this.markdown = undefined;
+  }
+
+  private muted(text: string, output: Writable): string {
+    return output.isTTY ? `${ansi.gray}${text}${ansi.reset}` : text;
   }
 
   private draw(): void {
     const icon = this.frames[this.frame % this.frames.length];
     this.frame += 1;
-    this.status.write(`\r\x1b[2K${icon} ${this.label}`);
+    this.status.write(`\r\x1b[2K${ansi.gray}${icon} ${this.label}${ansi.reset}`);
   }
 
   private stopSpinner(): void {
@@ -170,15 +354,7 @@ export class TerminalRenderer {
       clearInterval(this.timer);
       this.timer = undefined;
     }
-    if (this.status.isTTY && this.label) {
-      this.status.write('\r\x1b[2K');
-    }
+    if (this.status.isTTY && this.label) this.status.write('\r\x1b[2K');
     this.label = '';
-  }
-
-  private closeLine(): void {
-    if (this.line === 'answer') this.answer.write('\n');
-    if (this.line === 'reasoning') this.status.write('\n');
-    this.line = undefined;
   }
 }

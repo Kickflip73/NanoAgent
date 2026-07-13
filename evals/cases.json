@@ -1,0 +1,10 @@
+[
+  {
+    "query": "NanoAgent 使用什么语言和 SDK？",
+    "expectedSource": "knowledge/nano-agent.md"
+  },
+  {
+    "query": "NanoAgent 的运行数据保存在哪里？",
+    "expectedSource": "knowledge/nano-agent.md"
+  }
+]

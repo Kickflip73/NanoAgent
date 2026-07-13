@@ -1,87 +1,78 @@
 # NanoAgent
 
-一个用于学习 AI Agent 基本原理的轻量级示例项目。
+一个用于学习现代 AI Agent 核心技术的轻量级 TypeScript 项目。
 
-NanoAgent 使用 TypeScript 和 OpenAI Agents SDK 构建，把一个 Agent 最核心的组成部分压缩在少量代码中：模型、提示词、会话、工具调用、运行循环、过程事件和流式输出。项目支持 OpenAI 与 DeepSeek，适合用来理解 Agent 如何从“回答问题”进化到“调用工具完成任务”。
+NanoAgent 使用 OpenAI Agents SDK 作为运行内核，在少量代码中展示 Agent Loop、工具调用、流式事件、上下文管理、持久会话、长期记忆、Skill、MCP、本地 RAG、轻量计划与 Trace。它保持单 Agent、单进程和 CLI 形态，不尝试成为生产级平台。
 
-> 这是一个学习项目，不是生产级 Agent 平台。默认启用了本机文件和 Shell 工具，请仅在可信环境中运行。
+> 默认包含本机文件和 Shell 工具，请只在可信环境中运行。
 
-## 特性
+## 为什么是 NanoAgent
+
+许多 Agent 示例只展示一次工具调用，而完整框架又很难看清核心机制。NanoAgent 选择中间路线：保留一个可直接运行的 Agent，把上下文、会话、记忆、Skill、MCP 和 RAG 分别放进小而明确的模块中，方便阅读、调试和替换。
+
+## 核心能力
 
 - OpenAI Agents SDK 驱动的 Agent Loop
-- 支持 OpenAI Responses API
-- 支持 DeepSeek OpenAI-compatible Chat Completions API
-- 进程内多轮会话记忆
-- 最多 200 个 Agent 执行轮次
-- 动态终端状态动画
-- 实时展示模型 reasoning、工具调用及结果摘要
-- 最终回答流式输出
-- 本机文件读取、写入和目录浏览
-- 本机 zsh 命令执行
-- 时间与计算工具
-- OpenAI 模式下支持 Web Search 和 Code Interpreter
-- 自动使用 `HTTP_PROXY` / `HTTPS_PROXY`
-- 无 UI 框架、数据库、消息队列和额外日志框架
-
-## 运行效果
-
-```text
-⠹ 模型思考中
-💭 思考> 需要先获取当前年份，再进行计算。
-🔧 调用工具 current_time {}
-✓ 工具完成 current_time → {"timezone":"Asia/Shanghai", ...}
-🔧 调用工具 calculate {"operation":"add","a":2026,"b":17}
-✓ 工具完成 calculate → 2043
-助手> 当前是 2026 年，加上 17 年后是 2043 年。
-✓ 任务完成 · 4.1s
-```
+- OpenAI Responses API 与 DeepSeek OpenAI-compatible API
+- 持久化多轮会话，可新建、切换和恢复
+- 上下文窗口裁剪、旧历史压缩和动态上下文组装
+- 可检索、可删除的本地长期记忆
+- Markdown Skill 扫描与按需加载
+- Agents SDK 原生 stdio MCP Client
+- Markdown/Text 文档切片、Embedding 和本地 JSON 检索
+- 没有 Embedding Key 时自动使用轻量词法检索
+- 多步骤任务 Plan
+- Spinner、分块事件、Reasoning Summary 和最终回答流式输出
+- Claude Code 风格的低饱和事件配色与终端友好 Markdown 渲染
+- 本地 JSONL Trace 和最小 Retrieval Eval
 
 ## 架构
 
 ```text
 src/
-├── index.ts       # 配置加载、网络代理、CLI 入口和流消费
-├── agent.ts       # 模型选择、Agent、Runner 和 Session
-├── tools.ts       # 本机工具与 OpenAI 托管工具
-└── terminal.ts    # Spinner、运行事件和流式文本渲染
-
-tests/
-├── tools.test.ts
-└── terminal.test.ts
+├── index.ts              # CLI 与运行事件消费
+├── agent.ts              # Agent 组装和一次运行
+├── config.ts             # 环境配置
+├── core/
+│   ├── context.ts        # 上下文裁剪、压缩与组装
+│   ├── session.ts        # JSON 持久会话
+│   ├── memory.ts         # 长期记忆及工具
+│   ├── plan.ts           # 当前会话计划及工具
+│   └── trace.ts          # JSONL 执行记录
+├── extensions/
+│   ├── skills.ts         # Skill 发现与按需加载
+│   ├── mcp.ts            # MCP Server 生命周期
+│   └── rag.ts            # 文档索引与检索
+├── tools.ts              # 本机及 OpenAI 托管工具
+├── terminal.ts           # 终端动画和流式渲染
+└── eval.ts               # 最小检索评测
 ```
 
-一次请求的主要调用链：
+一次请求的调用链：
 
 ```text
-CLI
- └─ NanoAgent.stream()
-     └─ OpenAI Agents SDK Runner
-         ├─ OpenAI / DeepSeek
-         ├─ Function Tools
-         └─ MemorySession
+用户输入
+  → 检索长期记忆和知识库
+  → 加载 Skill 目录与当前 Plan
+  → Context Manager 组装 Instructions
+  → Agents SDK Runner
+      ├─ OpenAI / DeepSeek
+      ├─ 内置 Tools
+      ├─ MCP Tools
+      └─ 持久 Session
+  → 流式输出并写入 Trace
 ```
 
-## 环境要求
-
-- Node.js 22 或更高版本
-- npm
-- OpenAI API Key 或 DeepSeek API Key
+这里刻意只分两层：`core` 是 Agent 自身状态，`extensions` 是可插拔能力。详细设计见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
 ## 快速启动
 
-### 1. 克隆和安装
+要求 Node.js 22 或更高版本。
 
 ```bash
 git clone https://github.com/Kickflip73/NanoAgent.git
 cd NanoAgent
 npm install
-```
-
-### 2. 配置模型
-
-复制配置模板：
-
-```bash
 cp .env.example .env
 ```
 
@@ -102,93 +93,179 @@ DEEPSEEK_BASE_URL=https://api.deepseek.com
 DEEPSEEK_MODEL=deepseek-v4-flash
 ```
 
-`.env` 已被 Git 忽略，不要把真实 Key 写入 `.env.example` 或任何源代码文件。
-
-### 3. 启动交互模式
+启动交互模式：
 
 ```bash
 npm start
 ```
+
+执行单次任务：
+
+```bash
+npm start -- "读取 package.json 并介绍这个项目"
+```
+
+`.env` 和运行目录 `.nano-agent/` 已被 Git 忽略。不要将真实 API Key 写入代码、配置示例或提交记录。
+
+### 可选配置
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `MAX_TURNS` | `200` | 单次 Agent 运行最大轮数 |
+| `HISTORY_LIMIT` | `40` | 送入模型的近期历史条数；会从完整用户轮次开始截取 |
+| `AGENT_WORKSPACE` | 当前目录 | 文件、Shell、Skill 和知识库的工作区 |
+| `AGENT_DATA_DIR` | `<workspace>/.nano-agent` | 会话、记忆、计划、索引和 Trace 目录 |
+| `AGENT_SKILLS_DIR` | `<workspace>/skills` | Skill 根目录 |
+| `MCP_CONFIG` | `<workspace>/mcp.json` | MCP Server 配置文件 |
+| `EMBEDDING_MODEL` | `text-embedding-3-small` | RAG Embedding 模型 |
+
+## 会话与上下文
 
 内置命令：
 
-- `/exit`：退出
-- `/clear`：清屏
+| 命令 | 作用 |
+|---|---|
+| `/new [id]` | 新建并切换会话 |
+| `/sessions` | 列出本地会话 |
+| `/switch <id>` | 切换已有会话 |
+| `/history` | 查看当前完整历史 |
+| `/clear` | 清空当前会话 |
+| `/index [path]` | 构建 RAG 索引，默认 `knowledge/` |
+| `/exit` | 退出 |
 
-### 4. 单次任务
+完整会话保存在 `.nano-agent/sessions/`。发送给模型时会从最近的完整用户轮次开始保留约 `HISTORY_LIMIT` 条历史，避免拆散工具调用与工具结果；更早的人类对话压缩到动态 Instructions，且不会反向写入会话。完整原始历史不会因此删除。
 
-```bash
-npm start -- "现在几点？"
-npm start -- "读取 package.json 并介绍这个项目"
-npm start -- "运行测试并告诉我结果"
+## 终端展示
+
+交互输出使用低饱和前景色和简洁符号区分事件，并在事件块之间保留空行：
+
+```text
+✦ 思考
+需要读取项目配置。
+
+● 工具  read_file
+  {"path":"package.json"}
+
+└ 结果  read_file
+  {"name":"nano-agent", ...}
+
+◆ 回答
+项目配置已读取。
+
+✓ 完成  2.1s
 ```
 
-## 工作区
+颜色只在 TTY 中启用，管道和日志输出不会包含 ANSI 控制符。最终回答会定时增量刷新，并按行渲染 Markdown：标题不再显示 `###`，列表、引用、代码块、表格、粗体、行内代码和链接会转换为适合终端阅读的形式。
 
-默认工作区是启动命令所在目录。可以通过环境变量指定：
+## 长期记忆
+
+会话保存“发生过什么”，记忆保存“以后仍有价值的信息”。Agent 可调用：
+
+- `remember`：保存偏好、事实、决策或待办
+- `recall`：搜索相关记忆
+- `list_memories`：列出记忆
+- `forget`：删除指定记忆
+
+用户明确说“记住……”时，Agent 会使用 `remember`。记忆保存在 `.nano-agent/memories.json`，并在后续相关问题中自动检索。
+
+## Skill
+
+每个 Skill 是一个目录和 `SKILL.md`：
+
+```text
+skills/code-review/SKILL.md
+```
+
+```md
+---
+name: code-review
+description: 审查当前代码变更
+---
+
+1. 获取 git diff。
+2. 阅读相关文件。
+3. 运行测试并输出问题。
+```
+
+启动时只把名称和描述放入上下文；Agent 调用 `use_skill` 后才读取完整工作流。仓库包含 `code-review` 和 `research` 两个示例。
+
+## MCP
+
+`mcp.json` 默认不启动任何 Server。复制示例即可接入 filesystem MCP：
 
 ```bash
-export AGENT_WORKSPACE=/path/to/workspace
+cp mcp.example.json mcp.json
 npm start
 ```
 
-相对文件路径和 Shell 命令都会以该目录为基础。绝对路径仍然可以访问本机其他位置。
+```json
+{
+  "servers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."],
+      "cwd": "."
+    }
+  }
+}
+```
 
-## 内置工具
+NanoAgent 负责读取配置和连接/关闭 Server，工具发现与调用直接交给 Agents SDK，不重复实现 MCP 协议。
 
-| 工具 | 说明 | 可用 Provider |
-|---|---|---|
-| `current_time` | 获取时间和时区 | 全部 |
-| `read_file` | 读取本机文本文件 | 全部 |
-| `write_file` | 创建或覆盖文本文件 | 全部 |
-| `list_directory` | 浏览本机目录 | 全部 |
-| `run_shell` | 执行 zsh 命令 | 全部 |
-| `calculate` | 基础数学运算 | 全部 |
-| `web_search` | OpenAI 托管联网搜索 | OpenAI |
-| `code_interpreter` | OpenAI 托管代码执行 | OpenAI |
+## RAG
 
-DeepSeek 模式没有 OpenAI 托管工具，但 Agent 可以通过本机 `run_shell` 使用已有的命令行工具完成联网和代码执行。
+将 Markdown 或文本文件放到 `knowledge/`，然后在交互模式执行：
 
-## 开发与验证
+```text
+/index knowledge
+```
+
+RAG 流程：
+
+```text
+读取文档 → 切片 → Embedding → JSON 索引 → 相似度检索 → 注入上下文
+```
+
+如果配置了 `OPENAI_API_KEY`，默认使用 `text-embedding-3-small`；没有 Key 或 Embedding 请求失败时自动回退到词法相似度，因此 DeepSeek-only 环境也能运行。索引保存在 `.nano-agent/rag-index.json`，适合小型学习知识库，不面向海量数据。
+
+## Plan、Trace 与 Eval
+
+复杂任务可以调用 `update_plan`，计划按会话保存在 `.nano-agent/plans.json`。运行事件保存在 `.nano-agent/traces/<session-id>.jsonl`，只记录展示事件和工具摘要，不保存模型隐藏思维链。
+
+运行类型检查、测试和最小 RAG 评测：
 
 ```bash
 npm run check
 npm test
+npm run eval
 ```
 
-项目使用 TypeScript 严格模式和 Node.js 内置测试运行器，不需要额外测试框架。
+## 内置工具
 
-## 适合学习什么
+| 类别 | 工具 |
+|---|---|
+| 本机 | `current_time`、`read_file`、`write_file`、`list_directory`、`run_shell`、`calculate` |
+| 记忆 | `remember`、`recall`、`list_memories`、`forget` |
+| Skill | `use_skill`、`list_skills` |
+| RAG | `search_knowledge`、`index_knowledge` |
+| Plan | `update_plan`、`show_plan` |
+| OpenAI 托管 | `web_search`、`code_interpreter` |
+| MCP | 来自 `mcp.json` 中已连接的 Server |
 
-- Agent、Runner、Session 各自负责什么
-- Function Calling 如何连接模型与本地代码
-- 模型如何在多轮运行中选择并连续调用工具
-- OpenAI 与 OpenAI-compatible 模型如何共用 Agent Runtime
-- 如何消费 Agent 运行事件
-- 如何实现终端状态动画和 token 流式输出
-- 为什么工具权限是 Agent 应用的重要边界
+## 有意保留的边界
 
-## 当前限制
+NanoAgent 不实现 Web UI、多 Agent、消息网关、分布式任务、复杂工作流、企业向量数据库、权限审批平台或 Docker 沙箱。这些是生产系统能力，不是本项目要解释的核心机制。
 
-- 会话只保存在内存中，进程退出后清空
-- 只有 CLI，没有 Web UI 或消息渠道
-- 没有长期记忆、任务队列和定时任务
-- 没有工具审批或沙箱隔离
-- DeepSeek 的 `reasoning_content` 通过 Provider 原始事件读取
+`run_shell` 和文件工具拥有当前操作系统用户权限。请在测试目录或隔离环境运行，不要处理不可信提示词，也不要在工作区存放敏感文件。
 
-这些限制是刻意保留的，使代码足够小，便于学习和修改。
+## 项目文档
 
-## 安全说明
+- [架构与设计不变量](docs/ARCHITECTURE.md)
+- [贡献指南](CONTRIBUTING.md)
+- [安全策略](SECURITY.md)
+- [版本记录](CHANGELOG.md)
 
-NanoAgent 的 `run_shell`、文件读取和文件写入工具拥有当前操作系统用户的权限。Agent 可以修改或删除文件，也可能执行模型从外部内容中读到的指令。
-
-建议：
-
-- 只在测试目录或隔离环境运行
-- 不要把服务暴露给不可信用户
-- 不要让 Agent 处理来源不明的提示词和网页内容
-- 不要在工作区存放敏感文件
-- 定期检查模型 API 用量
+欢迎提交 Issue 和 Pull Request。新增能力时请优先保证代码可读性，避免把 NanoAgent 扩展成复杂平台。
 
 ## License
 
