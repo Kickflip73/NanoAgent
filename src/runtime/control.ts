@@ -50,7 +50,7 @@ export function createRuntimeControlTools(controls: RuntimeControls): Tool[] {
     }),
     tool({
       name: 'switch_mode',
-      description: '切换标准、规划、编码或调研模式；从下一轮对话生效。',
+      description: '切换通用（general）、Plan（plan）或 Ultra Team（ultra）模式；从下一轮对话生效。',
       parameters: z.object({ mode: z.string().min(1) }),
       execute: async ({ mode }) => {
         controls.switchMode(mode);

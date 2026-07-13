@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.10.0] - 2026-07-14
+
+### Added
+
+- add a lightweight Ultra Team runtime with five worker roles, persistent per-session task lists, dependencies, atomic claims, partial-failure reporting, and bounded concurrency
+- add deterministic builder path-overlap protection, Team lifecycle traces, `/team`, resume context, and configurable `TEAM_MAX_CONCURRENCY`
+- add Plan-mode tool policy, Team store/concurrency regressions, and a real Ultra Team Agent behavior eval
+
+### Changed
+
+- replace the four cosmetic presets with three capability-aware modes: General, read-only Plan, and Ultra Team
+- scope SubAgent tools by mode and expose a read-only architect in Plan and Ultra
+- document the mode contract, orchestration lifecycle, safety invariants, configuration, and extension boundaries
+
 ## [0.9.0] - 2026-07-14
 
 ### Added

@@ -9,7 +9,7 @@ function fakeAgent(): NanoAgent {
     runtimeInfo: async () => ({
       provider: 'deepseek',
       model: 'deepseek-chat',
-      mode: { id: 'standard', label: '标准', description: '平衡速度与完整性', instruction: '' },
+      mode: { id: 'general', label: '通用', description: '大多数任务', instruction: '' },
       sessionId: 'demo',
       sessionTitle: '讨论 NanoAgent',
       workspaceRoot: '/tmp/demo',
@@ -18,6 +18,7 @@ function fakeAgent(): NanoAgent {
       memoryCount: 1,
       mcpServers: [],
       guidanceFiles: [{ scope: 'project', path: '/tmp/demo/NANO.md', truncated: false }],
+      team: { total: 0, pending: 0, running: 0, completed: 0, failed: 0 },
     }),
     listSessions: async () => ['demo'],
     listSessionSummaries: async () => [{
@@ -34,6 +35,7 @@ function fakeAgent(): NanoAgent {
     reloadSkills: async () => ({ skills: [{ name: 'review', description: 'Review code' }], warnings: [] }),
     listMemories: async () => [{ id: 'm1', type: 'fact', content: 'uses TS', createdAt: '' }],
     currentPlan: async () => [{ id: '1', description: 'test', status: 'running' }],
+    currentTeam: async () => [],
     currentGoal: async () => ({ objective: 'ship NanoAgent', status: 'active', createdAt: '', updatedAt: '' }),
     setGoal: async (objective: string) => ({ objective, status: 'active', createdAt: '', updatedAt: '' }),
     resumePrompt: async () => 'resume goal',
@@ -42,8 +44,8 @@ function fakeAgent(): NanoAgent {
     switchModel: () => undefined,
     contextInfo: async () => ({ historyItems: 4, historyLimit: 40, estimatedTokens: 1200, contextWindow: 128000, memories: 1, planSteps: 1, goal: 'active' }),
     availableModes: () => [
-      { id: 'standard', label: '标准', description: '平衡速度与完整性' },
-      { id: 'code', label: '编码', description: '代码任务' },
+      { id: 'general', label: '通用', description: '大多数任务' },
+      { id: 'ultra', label: 'Ultra Team', description: '大型任务' },
     ],
     switchMode: () => undefined,
     toolNames: ['read_file', 'run_shell'],
@@ -68,6 +70,7 @@ test('handles status and high-frequency inspection commands', async () => {
     assert.equal(await handler.execute('/skills'), 'handled');
     assert.equal(await handler.execute('/memories'), 'handled');
     assert.equal(await handler.execute('/plan'), 'handled');
+    assert.equal(await handler.execute('/team'), 'handled');
     assert.equal(await handler.execute('/instructions'), 'handled');
     assert.match(output.join('\n'), /deepseek-chat/);
     assert.match(output.join('\n'), /Review code/);
@@ -143,11 +146,11 @@ test('selects a preset Agent mode', async () => {
   agent.switchMode = (mode) => switched.push(mode);
   const handler = new CommandHandler(agent, async () => undefined, {
     write: () => undefined,
-    selectMode: async () => 'code',
+    selectMode: async () => 'ultra',
   });
 
   assert.equal(await handler.execute('/mode'), 'handled');
-  assert.deepEqual(switched, ['code']);
+  assert.deepEqual(switched, ['ultra']);
 });
 
 test('switches terminal output detail level', async () => {

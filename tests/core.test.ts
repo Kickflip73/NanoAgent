@@ -351,8 +351,10 @@ test('isolates an MCP connection failure instead of blocking startup', async () 
 });
 
 test('creates bounded researcher and reviewer agent tools', () => {
-  const tools = createSubAgentTools({ model: 'gpt-5-mini', tools: [] });
+  const tools = createSubAgentTools({ mode: 'general', model: 'gpt-5-mini', tools: [] });
   assert.deepEqual(tools.map((tool) => tool.name), ['delegate_research', 'delegate_review']);
+  const planTools = createSubAgentTools({ mode: 'plan', model: 'gpt-5-mini', tools: [] });
+  assert.deepEqual(planTools.map((tool) => tool.name), ['delegate_research', 'delegate_architecture', 'delegate_review']);
 });
 
 test('emits lightweight runtime lifecycle hooks', async () => {

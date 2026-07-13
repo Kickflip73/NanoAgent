@@ -2,7 +2,8 @@ export type RuntimeEvent =
   | { type: 'run_start'; sessionId: string; input: string }
   | { type: 'run_end'; sessionId: string; answer: string }
   | { type: 'run_error'; sessionId: string; error: string }
-  | { type: 'subagent_event'; sessionId: string; agent: string; eventType: string };
+  | { type: 'subagent_event'; sessionId: string; agent: string; eventType: string }
+  | { type: 'team_worker_event'; sessionId: string; taskId: string; role: string; eventType: 'start' | 'end' | 'error' };
 
 export type RuntimeHook = (event: RuntimeEvent) => void | Promise<void>;
 

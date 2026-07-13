@@ -22,6 +22,7 @@ export const COMMANDS = [
   { value: '/instructions', description: '查看持久指令文件' },
   { value: '/memories', description: '列出长期记忆' },
   { value: '/plan', description: '查看任务计划' },
+  { value: '/team', description: '查看 Ultra Team 任务板' },
   { value: '/goal', description: '查看或设置长期目标' },
   { value: '/resume', description: '从 Goal 检查点继续' },
   { value: '/index', description: '索引本地知识库' },
@@ -47,6 +48,7 @@ const HELP = `内置命令：
   /instructions       查看用户级与项目级 NANO.md
   /memories           列出长期记忆
   /plan               查看当前任务计划
+  /team               查看 Ultra Team 子任务、依赖和结果
   /goal [objective]   查看或设置当前长期目标
   /resume             从 Goal 检查点继续执行
   /index [path]       索引知识库，默认 knowledge
@@ -100,6 +102,7 @@ export class CommandHandler {
         `Skills    ${info.skillCount}`,
         `Memories  ${info.memoryCount}`,
         `MCP       ${info.mcpServers.join(', ') || '未连接'}`,
+        `Team      ${info.team.total ? `${info.team.completed}/${info.team.total} 完成 · ${info.team.running} 运行` : '未启用'}`,
         `NANO.md   ${info.guidanceFiles.length ? `${info.guidanceFiles.length} 个已加载` : '未配置'}`,
       ].join('\n'));
     }
@@ -204,6 +207,15 @@ export class CommandHandler {
     if (command === '/plan') {
       const plan = await this.agent.currentPlan();
       return this.handled(plan.map((step) => `- [${step.status}] ${step.id}. ${step.description}`).join('\n') || '当前没有计划');
+    }
+    if (command === '/team') {
+      const tasks = await this.agent.currentTeam();
+      return this.handled(tasks.map((task) => [
+        `- [${task.status}] ${task.id} · ${task.role} · ${task.description}`,
+        task.dependencies.length ? `依赖 ${task.dependencies.join(', ')}` : '',
+        task.owner ? `负责人 ${task.owner}` : '',
+        task.result ? `结果 ${task.result.slice(0, 240)}` : '',
+      ].filter(Boolean).join(' · ')).join('\n') || '当前没有 Ultra Team 任务');
     }
     if (command === '/goal') {
       const goal = argument ? await this.agent.setGoal(argument) : await this.agent.currentGoal();

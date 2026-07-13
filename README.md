@@ -25,11 +25,11 @@ NanoAgent 使用 OpenAI Agents SDK 作为运行内核，覆盖工具调用、流
 - Markdown/Text 增量索引、Embedding 与混合检索
 - 没有 Embedding Key 时自动使用轻量词法检索
 - 多步骤 Plan，以及跨重启 Goal、Checkpoint 与 `/resume`
-- 单层 researcher/reviewer SubAgent，主 Agent 保持最终控制
+- 通用 / Plan / Ultra Team 三种有真实工具边界的运行模式
+- 单层 SubAgent 与持久 Team task list，支持依赖、原子领取和最多 4 路并行
 - 轻量运行时 Hooks
 - Spinner、分块事件、Reasoning Summary 和最终回答流式输出
 - 非阻塞输入队列、Esc 中止和永久用户输入记录
-- 标准、规划、编码、调研四种运行模式
 - 从仅答案到完整工具详情的四级终端事件过滤
 - 常驻状态栏、内容摘要会话选择器和斜杠命令补全
 - Claude Code 风格的低饱和事件配色与终端友好 Markdown 渲染
@@ -50,16 +50,19 @@ src/
 │   ├── session.ts        # JSON 持久会话
 │   ├── memory.ts         # 长期记忆及工具
 │   ├── plan.ts           # Plan、Goal、Checkpoint 与 Resume
+│   ├── team.ts           # Ultra Team 任务、依赖与持久状态
 │   └── trace.ts          # JSONL 执行记录
 ├── extensions/
 │   ├── skills.ts         # Skill 发现与按需加载
 │   ├── mcp.ts            # MCP Client、状态与生命周期
 │   ├── rag.ts            # 文档增量索引与混合检索
-│   └── subagents.ts      # 单层 Agent-as-tool
+│   ├── subagents.ts      # 单层只读 Agent-as-tool
+│   └── team.ts           # 多角色有限并发执行器
 ├── runtime/
 │   ├── nano-agent.ts     # 运行时组合根
 │   ├── model.ts          # Provider 模型工厂
 │   ├── instructions.ts   # 基础指令与模式
+│   ├── tool-policy.ts    # 模式工具白名单
 │   ├── control.ts        # Agent 可调用的运行时控制
 │   └── hooks.ts          # 生命周期事件总线
 ├── tools.ts              # 本机及 OpenAI 托管工具
@@ -78,7 +81,8 @@ src/
       ├─ OpenAI / DeepSeek
       ├─ 内置 Tools
       ├─ MCP Tools / Resources
-      ├─ Researcher / Reviewer SubAgent
+      ├─ Researcher / Architect / Reviewer SubAgent
+      ├─ Ultra Team Worker（按需）
       └─ 持久 Session
   → 流式输出并写入 Trace
 ```
@@ -152,6 +156,8 @@ NanoAgent 始终从 `~/.nano-agent/.env` 读取模型和 API Key 配置，因此
 | `OUTPUT_LEVEL` | `tools` | 启动时的事件展示等级：`answer`、`thinking`、`tools`、`trace` |
 | `OPENAI_MODELS` / `DEEPSEEK_MODELS` | 内置常用模型 | `/model` 选择器追加的逗号分隔模型列表 |
 | `AGENT_SESSION` | `default` | 启动时使用的本地会话 ID |
+| `AGENT_MODE` | `general` | 启动模式：`general`、`plan`、`ultra` |
+| `TEAM_MAX_CONCURRENCY` | `4` | Ultra Team worker 并发上限，运行时强制不超过 4 |
 | `AGENT_WORKSPACE` | 当前目录 | 文件、Shell、Skill 和知识库的工作区 |
 | `AGENT_DATA_DIR` | `<workspace>/.nano-agent` | 会话、记忆、计划、索引和 Trace 目录 |
 | `AGENT_SKILLS_DIR` | `<workspace>/skills` | Skill 根目录 |
@@ -166,7 +172,7 @@ NanoAgent 始终从 `~/.nano-agent/.env` 读取模型和 API Key 配置，因此
 | 命令 | 作用 |
 |---|---|
 | `/model [name]` | 查看或切换当前 Provider 下的模型；无参数时使用选择器 |
-| `/mode [name]` | 在标准、规划、编码和调研模式之间切换 |
+| `/mode [name]` | 在 `general`、`plan`、`ultra` 之间切换 |
 | `/output [level]` | 切换终端执行事件的展示详细度 |
 | `/new [id]` | 新建并切换会话 |
 | `/sessions` | 按内容摘要列出最近对话，使用 ↑↓ 和 Enter 切换 |
@@ -181,6 +187,7 @@ NanoAgent 始终从 `~/.nano-agent/.env` 读取模型和 API Key 配置，因此
 | `/instructions` | 查看当前加载的用户级和项目级 `NANO.md` |
 | `/memories` | 列出长期记忆 |
 | `/plan` | 查看当前任务计划 |
+| `/team` | 查看当前 Ultra Team 子任务、依赖、负责人和结果 |
 | `/goal [objective]` | 查看或设置跨多轮长期目标 |
 | `/resume` | 从 Goal checkpoint 继续执行 |
 | `/index [path]` | 构建 RAG 索引，默认 `knowledge/` |
@@ -198,7 +205,9 @@ NanoAgent 始终从 `~/.nano-agent/.env` 读取模型和 API Key 配置，因此
 
 用户提交的内容不会随输入框清空而消失：空闲消息开始执行时会立即以 `> 内容` 写入终端对话历史；执行期间提交的消息先常驻等待队列，轮到执行时再移入历史区，避免插入并打断上一条流式回答。
 
-内置模式会直接补充 Agent 的运行指令：`standard` 平衡速度与完整性，`plan` 强调先规划后执行，`code` 强调检查、修改和验证代码，`research` 强调多来源检索与交叉验证。`/mode` 无参数时可通过选择器切换。
+内置模式不仅改变提示词，也改变可用工具：`general` 是默认模式，以最短可靠路径处理大多数任务；`plan` 只保留读取、检索、计划和模式切换能力，先与用户形成完整方案，明确批准后下一轮才能进入实施；`ultra` 为大型代码和长程任务提供 task list 与多角色并行执行。`/mode` 无参数时可通过选择器切换，模型也可调用 `switch_mode`。
+
+Ultra Team 由主 Agent 担任 lead，将工作拆成 2～6 个 `explorer / architect / builder / tester / reviewer` 子任务。`run_team` 每波并行 2～4 个依赖已完成的任务；任务领取是原子的，builder 必须声明负责路径，路径重叠的 builder 会被确定性拒绝并行。每个 worker 拥有隔离上下文、角色专用工具和有限 turns，不允许嵌套委派。task list 按 Session 保存在 `.nano-agent/teams.json`，会进入上下文并随 `/resume` 恢复。
 
 终端事件支持四个轻量输出等级，可通过 `/output` 选择或使用 `OUTPUT_LEVEL` 设置启动默认值：
 
@@ -350,11 +359,13 @@ RAG 流程：
 
 如果配置了 `OPENAI_API_KEY`，默认使用 `text-embedding-3-small`；没有 Key 或 Embedding 请求失败时自动回退到词法相似度，因此 DeepSeek-only 环境也能运行。每轮自动注入先做零网络成本的词法检索；模型显式调用 `search_knowledge` 时启用向量/词法混合检索。重新索引会按内容摘要和 Embedding 模型复用未变化的向量，索引在进程内缓存，适合本地中小型知识库。
 
-## Plan、Goal、SubAgent、Trace 与 Eval
+## Plan、Goal、Ultra Team、Trace 与 Eval
 
 复杂任务使用 `update_plan` 管理当前步骤；需要跨多轮或跨重启时使用 `set_goal`，并通过 `update_goal` 保存状态、checkpoint 和 next action。`/resume` 会从持久状态生成恢复输入。两者共享 `.nano-agent/plans.json`，不会产生重复的 Todo 系统。
 
-主 Agent 可将独立研究或审查任务交给 `delegate_research`、`delegate_review`。SubAgent 使用独立上下文、只读本地/网络工具、有限轮数且不能嵌套委派；它们不继承 MCP，最终回答和外部写操作仍由主 Agent 负责。运行生命周期和 SubAgent 事件通过轻量 Hooks 写入 `.nano-agent/traces/<session-id>.jsonl`，不保存模型隐藏思维链。
+通用模式可将独立研究或审查交给 `delegate_research`、`delegate_review`；Plan 与 Ultra 还提供只读 `delegate_architecture`。Ultra 的 `set_team_tasks` 与 `run_team` 才会启动 builder/tester 等角色。SubAgent 不继承 MCP、不包含委派工具，最终整合仍由主 Agent 负责。该设计借鉴 [Claude Code Agent Teams](https://code.claude.com/docs/en/agent-teams) 的 lead、共享任务和 mailbox 思想，但只保留本地 task list、依赖与有限并发，不引入额外进程或复杂编排服务。
+
+运行生命周期、SubAgent 和 Team worker 事件通过轻量 Hooks 写入 `.nano-agent/traces/<session-id>.jsonl`。Trace 只记录公开运行事件与公开 reasoning summary，不保存模型隐藏思维链。
 
 运行类型检查、测试和最小 RAG 评测：
 
@@ -364,7 +375,7 @@ npm test
 npm run eval
 ```
 
-需要 API Key 的可选 Agent 行为评测会验证模型是否真实激活 Skill 和调用 SubAgent：
+需要 API Key 的可选 Agent 行为评测会验证模型是否真实激活 Skill、调用 SubAgent、切换模式并执行 Ultra Team wave：
 
 ```bash
 npm run eval:agent
@@ -380,7 +391,8 @@ npm run eval:agent
 | Skill | `use_skill`、`read_skill_resource`、`list_skills`、`reload_skills` |
 | RAG | `search_knowledge`、`index_knowledge` |
 | Plan / Goal | `update_plan`、`show_plan`、`set_goal`、`update_goal`、`show_goal` |
-| SubAgent | `delegate_research`、`delegate_review` |
+| SubAgent | `delegate_research`、`delegate_architecture`、`delegate_review`（按模式提供） |
+| Ultra Team | `set_team_tasks`、`show_team_tasks`、`claim_team_task`、`update_team_task`、`retry_team_task`、`run_team` |
 | OpenAI 托管 | `code_interpreter`，以及 Provider 支持时的托管能力 |
 | MCP | Server Tools、`list_mcp_resources`、`read_mcp_resource` |
 

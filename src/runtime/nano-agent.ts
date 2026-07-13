@@ -12,12 +12,14 @@ import { ContextManager, estimateTokens } from '../core/context.js';
 import { GuidanceLoader } from '../core/guidance.js';
 import { MemoryStore } from '../core/memory.js';
 import { PlanStore } from '../core/plan.js';
+import { TeamTaskStore } from '../core/team.js';
 import { FileSession } from '../core/session.js';
 import { TraceStore } from '../core/trace.js';
 import { MCPManager } from '../extensions/mcp.js';
 import { RagStore } from '../extensions/rag.js';
 import { SkillLoader } from '../extensions/skills.js';
 import { createSubAgentTools } from '../extensions/subagents.js';
+import { createTeamTools } from '../extensions/team.js';
 import { createTools } from '../tools.js';
 import { HookBus } from './hooks.js';
 import {
@@ -29,6 +31,7 @@ import {
 } from './control.js';
 import { AGENT_MODES, BASE_INSTRUCTIONS, type AgentMode } from './instructions.js';
 import { createModel, type AgentModel } from './model.js';
+import { toolsForMode } from './tool-policy.js';
 
 export { AGENT_MODES } from './instructions.js';
 export type { AgentMode } from './instructions.js';
@@ -41,13 +44,16 @@ export class NanoAgent {
   private readonly skills: SkillLoader;
   private readonly rag: RagStore;
   private readonly plans: PlanStore;
+  private readonly team: TeamTaskStore;
   private readonly traces: TraceStore;
   private readonly mcp: MCPManager;
   private readonly hooks = new HookBus();
   private readonly tools: Tool[];
   private session: FileSession;
   private sessionId: string;
-  private mode: AgentMode = 'standard';
+  private mode: AgentMode = AGENT_MODES.some((item) => item.id === process.env.AGENT_MODE)
+    ? process.env.AGENT_MODE as AgentMode
+    : 'general';
   private outputLevel: RuntimeOutputLevel = RUNTIME_OUTPUT_LEVELS.includes(process.env.OUTPUT_LEVEL as RuntimeOutputLevel)
     ? process.env.OUTPUT_LEVEL as RuntimeOutputLevel
     : 'tools';
@@ -65,6 +71,7 @@ export class NanoAgent {
       skills: SkillLoader;
       rag: RagStore;
       plans: PlanStore;
+      team: TeamTaskStore;
       traces: TraceStore;
       mcp: MCPManager;
       sessionId: string;
@@ -77,6 +84,7 @@ export class NanoAgent {
     this.skills = components.skills;
     this.rag = components.rag;
     this.plans = components.plans;
+    this.team = components.team;
     this.traces = components.traces;
     this.mcp = components.mcp;
     this.sessionId = components.sessionId;
@@ -130,6 +138,7 @@ export class NanoAgent {
     const traces = new TraceStore(path.join(config.dataRoot, 'traces'));
     const mcp = new MCPManager(config.mcpConfig, config.workspaceRoot);
     const plans = new PlanStore(path.join(config.dataRoot, 'plans.json'), sessionId);
+    const team = new TeamTaskStore(path.join(config.dataRoot, 'teams.json'), sessionId);
     await skills.load();
     await mcp.connect();
     const agent = new NanoAgent(config, modelRuntime.model, {
@@ -139,6 +148,7 @@ export class NanoAgent {
       skills,
       rag,
       plans,
+      team,
       traces,
       mcp,
       sessionId,
@@ -150,11 +160,12 @@ export class NanoAgent {
   async stream(input: string, signal?: AbortSignal) {
     await this.session.cleanupGeneratedSummaries();
     await this.session.repairToolPairs();
-    const [memories, documents, plan, goal, history, guidance] = await Promise.all([
+    const [memories, documents, plan, goal, teamSummary, history, guidance] = await Promise.all([
       this.memory.search(input),
       this.rag.search(input, 4, false),
       this.plans.get(),
       this.plans.getGoal(),
+      this.team.summary(),
       this.session.getItems(),
       this.guidance.load(),
     ]);
@@ -171,12 +182,14 @@ export class NanoAgent {
       documents,
       plan,
       goal,
+      teamSummary,
     });
     const effectiveHistory = await this.context.sessionInput(history, [
       { role: 'user', content: input } as AgentInputItem,
     ]);
     this.lastContextTokens = estimateTokens(instructions) + estimateTokens(effectiveHistory);
     const subAgentTools = createSubAgentTools({
+      mode: this.mode,
       model: this.model,
       tools: this.tools,
       persistentInstructions: guidance.instructions,
@@ -187,12 +200,26 @@ export class NanoAgent {
         eventType,
       }),
     });
+    const teamTools = createTeamTools({
+      store: this.team,
+      model: this.model,
+      tools: this.tools,
+      workspaceRoot: this.config.workspaceRoot,
+      persistentInstructions: guidance.instructions,
+      maxConcurrency: Number(process.env.TEAM_MAX_CONCURRENCY ?? 4),
+      signal,
+      onEvent: async (task, eventType) => this.hooks.emit({
+        type: 'team_worker_event', sessionId: this.sessionId, taskId: task.id, role: task.role, eventType,
+      }),
+    });
+    const modeTools = toolsForMode(this.mode, this.tools, teamTools);
     const agent = new Agent({
       name: 'NanoAgent',
       model: this.model,
       instructions,
-      tools: [...this.tools, ...subAgentTools],
-      mcpServers: this.mcp.servers,
+      tools: [...modeTools, ...subAgentTools],
+      // Plan mode keeps only the explicit read-only MCP resource wrappers above.
+      mcpServers: this.mode === 'plan' ? [] : this.mcp.servers,
       mcpConfig: { includeServerInToolNames: true },
     });
     await this.hooks.emit({ type: 'run_start', sessionId: this.sessionId, input });
@@ -202,6 +229,7 @@ export class NanoAgent {
       maxTurns: this.config.maxTurns,
       stream: true,
       signal,
+      toolExecution: { maxFunctionToolConcurrency: this.mode === 'ultra' ? 4 : 2 },
     });
   }
 
@@ -210,6 +238,7 @@ export class NanoAgent {
     this.session = this.createSession(sessionId);
     await this.session.ensure();
     this.plans.useSession(sessionId);
+    this.team.useSession(sessionId);
   }
 
   async listSessions(): Promise<string[]> {
@@ -249,16 +278,22 @@ export class NanoAgent {
     return this.plans.getGoal();
   }
 
+  async currentTeam() {
+    return this.team.list();
+  }
+
   async setGoal(objective: string) {
     return this.plans.setGoal(objective);
   }
 
   async resumePrompt(): Promise<string> {
-    return this.plans.resumePrompt();
+    const base = await this.plans.resumePrompt();
+    const team = await this.team.summary();
+    return team ? `${base}\n\n当前 Ultra Team task list：\n${team}` : base;
   }
 
   async runtimeInfo() {
-    const [sessionSummary, guidance] = await Promise.all([this.session.summary(), this.guidance.load()]);
+    const [sessionSummary, guidance, team] = await Promise.all([this.session.summary(), this.guidance.load(), this.team.list()]);
     return {
       provider: this.config.provider,
       model: this.modelName,
@@ -274,6 +309,13 @@ export class NanoAgent {
       mcpServers: this.mcpServerNames,
       mcpStatuses: this.mcp.statuses(),
       guidanceFiles: guidance.files.map((file) => ({ scope: file.scope, path: file.path, truncated: file.truncated })),
+      team: {
+        total: team.length,
+        pending: team.filter((item) => item.status === 'pending').length,
+        running: team.filter((item) => item.status === 'running').length,
+        completed: team.filter((item) => item.status === 'completed').length,
+        failed: team.filter((item) => item.status === 'failed').length,
+      },
     };
   }
 
@@ -317,11 +359,12 @@ export class NanoAgent {
   }
 
   async contextInfo() {
-    const [history, memories, plan, goal] = await Promise.all([
+    const [history, memories, plan, goal, team] = await Promise.all([
       this.session.getItems(),
       this.memory.list(),
       this.plans.get(),
       this.plans.getGoal(),
+      this.team.list(),
     ]);
     return {
       historyItems: history.length,
@@ -331,11 +374,18 @@ export class NanoAgent {
       memories: memories.length,
       planSteps: plan.length,
       goal: goal?.status,
+      teamTasks: team.length,
     };
   }
 
   get toolNames(): string[] {
-    return [...this.tools.map((item) => item.name), 'delegate_research', 'delegate_review'].sort();
+    const subagents = this.mode === 'general'
+      ? ['delegate_research', 'delegate_review']
+      : ['delegate_research', 'delegate_architecture', 'delegate_review'];
+    const team = this.mode === 'ultra'
+      ? ['set_team_tasks', 'show_team_tasks', 'claim_team_task', 'update_team_task', 'retry_team_task', 'run_team']
+      : [];
+    return [...toolsForMode(this.mode, this.tools).map((item) => item.name), ...subagents, ...team].sort();
   }
 
   private get currentMode() {

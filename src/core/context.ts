@@ -12,6 +12,7 @@ export interface ContextParts {
   documents: RagMatch[];
   plan: PlanStep[];
   goal?: Goal;
+  teamSummary?: string;
 }
 
 export function estimateTokens(value: unknown): number {
@@ -54,6 +55,7 @@ export class ContextManager {
         `当前计划：\n${parts.plan.map((step) => `- [${step.status}] ${step.id}. ${step.description}`).join('\n')}`,
       );
     }
+    if (parts.teamSummary) candidates.push(`当前 Ultra Team task list：\n${parts.teamSummary}`);
     if (parts.memories.length) {
       candidates.push(
         `与当前问题相关的长期记忆：\n${parts.memories.map((memory) => `- [${memory.type}:${memory.id}] ${memory.content}`).join('\n')}`,

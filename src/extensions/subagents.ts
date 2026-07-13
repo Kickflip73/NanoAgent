@@ -1,4 +1,5 @@
 import { Agent, type Tool } from '@openai/agents';
+import type { AgentMode } from '../runtime/instructions.js';
 import type { AgentModel } from '../runtime/model.js';
 
 function selectTools(tools: Tool[], names: string[]): Tool[] {
@@ -16,6 +17,7 @@ async function forwardEvent(
 }
 
 export function createSubAgentTools(options: {
+  mode: AgentMode;
   model: AgentModel;
   tools: Tool[];
   persistentInstructions?: string;
@@ -43,8 +45,18 @@ export function createSubAgentTools(options: {
     ].filter(Boolean).join('\n\n'),
     tools: selectTools(options.tools, ['read_file', 'list_directory', 'search_files', 'search_knowledge']),
   });
+  const architect = new Agent({
+    name: 'Nano Architect',
+    model: options.model,
+    instructions: [
+      options.persistentInstructions,
+      '你是独立架构子 Agent，只负责分析边界、数据流、方案取舍、风险与验证策略。',
+      '必须保持只读，不修改文件、不运行命令、不继续委派；输出可实施但不实施的紧凑设计。',
+    ].filter(Boolean).join('\n\n'),
+    tools: selectTools(options.tools, ['read_file', 'list_directory', 'search_files', 'web_search', 'search_knowledge']),
+  });
 
-  return [
+  const tools = [
     researcher.asTool({
       toolName: 'delegate_research',
       toolDescription: '把独立、资料密集的研究子任务交给只读 researcher；简单查询不要委派。',
@@ -58,4 +70,13 @@ export function createSubAgentTools(options: {
       onStream: async ({ event }) => forwardEvent(options.onEvent, 'reviewer', event.type),
     }),
   ];
+  if (options.mode !== 'general') {
+    tools.splice(1, 0, architect.asTool({
+      toolName: 'delegate_architecture',
+      toolDescription: '把边界清晰的架构分析或实施方案设计交给只读 architect。',
+      runOptions: { maxTurns: 16 },
+      onStream: async ({ event }) => forwardEvent(options.onEvent, 'architect', event.type),
+    }));
+  }
+  return tools;
 }

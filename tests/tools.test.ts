@@ -23,7 +23,7 @@ test('exposes CLI-equivalent runtime controls to the Agent', async () => {
   const tools = createRuntimeControlTools({
     status: () => ({ model: 'demo-model' }),
     models: () => ['demo-model', 'next-model'],
-    modes: () => [{ id: 'code', label: '编码', description: '代码任务' }],
+    modes: () => [{ id: 'ultra', label: 'Ultra Team', description: '大型任务' }],
     switchModel: (model) => switched.push(`model:${model}`),
     switchMode: (mode) => switched.push(`mode:${mode}`),
     listSessions: () => [{ id: 'demo' }],
@@ -41,10 +41,10 @@ test('exposes CLI-equivalent runtime controls to the Agent', async () => {
     'get_session_history', 'switch_session', 'new_session', 'clear_session', 'reload_mcp', 'request_exit',
   ]);
   await invoke('switch_model', { model: 'next-model' });
-  await invoke('switch_mode', { mode: 'code' });
+  await invoke('switch_mode', { mode: 'ultra' });
   await invoke('set_output_level', { level: 'trace' });
   await invoke('switch_session', { sessionId: 'archive' });
-  assert.deepEqual(switched, ['model:next-model', 'mode:code']);
+  assert.deepEqual(switched, ['model:next-model', 'mode:ultra']);
   assert.deepEqual(actions, [
     { type: 'set_output_level', level: 'trace' },
     { type: 'switch_session', sessionId: 'archive' },

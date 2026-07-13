@@ -6,7 +6,8 @@ import path from 'node:path';
 interface AgentEvalCase {
   name: string;
   input: string;
-  expectedTool: string;
+  expectedTools: string[];
+  env?: Record<string, string>;
 }
 
 const root = process.cwd();
@@ -25,6 +26,7 @@ for (const item of cases) {
           AGENT_SESSION: 'eval',
           MAX_TURNS: '12',
           OUTPUT_LEVEL: 'trace',
+          ...item.env,
         },
         stdio: ['ignore', 'pipe', 'pipe'],
       });
@@ -39,8 +41,9 @@ for (const item of cases) {
         else reject(new Error(`Agent eval 退出码 ${code}\n${text}`));
       });
     });
-    const ok = output.includes(`工具  ${item.expectedTool}`);
-    console.log(`${ok ? '✓' : '✗'} ${item.name} → ${item.expectedTool}`);
+    const missing = item.expectedTools.filter((name) => !output.includes(`工具  ${name}`));
+    const ok = missing.length === 0;
+    console.log(`${ok ? '✓' : '✗'} ${item.name} → ${item.expectedTools.join(', ')}${missing.length ? ` (missing: ${missing.join(', ')})` : ''}`);
     if (ok) passed += 1;
   } finally {
     await rm(dataRoot, { recursive: true, force: true });
