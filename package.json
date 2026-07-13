@@ -1,0 +1,41 @@
+{
+  "name": "nano-agent",
+  "version": "0.1.0",
+  "description": "A tiny, educational AI agent built with TypeScript and the OpenAI Agents SDK.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Kickflip73/NanoAgent.git"
+  },
+  "homepage": "https://github.com/Kickflip73/NanoAgent#readme",
+  "bugs": {
+    "url": "https://github.com/Kickflip73/NanoAgent/issues"
+  },
+  "keywords": [
+    "ai-agent",
+    "openai-agents-sdk",
+    "deepseek",
+    "typescript",
+    "cli"
+  ],
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "check": "tsc --noEmit",
+    "test": "node --import tsx --test tests/*.test.ts"
+  },
+  "dependencies": {
+    "@openai/agents": "^0.13.2",
+    "dotenv": "^17.0.0",
+    "undici": "^8.7.0",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.0.0"
+  }
+}
