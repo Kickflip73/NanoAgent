@@ -1,0 +1,12 @@
+[
+  {
+    "name": "activates a matching Agent Skill",
+    "input": "请调用 use_skill 激活 research Skill，然后只回复完成。",
+    "expectedTool": "use_skill"
+  },
+  {
+    "name": "delegates an explicit review subtask",
+    "input": "请调用 delegate_review 审查这句话是否正确：2+2=4，然后简短回复。",
+    "expectedTool": "delegate_review"
+  }
+]

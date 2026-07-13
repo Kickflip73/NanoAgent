@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import {
+  createTools,
   editLocalFile,
   moveLocalFile,
   readLocalFile,
@@ -13,6 +14,14 @@ import {
   searchLocalFiles,
   writeLocalFile,
 } from '../src/tools.js';
+
+test('exposes unique tool names for OpenAI and compatible providers', () => {
+  for (const openAI of [true, false]) {
+    const names = createTools(process.cwd(), openAI).map((tool) => tool.name);
+    assert.equal(new Set(names).size, names.length);
+    assert.ok(names.includes('web_search'));
+  }
+});
 
 test('reads files using relative and absolute paths', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'nano-agent-'));

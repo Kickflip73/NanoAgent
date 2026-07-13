@@ -337,6 +337,58 @@ export function createTools(workspaceRoot: string, includeOpenAIHostedTools = tr
       requestUrl(url, method, headers, body, timeoutSeconds, details?.signal),
   });
 
+  const webSearch = tool({
+    name: 'web_search',
+    description: '搜索互联网（Bing，无需配置）。适用于查找最新资讯、教程、文档、图片等。也可配置 GOOGLE_CSE_API_KEY+GOOGLE_CSE_CX 使用 Google 搜索。',
+    parameters: z.object({
+      query: z.string().min(1).describe('搜索关键词，尽量精确'),
+      num: z.number().int().min(1).max(10).default(5).describe('返回结果数量，默认 5，最多 10'),
+    }),
+    execute: async ({ query, num }, _context, details) => {
+      const signals = [AbortSignal.timeout(15_000)];
+      if (details?.signal) signals.push(details.signal);
+      const signal = AbortSignal.any(signals);
+      // 优先使用 Google CSE（如果有配置）
+      const apiKey = process.env.GOOGLE_CSE_API_KEY;
+      const cx = process.env.GOOGLE_CSE_CX;
+      if (apiKey && cx) {
+        const url = `https://www.googleapis.com/customsearch/v1?key=${encodeURIComponent(apiKey)}&cx=${encodeURIComponent(cx)}&q=${encodeURIComponent(query)}&num=${num}`;
+        const res = await fetch(url, { signal });
+        if (!res.ok) throw new Error(`Google CSE 返回 ${res.status}: ${await res.text()}`);
+        const data = await res.json() as { items?: Array<{ title?: string; link?: string; snippet?: string }> };
+        if (!data.items?.length) return '未找到结果';
+        return data.items.map((item, i) =>
+          `${i + 1}. ${item.title ?? '无标题'}\n   链接: ${item.link ?? ''}\n   摘要: ${item.snippet ?? ''}`
+        ).join('\n\n');
+      }
+      // 默认使用 Bing 搜索（无需 API Key）
+      const response = await fetch(
+        `https://www.bing.com/search?q=${encodeURIComponent(query)}&mkt=zh-CN`,
+        {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept-Language': 'zh-CN,zh;q=0.9',
+          },
+          signal,
+        },
+      );
+      if (!response.ok) throw new Error(`Bing 返回 ${response.status}: ${await response.text()}`);
+      const html = await response.text();
+      const algoBlocks = html.match(/<li[^>]*class="[^"]*b_algo[^"]*"[^>]*>[\s\S]*?<\/li>/g);
+      if (!algoBlocks?.length) return '未找到搜索结果';
+      return algoBlocks.slice(0, num).map((block, i) => {
+        const urlMatch = block.match(/<a[^>]*href="(https?:\/\/[^"]+)"[^>]*>/);
+        const titleMatch = block.match(/<a[^>]*>([\s\S]*?)<\/a>/);
+        const snippetMatch = block.match(/<p[^>]*>([\s\S]*?)<\/p>/);
+        const url = urlMatch ? urlMatch[1]!.replace(/&amp;/g, '&') : '';
+        const title = titleMatch ? titleMatch[1]!.replace(/<[^>]+>/g, '').trim() : '';
+        const snippet = snippetMatch ? snippetMatch[1]!.replace(/<[^>]+>/g, '').trim() : '';
+        if (!title) return '';
+        return `${i + 1}. ${title}\n   链接: ${url}\n   摘要: ${snippet.slice(0, 200)}`;
+      }).filter(Boolean).join('\n\n');
+    },
+  });
+
   const localTools = [
     currentTime,
     readFileTool,
@@ -350,7 +402,7 @@ export function createTools(workspaceRoot: string, includeOpenAIHostedTools = tr
     httpRequest,
   ];
 
-  if (!includeOpenAIHostedTools) return localTools;
+  if (!includeOpenAIHostedTools) return [...localTools, webSearch];
   return [
     ...localTools,
     webSearchTool({ searchContextSize: 'low', externalWebAccess: true }),

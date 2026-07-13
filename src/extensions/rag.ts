@@ -1,4 +1,5 @@
 import { mkdir, readFile, readdir, rename, stat, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { tool } from '@openai/agents';
 import type OpenAI from 'openai';
@@ -9,6 +10,7 @@ interface RagChunk {
   id: string;
   source: string;
   content: string;
+  digest?: string;
   embedding?: number[];
 }
 
@@ -50,6 +52,7 @@ function cosine(a: number[], b: number[]): number {
 
 export class RagStore {
   private readonly embeddingModel: string;
+  private cache?: RagIndex;
 
   constructor(
     private readonly workspaceRoot: string,
@@ -62,22 +65,30 @@ export class RagStore {
   async index(target = 'knowledge'): Promise<{ files: number; chunks: number; embeddings: boolean; embeddingError?: string }> {
     const root = path.resolve(this.workspaceRoot, target);
     const files = await this.textFiles(root);
+    const previous = await this.load();
+    const previousEmbeddings = new Map((previous.embeddingModel === this.embeddingModel ? previous.chunks : [])
+      .filter((chunk) => chunk.digest && chunk.embedding)
+      .map((chunk) => [chunk.digest!, chunk.embedding!]));
     const chunks: RagChunk[] = [];
     for (const file of files) {
       const content = await readFile(file, 'utf8');
       chunkText(content).forEach((text, index) => {
+        const digest = createHash('sha256').update(text).digest('hex');
         chunks.push({
           id: `${path.relative(root, file)}:${index}`,
           source: path.relative(this.workspaceRoot, file),
           content: text,
+          digest,
+          embedding: previousEmbeddings.get(digest),
         });
       });
     }
     let embeddingError: string | undefined;
     if (this.embeddingClient && chunks.length) {
       try {
-        for (let start = 0; start < chunks.length; start += 64) {
-          const batch = chunks.slice(start, start + 64);
+        const pending = chunks.filter((chunk) => !chunk.embedding);
+        for (let start = 0; start < pending.length; start += 64) {
+          const batch = pending.slice(start, start + 64);
           const response = await this.embeddingClient.embeddings.create({
             model: this.embeddingModel,
             input: batch.map((chunk) => chunk.content),
@@ -100,11 +111,11 @@ export class RagStore {
     return { files: files.length, chunks: chunks.length, embeddings, ...(embeddingError ? { embeddingError } : {}) };
   }
 
-  async search(query: string, limit = 4): Promise<RagMatch[]> {
+  async search(query: string, limit = 4, useEmbeddings = true): Promise<RagMatch[]> {
     const index = await this.load();
     if (!index.chunks.length) return [];
     let queryEmbedding: number[] | undefined;
-    if (this.embeddingClient && index.chunks.some((chunk) => chunk.embedding)) {
+    if (useEmbeddings && this.embeddingClient && index.chunks.some((chunk) => chunk.embedding)) {
       try {
         const response = await this.embeddingClient.embeddings.create({
           model: index.embeddingModel ?? this.embeddingModel,
@@ -120,7 +131,7 @@ export class RagStore {
         source: chunk.source,
         content: chunk.content,
         score: queryEmbedding && chunk.embedding
-          ? cosine(queryEmbedding, chunk.embedding)
+          ? cosine(queryEmbedding, chunk.embedding) * 0.85 + textScore(query, chunk.content) * 0.15
           : textScore(query, chunk.content),
       }))
       .filter((match) => match.score > 0)
@@ -146,10 +157,15 @@ export class RagStore {
   }
 
   private async load(): Promise<RagIndex> {
+    if (this.cache) return this.cache;
     try {
-      return JSON.parse(await readFile(this.indexFile, 'utf8')) as RagIndex;
+      this.cache = JSON.parse(await readFile(this.indexFile, 'utf8')) as RagIndex;
+      return this.cache;
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { version: 1, chunks: [] };
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        this.cache = { version: 1, chunks: [] };
+        return this.cache;
+      }
       throw error;
     }
   }
@@ -159,6 +175,7 @@ export class RagStore {
     const temporary = `${this.indexFile}.tmp`;
     await writeFile(temporary, `${JSON.stringify(index)}\n`, 'utf8');
     await rename(temporary, this.indexFile);
+    this.cache = index;
   }
 
   private async textFiles(target: string): Promise<string[]> {

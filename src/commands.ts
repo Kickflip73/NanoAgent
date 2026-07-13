@@ -21,6 +21,8 @@ export const COMMANDS = [
   { value: '/context', description: '查看上下文用量' },
   { value: '/memories', description: '列出长期记忆' },
   { value: '/plan', description: '查看任务计划' },
+  { value: '/goal', description: '查看或设置长期目标' },
+  { value: '/resume', description: '从 Goal 检查点继续' },
   { value: '/index', description: '索引本地知识库' },
   { value: '/retry', description: '重试上一条输入' },
   { value: '/help', description: '显示命令帮助' },
@@ -37,12 +39,14 @@ const HELP = `内置命令：
   /switch <id>        按 ID 切换对话
   /history            查看当前对话历史
   /clear              清空当前对话
-  /skills             列出可用 Skills
+  /skills [reload]    列出或重新加载 Skills
   /tools              列出当前可用工具
-  /mcp                查看 MCP Server 连接
+  /mcp [reload]       查看或重新连接 MCP Server
   /context            查看上下文、记忆和计划用量
   /memories           列出长期记忆
   /plan               查看当前任务计划
+  /goal [objective]   查看或设置当前长期目标
+  /resume             从 Goal 检查点继续执行
   /index [path]       索引知识库，默认 knowledge
   /retry              重新执行上一条用户输入
   /help               显示帮助
@@ -155,6 +159,10 @@ export class CommandHandler {
       return this.handled('当前对话已清空。');
     }
     if (command === '/skills') {
+      if (argument === 'reload') {
+        const result = await this.agent.reloadSkills();
+        return this.handled(`已重新加载 ${result.skills.length} 个 Skills${result.warnings.length ? `，${result.warnings.length} 个无效` : ''}`);
+      }
       const skills = this.agent.listSkills();
       return this.handled(skills.map((skill) => `- ${skill.name}: ${skill.description}`).join('\n') || '暂无 Skills');
     }
@@ -162,8 +170,11 @@ export class CommandHandler {
       return this.handled(this.agent.toolNames.map((name) => `- ${name}`).join('\n') || '暂无工具');
     }
     if (command === '/mcp') {
-      const servers = this.agent.mcpServerNames;
-      return this.handled(servers.length ? servers.map((name) => `● ${name}`).join('\n') : 'MCP 未连接');
+      const statuses = argument === 'reload' ? await this.agent.reloadMcp() : this.agent.mcpStatuses();
+      if (!statuses.length) return this.handled('MCP 未配置');
+      return this.handled(statuses.map((status) => status.state === 'connected'
+        ? `● ${status.name} · ${status.transport} · ${status.tools} tools`
+        : `○ ${status.name} · 连接失败 · ${status.error ?? '未知错误'}`).join('\n'));
     }
     if (command === '/context') {
       const info = await this.agent.contextInfo();
@@ -172,7 +183,8 @@ export class CommandHandler {
         `上下文    ~${info.estimatedTokens} / ${info.contextWindow} tokens`,
         `长期记忆  ${info.memories}`,
         `计划步骤  ${info.planSteps}`,
-        '更早历史会在发送模型前自动压缩。',
+        `长期目标  ${info.goal ?? '未设置'}`,
+        '更早历史会按 Token Budget 结构化压缩。',
       ].join('\n'));
     }
     if (command === '/memories') {
@@ -182,6 +194,21 @@ export class CommandHandler {
     if (command === '/plan') {
       const plan = await this.agent.currentPlan();
       return this.handled(plan.map((step) => `- [${step.status}] ${step.id}. ${step.description}`).join('\n') || '当前没有计划');
+    }
+    if (command === '/goal') {
+      const goal = argument ? await this.agent.setGoal(argument) : await this.agent.currentGoal();
+      if (!goal) return this.handled('当前没有长期 Goal。使用 /goal <目标> 设置。');
+      return this.handled([
+        `[${goal.status}] ${goal.objective}`,
+        goal.checkpoint ? `检查点：${goal.checkpoint}` : '',
+        goal.nextAction ? `下一步：${goal.nextAction}` : '',
+      ].filter(Boolean).join('\n'));
+    }
+    if (command === '/resume') {
+      const prompt = await this.agent.resumePrompt();
+      this.print('正在从 Goal 检查点继续...');
+      await this.runTask(prompt);
+      return 'handled';
     }
     if (command === '/index') {
       this.print('正在构建知识库索引...');

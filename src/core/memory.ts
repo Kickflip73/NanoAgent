@@ -11,6 +11,9 @@ export interface Memory {
   type: MemoryType;
   content: string;
   createdAt: string;
+  updatedAt?: string;
+  importance?: number;
+  source?: 'user' | 'agent';
 }
 
 function terms(text: string): Set<string> {
@@ -31,17 +34,29 @@ export function textScore(query: string, content: string): number {
 export class MemoryStore {
   constructor(private readonly file: string) {}
 
-  async remember(content: string, type: MemoryType): Promise<Memory> {
+  async remember(
+    content: string,
+    type: MemoryType,
+    options: { importance?: number; source?: 'user' | 'agent' } = {},
+  ): Promise<Memory> {
     const memories = await this.list();
     const duplicate = memories.find(
       (memory) => memory.content.toLowerCase() === content.trim().toLowerCase(),
     );
-    if (duplicate) return duplicate;
+    if (duplicate) {
+      duplicate.updatedAt = new Date().toISOString();
+      duplicate.importance = Math.max(duplicate.importance ?? 3, options.importance ?? 3);
+      await this.save(memories);
+      return duplicate;
+    }
     const memory: Memory = {
       id: randomUUID().slice(0, 8),
       type,
       content: content.trim(),
       createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      importance: options.importance ?? 3,
+      source: options.source ?? 'user',
     };
     memories.push(memory);
     await this.save(memories);
@@ -59,8 +74,12 @@ export class MemoryStore {
 
   async search(query: string, limit = 5): Promise<Memory[]> {
     return (await this.list())
-      .map((memory) => ({ memory, score: textScore(query, memory.content) }))
-      .filter(({ score }) => score > 0)
+      .map((memory) => ({ memory, lexical: textScore(query, memory.content) }))
+      .filter(({ lexical }) => lexical > 0)
+      .map(({ memory, lexical }) => ({
+        memory,
+        score: lexical * 0.9 + ((memory.importance ?? 3) / 5) * 0.1,
+      }))
       .sort((a, b) => b.score - a.score)
       .slice(0, limit)
       .map(({ memory }) => memory);
@@ -82,8 +101,9 @@ export class MemoryStore {
         parameters: z.object({
           content: z.string().min(1),
           type: z.enum(['preference', 'fact', 'decision', 'todo']).default('fact'),
+          importance: z.number().int().min(1).max(5).default(3),
         }),
-        execute: async ({ content, type }) => this.remember(content, type),
+        execute: async ({ content, type, importance }) => this.remember(content, type, { importance, source: 'user' }),
       }),
       tool({
         name: 'recall',

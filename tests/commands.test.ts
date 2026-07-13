@@ -30,12 +30,16 @@ function fakeAgent(): NanoAgent {
     history: async () => [],
     clearSession: async () => undefined,
     listSkills: () => [{ name: 'review', description: 'Review code' }],
+    reloadSkills: async () => ({ skills: [{ name: 'review', description: 'Review code' }], warnings: [] }),
     listMemories: async () => [{ id: 'm1', type: 'fact', content: 'uses TS', createdAt: '' }],
     currentPlan: async () => [{ id: '1', description: 'test', status: 'running' }],
+    currentGoal: async () => ({ objective: 'ship NanoAgent', status: 'active', createdAt: '', updatedAt: '' }),
+    setGoal: async (objective: string) => ({ objective, status: 'active', createdAt: '', updatedAt: '' }),
+    resumePrompt: async () => 'resume goal',
     indexKnowledge: async () => ({ files: 1, chunks: 1, embeddings: false }),
     availableModels: () => ['deepseek-chat', 'deepseek-reasoner'],
     switchModel: () => undefined,
-    contextInfo: async () => ({ historyItems: 4, historyLimit: 40, estimatedTokens: 1200, contextWindow: 128000, memories: 1, planSteps: 1 }),
+    contextInfo: async () => ({ historyItems: 4, historyLimit: 40, estimatedTokens: 1200, contextWindow: 128000, memories: 1, planSteps: 1, goal: 'active' }),
     availableModes: () => [
       { id: 'standard', label: '标准', description: '平衡速度与完整性' },
       { id: 'code', label: '编码', description: '代码任务' },
@@ -43,6 +47,8 @@ function fakeAgent(): NanoAgent {
     switchMode: () => undefined,
     toolNames: ['read_file', 'run_shell'],
     mcpServerNames: [],
+    mcpStatuses: () => [],
+    reloadMcp: async () => [],
   } as unknown as NanoAgent;
 }
 
@@ -120,7 +126,7 @@ test('selects a model and exposes common runtime inspection commands', async () 
   assert.deepEqual(switched, ['deepseek-reasoner']);
   assert.match(output.join('\n'), /历史条目/);
   assert.match(output.join('\n'), /run_shell/);
-  assert.match(output.join('\n'), /MCP 未连接/);
+  assert.match(output.join('\n'), /MCP 未配置/);
 });
 
 test('selects a preset Agent mode', async () => {
@@ -148,4 +154,17 @@ test('switches terminal output detail level', async () => {
   assert.equal(await handler.execute('/output'), 'handled');
   assert.equal(current, 'trace');
   await assert.rejects(handler.execute('/output everything'), /未知输出等级/);
+});
+
+test('sets and resumes a durable goal', async () => {
+  const tasks: string[] = [];
+  const output: string[] = [];
+  const handler = new CommandHandler(fakeAgent(), async (input) => { tasks.push(input); }, {
+    write: (text) => output.push(text),
+  });
+
+  assert.equal(await handler.execute('/goal 发布 NanoAgent'), 'handled');
+  assert.equal(await handler.execute('/resume'), 'handled');
+  assert.deepEqual(tasks, ['resume goal']);
+  assert.match(output.join('\n'), /发布 NanoAgent/);
 });

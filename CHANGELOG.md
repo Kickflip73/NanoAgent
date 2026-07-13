@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.7.0] - 2026-07-13
+
+### Added
+
+- add Agent Skills-compatible YAML validation, resource roots, safe resource loading, diagnostics, and hot reload
+- add MCP Streamable HTTP, `mcpServers` compatibility, environment-backed headers, failure isolation, status, reload, and Resources
+- add durable Goal, checkpoint, next action, `/goal`, and `/resume` on top of the existing Plan store
+- add bounded researcher and reviewer SubAgents through Agents SDK `Agent.asTool()`
+- add lightweight runtime lifecycle Hooks and SubAgent trace events
+- add memory importance/source metadata and incremental hybrid RAG retrieval
+- add MCP, Skill resource, Goal, SubAgent, and Hook regression tests
+- add serialized local state writes, bounded trace rotation, and executable Agent behavior evals
+
+### Changed
+
+- reposition NanoAgent as a lightweight general-purpose Agent for real work rather than an educational-only example
+- split model creation, instructions, hooks, and the Agent composition root into `runtime/`
+- make context trimming token-aware and replace raw JSON history snippets with structured summaries
+- keep complete conversation turns within the context budget and reserve output capacity
+- add a local `web_search` implementation for DeepSeek while retaining OpenAI hosted search
+- reuse RAG indexes and embeddings when their content and model are unchanged
+- update README, architecture, contribution guide, MCP examples, and package metadata for the new runtime
+
+### Fixed
+
+- prevent one unavailable MCP Server from blocking NanoAgent startup
+- retain healthy MCP connections when a hot reload contains an invalid or unavailable replacement
+- prevent Skill resources from escaping their root through traversal or symbolic links
+- preserve legacy Plan JSON while migrating sessions to Goal-aware task state
+
 ## [0.6.0] - 2026-07-13 23:06
 
 ### Added

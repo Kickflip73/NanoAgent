@@ -33,7 +33,7 @@ async function version(): Promise<string> {
 }
 
 function cliHelp(): string {
-  return `NanoAgent - 轻量级 Agent 学习助手
+  return `NanoAgent - 轻量级通用 Agent
 
 用法：
   nano                    启动交互模式
@@ -92,10 +92,10 @@ async function main(): Promise<void> {
       }
       await stream.completed;
       renderer.finish();
-      await agent.recordEvent('turn_end', { answer: finalAnswer.slice(0, 20_000) });
+      await agent.completeRun(finalAnswer.slice(0, 20_000));
     } catch (error) {
       renderer.stop();
-      await agent.recordEvent('error', { message: error instanceof Error ? error.message : String(error) });
+      await agent.failRun(error);
       throw error;
     }
   };

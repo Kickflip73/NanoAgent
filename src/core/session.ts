@@ -64,6 +64,8 @@ function safeId(id: string): string {
 
 export class FileSession implements Session {
   private readonly file: string;
+  private cache?: SessionFile;
+  private writeQueue: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly directory: string,
@@ -77,80 +79,82 @@ export class FileSession implements Session {
   }
 
   async ensure(): Promise<void> {
-    await this.save(await this.load());
+    await this.mutate(() => undefined);
   }
 
   async getItems(limit?: number): Promise<AgentInputItem[]> {
+    await this.writeQueue;
     const items = (await this.load()).items;
-    return limit === undefined ? items : items.slice(-limit);
+    return limit === undefined ? [...items] : items.slice(-limit);
   }
 
   async addItems(items: AgentInputItem[]): Promise<void> {
-    const session = await this.load();
-    session.items.push(...items);
-    session.updatedAt = new Date().toISOString();
-    await this.save(session);
+    await this.mutate((session) => {
+      session.items.push(...items);
+      session.updatedAt = new Date().toISOString();
+    });
   }
 
   async popItem(): Promise<AgentInputItem | undefined> {
-    const session = await this.load();
-    const item = session.items.pop();
-    session.updatedAt = new Date().toISOString();
-    await this.save(session);
-    return item;
+    return this.mutate((session) => {
+      const item = session.items.pop();
+      session.updatedAt = new Date().toISOString();
+      return item;
+    });
   }
 
   async clearSession(): Promise<void> {
-    const session = await this.load();
-    session.items = [];
-    session.updatedAt = new Date().toISOString();
-    await this.save(session);
+    await this.mutate((session) => {
+      session.items = [];
+      session.updatedAt = new Date().toISOString();
+    });
   }
 
   async summary(): Promise<SessionSummary> {
+    await this.writeQueue;
     return summarizeSession(await this.load());
   }
 
   async cleanupGeneratedSummaries(): Promise<number> {
-    const session = await this.load();
-    const items = session.items.filter((item) => {
-      if (!('role' in item) || item.role !== 'user' || !('content' in item)) return true;
-      return typeof item.content !== 'string' || !item.content.startsWith('[更早的会话历史已压缩为摘要');
+    return this.mutateWhen((session) => {
+      const items = session.items.filter((item) => {
+        if (!('role' in item) || item.role !== 'user' || !('content' in item)) return true;
+        return typeof item.content !== 'string' || !item.content.startsWith('[更早的会话历史已压缩为摘要');
+      });
+      const removed = session.items.length - items.length;
+      if (removed > 0) {
+        session.items = items;
+        session.updatedAt = new Date().toISOString();
+      }
+      return { result: removed, changed: removed > 0 };
     });
-    const removed = session.items.length - items.length;
-    if (removed > 0) {
-      session.items = items;
-      session.updatedAt = new Date().toISOString();
-      await this.save(session);
-    }
-    return removed;
   }
 
   async repairToolPairs(): Promise<number> {
-    const session = await this.load();
-    const calls = new Set(session.items.flatMap((item) =>
-      'type' in item && item.type === 'function_call' && 'callId' in item
-        ? [String(item.callId)]
-        : [],
-    ));
-    const results = new Set(session.items.flatMap((item) =>
-      'type' in item && item.type === 'function_call_result' && 'callId' in item
-        ? [String(item.callId)]
-        : [],
-    ));
-    const items = session.items.filter((item) => {
-      if (!('type' in item) || !('callId' in item)) return true;
-      if (item.type === 'function_call') return results.has(String(item.callId));
-      if (item.type === 'function_call_result') return calls.has(String(item.callId));
-      return true;
+    return this.mutateWhen((session) => {
+      const calls = new Set(session.items.flatMap((item) =>
+        'type' in item && item.type === 'function_call' && 'callId' in item
+          ? [String(item.callId)]
+          : [],
+      ));
+      const results = new Set(session.items.flatMap((item) =>
+        'type' in item && item.type === 'function_call_result' && 'callId' in item
+          ? [String(item.callId)]
+          : [],
+      ));
+      const items = session.items.filter((item) => {
+        if (!('type' in item) || !('callId' in item)) return true;
+        if (item.type === 'function_call') return results.has(String(item.callId));
+        if (item.type === 'function_call_result') return calls.has(String(item.callId));
+        return true;
+      });
+      const removed = session.items.length - items.length;
+      if (removed) {
+        session.items = items;
+        session.updatedAt = new Date().toISOString();
+      }
+      return { result: removed, changed: removed > 0 };
     });
-    const removed = session.items.length - items.length;
-    if (removed) {
-      session.items = items;
-      session.updatedAt = new Date().toISOString();
-      await this.save(session);
-    }
-    return removed;
   }
 
   static async list(directory: string): Promise<string[]> {
@@ -172,19 +176,45 @@ export class FileSession implements Session {
   }
 
   private async load(): Promise<SessionFile> {
+    if (this.cache) return this.cache;
     try {
-      return JSON.parse(await readFile(this.file, 'utf8')) as SessionFile;
+      this.cache = JSON.parse(await readFile(this.file, 'utf8')) as SessionFile;
+      return this.cache;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
       const now = new Date().toISOString();
-      return { id: this.id, createdAt: now, updatedAt: now, items: [] };
+      this.cache = { id: this.id, createdAt: now, updatedAt: now, items: [] };
+      return this.cache;
     }
+  }
+
+  private mutate<T>(mutation: (session: SessionFile) => T): Promise<T> {
+    const operation = this.writeQueue.then(async () => {
+      const session = await this.load();
+      const result = mutation(session);
+      await this.save(session);
+      return result;
+    });
+    this.writeQueue = operation.then(() => undefined, () => undefined);
+    return operation;
+  }
+
+  private mutateWhen<T>(mutation: (session: SessionFile) => { result: T; changed: boolean }): Promise<T> {
+    const operation = this.writeQueue.then(async () => {
+      const session = await this.load();
+      const { result, changed } = mutation(session);
+      if (changed) await this.save(session);
+      return result;
+    });
+    this.writeQueue = operation.then(() => undefined, () => undefined);
+    return operation;
   }
 
   private async save(session: SessionFile): Promise<void> {
     await mkdir(this.directory, { recursive: true });
     const temporary = `${this.file}.tmp`;
-    await writeFile(temporary, `${JSON.stringify(session, null, 2)}\n`, 'utf8');
+    await writeFile(temporary, `${JSON.stringify(session)}\n`, 'utf8');
     await rename(temporary, this.file);
+    this.cache = session;
   }
 }
