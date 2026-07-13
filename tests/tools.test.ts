@@ -4,6 +4,7 @@ import { createServer } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { RunContext } from '@openai/agents';
 import {
   createTools,
   editLocalFile,
@@ -14,6 +15,41 @@ import {
   searchLocalFiles,
   writeLocalFile,
 } from '../src/tools.js';
+import { createRuntimeControlTools, type RuntimeAction } from '../src/runtime/control.js';
+
+test('exposes CLI-equivalent runtime controls to the Agent', async () => {
+  const actions: RuntimeAction[] = [];
+  const switched: string[] = [];
+  const tools = createRuntimeControlTools({
+    status: () => ({ model: 'demo-model' }),
+    models: () => ['demo-model', 'next-model'],
+    modes: () => [{ id: 'code', label: '编码', description: '代码任务' }],
+    switchModel: (model) => switched.push(`model:${model}`),
+    switchMode: (mode) => switched.push(`mode:${mode}`),
+    listSessions: () => [{ id: 'demo' }],
+    history: async () => [],
+    schedule: (action) => actions.push(action),
+  });
+  const invoke = async (name: string, input: object) => {
+    const selected = tools.find((item) => item.name === name);
+    if (!selected || !('invoke' in selected)) throw new Error(`工具不可调用：${name}`);
+    return selected.invoke(new RunContext({}), JSON.stringify(input));
+  };
+
+  assert.deepEqual(tools.map((tool) => tool.name), [
+    'runtime_status', 'switch_model', 'switch_mode', 'set_output_level', 'list_sessions',
+    'get_session_history', 'switch_session', 'new_session', 'clear_session', 'reload_mcp', 'request_exit',
+  ]);
+  await invoke('switch_model', { model: 'next-model' });
+  await invoke('switch_mode', { mode: 'code' });
+  await invoke('set_output_level', { level: 'trace' });
+  await invoke('switch_session', { sessionId: 'archive' });
+  assert.deepEqual(switched, ['model:next-model', 'mode:code']);
+  assert.deepEqual(actions, [
+    { type: 'set_output_level', level: 'trace' },
+    { type: 'switch_session', sessionId: 'archive' },
+  ]);
+});
 
 test('exposes unique tool names for OpenAI and compatible providers', () => {
   for (const openAI of [true, false]) {

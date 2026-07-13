@@ -16,6 +16,7 @@ NanoAgent 使用 OpenAI Agents SDK 作为运行内核，覆盖工具调用、流
 - OpenAI Responses API 与 DeepSeek OpenAI-compatible API
 - 持久化多轮会话，可新建、切换和恢复
 - 用户级与项目级 `NANO.md` 持久指令，每轮自动加载且项目级优先
+- CLI 与 Agent 共用运行时控制：模型、模式、输出、Session、MCP 和退出均可由对话触发
 - 按 Token Budget 裁剪历史、结构化压缩旧上下文和动态上下文组装
 - 可检索、可删除的本地长期记忆
 - 兼容 Agent Skills 开放规范的发现、激活、资源读取与热重载
@@ -59,6 +60,7 @@ src/
 │   ├── nano-agent.ts     # 运行时组合根
 │   ├── model.ts          # Provider 模型工厂
 │   ├── instructions.ts   # 基础指令与模式
+│   ├── control.ts        # Agent 可调用的运行时控制
 │   └── hooks.ts          # 生命周期事件总线
 ├── tools.ts              # 本机及 OpenAI 托管工具
 ├── terminal.ts           # 终端动画和流式渲染
@@ -253,6 +255,24 @@ NanoAgent 使用两层纯 Markdown 指令文件，把需要在每次任务中生
 适合放入 `NANO.md` 的内容包括构建与测试命令、代码规范、项目结构、常用工作流和回答偏好。一次性的任务要求应留在当前对话，可复用的多步骤流程应写成 Skill，事实和用户偏好则可交给 Memory。仓库中的 [NANO.md](NANO.md) 可作为项目级示例。
 
 该设计参考了 [Codex AGENTS.md](https://developers.openai.com/codex/concepts/customization#agents-guidance)、[Claude Code CLAUDE.md](https://code.claude.com/docs/zh-CN/memory) 和 [OpenClaw workspace bootstrap](https://docs.openclaw.ai/agent-workspace) 的持久上下文模式，同时只保留 NanoAgent 当前需要的两层结构。
+
+## Agent 自管理与自修改
+
+CLI 斜杠命令和模型工具调用复用相同的 NanoAgent 运行时方法。用户既可以输入 `/model`，也可以直接说“切换到某个模型”；Agent 会实际调用工具，而不是只回复操作步骤。
+
+| CLI 能力 | Agent 工具 |
+|---|---|
+| `/status`、`/context`、`/tools` | `runtime_status` 与现有状态工具 |
+| `/model`、`/mode`、`/output` | `switch_model`、`switch_mode`、`set_output_level` |
+| `/sessions`、`/history` | `list_sessions`、`get_session_history` |
+| `/switch`、`/new`、`/clear` | `switch_session`、`new_session`、`clear_session` |
+| `/skills`、`/mcp`、`/index` | `list_skills`、`reload_skills`、`reload_mcp`、`index_knowledge` |
+| `/memories`、`/plan`、`/goal` | Memory、Plan 和 Goal 工具 |
+| `/exit` | `request_exit` |
+
+模型和模式切换从下一轮生效；Session、输出等级和退出在当前回答完整写入后生效，避免留下孤立 Tool Call。`/retry` 与 `/resume` 属于重新发起一轮对话的 CLI 入口，Agent 在当前轮中分别通过重试工具和 Goal 工具完成相同语义，不递归启动自身。
+
+`runtime_status` 同时返回当前工作区与 NanoAgent 运行时代码目录。已有 `read_file`、`search_files`、`write_file`、`edit_file` 和 `run_shell` 支持绝对路径，因此当用户明确要求检查或修改 NanoAgent 自身时，Agent 可以读取源码、实施修改并运行构建与测试。自修改使用当前操作系统用户权限，不提供不可回滚的隐藏更新通道。
 
 ## 长期记忆
 

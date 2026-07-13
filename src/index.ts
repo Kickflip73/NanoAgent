@@ -8,6 +8,7 @@ import { NanoAgent } from './agent.js';
 import { COMMANDS, CommandHandler, commandHelp } from './commands.js';
 import { loadConfig, loadEnvironment } from './config.js';
 import { InteractiveTerminal } from './interactive.js';
+import type { RuntimeEffect } from './runtime/control.js';
 import { normalizeOutputLevel, OUTPUT_LEVELS, parseRunEvent, renderBanner, renderSessionTranscript, TerminalRenderer, type OutputLevel } from './terminal.js';
 
 loadEnvironment();
@@ -74,6 +75,8 @@ async function main(): Promise<void> {
   const agent = await NanoAgent.create(config);
   const oneShotInput = args.join(' ').trim();
   let outputLevel: OutputLevel = normalizeOutputLevel(process.env.OUTPUT_LEVEL);
+  agent.setOutputLevel(outputLevel);
+  let handleRuntimeEffects = async (_effects: RuntimeEffect[]): Promise<void> => undefined;
 
   const runTask = async (
     input: string,
@@ -92,7 +95,8 @@ async function main(): Promise<void> {
       }
       await stream.completed;
       renderer.finish();
-      await agent.completeRun(finalAnswer.slice(0, 20_000));
+      const effects = await agent.completeRun(finalAnswer.slice(0, 20_000));
+      await handleRuntimeEffects(effects);
     } catch (error) {
       renderer.stop();
       await agent.failRun(error);
@@ -126,6 +130,21 @@ async function main(): Promise<void> {
       const [header, history] = await Promise.all([banner(), agent.history()]);
       const transcript = renderSessionTranscript(history, Boolean(process.stdout.isTTY));
       return [header, transcript].filter(Boolean).join('\n\n');
+    };
+    handleRuntimeEffects = async (effects) => {
+      const latest = [...effects].reverse();
+      const output = latest.find((effect) => effect.type === 'output_level_changed');
+      if (output?.type === 'output_level_changed') outputLevel = output.level;
+      const session = latest.find((effect) => effect.type === 'session_changed' || effect.type === 'session_cleared');
+      if (session?.type === 'session_changed') terminal.clearScreen(await sessionView());
+      if (session?.type === 'session_cleared') terminal.clearScreen(await banner());
+      if (latest.some((effect) => effect.type === 'exit_requested')) {
+        exitRequested = true;
+        queue.length = 0;
+        terminal.setQueue(queue);
+        terminal.close();
+        resolveClosed();
+      }
     };
     const refreshRuntimeStatus = async () => {
       const [info, context] = await Promise.all([agent.runtimeInfo(), agent.contextInfo()]);
@@ -161,7 +180,10 @@ async function main(): Promise<void> {
         detail: mode.description,
       })), '选择模式'),
       getOutputLevel: () => outputLevel,
-      setOutputLevel: (level) => { outputLevel = level; },
+      setOutputLevel: (level) => {
+        outputLevel = level;
+        agent.setOutputLevel(level);
+      },
       selectOutputLevel: async (current) => terminal.select(OUTPUT_LEVELS.map((level) => ({
         value: level.id,
         label: `${level.id === current ? '● ' : ''}${level.label}`,

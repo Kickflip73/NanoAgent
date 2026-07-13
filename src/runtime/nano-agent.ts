@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   Agent,
   Runner,
@@ -19,6 +20,13 @@ import { SkillLoader } from '../extensions/skills.js';
 import { createSubAgentTools } from '../extensions/subagents.js';
 import { createTools } from '../tools.js';
 import { HookBus } from './hooks.js';
+import {
+  createRuntimeControlTools,
+  RUNTIME_OUTPUT_LEVELS,
+  type RuntimeAction,
+  type RuntimeEffect,
+  type RuntimeOutputLevel,
+} from './control.js';
 import { AGENT_MODES, BASE_INSTRUCTIONS, type AgentMode } from './instructions.js';
 import { createModel, type AgentModel } from './model.js';
 
@@ -40,7 +48,12 @@ export class NanoAgent {
   private session: FileSession;
   private sessionId: string;
   private mode: AgentMode = 'standard';
+  private outputLevel: RuntimeOutputLevel = RUNTIME_OUTPUT_LEVELS.includes(process.env.OUTPUT_LEVEL as RuntimeOutputLevel)
+    ? process.env.OUTPUT_LEVEL as RuntimeOutputLevel
+    : 'tools';
+  private pendingActions: RuntimeAction[] = [];
   private lastContextTokens = 0;
+  private readonly runtimeRoot = path.resolve(fileURLToPath(new URL('../../', import.meta.url)));
 
   private constructor(
     private readonly config: AppConfig,
@@ -90,6 +103,16 @@ export class NanoAgent {
       ...this.rag.createTools(),
       ...this.plans.createTools(),
       ...this.mcp.createTools(),
+      ...createRuntimeControlTools({
+        status: () => this.runtimeInfo(),
+        models: () => this.availableModels(),
+        modes: () => this.availableModes(),
+        switchModel: (model) => this.switchModel(model),
+        switchMode: (mode) => this.switchMode(mode),
+        listSessions: () => this.listSessionSummaries(),
+        history: async (limit) => (await this.session.getItems()).slice(-limit),
+        schedule: (action) => this.pendingActions.push(action),
+      }),
     ];
   }
 
@@ -136,7 +159,11 @@ export class NanoAgent {
       this.guidance.load(),
     ]);
     const instructions = this.context.buildInstructions({
-      baseInstructions: `${BASE_INSTRUCTIONS}\n当前模式：${this.currentMode.label}。${this.currentMode.instruction}`,
+      baseInstructions: [
+        BASE_INSTRUCTIONS,
+        `当前模式：${this.currentMode.label}。${this.currentMode.instruction}`,
+        `当前工作区：${this.config.workspaceRoot}。NanoAgent 运行时代码目录：${this.runtimeRoot}。用户要求检查或修改项目/Agent 自身时，使用文件与 Shell 工具实际读取、编辑并验证。`,
+      ].join('\n'),
       persistentInstructions: guidance.instructions,
       historySummary: this.context.summarizeHistory(history),
       skillCatalog: this.skills.catalog(),
@@ -239,6 +266,8 @@ export class NanoAgent {
       sessionId: this.sessionId,
       sessionTitle: sessionSummary.title,
       workspaceRoot: this.config.workspaceRoot,
+      runtimeRoot: this.runtimeRoot,
+      outputLevel: this.outputLevel,
       maxTurns: this.config.maxTurns,
       skillCount: this.skills.list().length,
       memoryCount: (await this.memory.list()).length,
@@ -280,6 +309,11 @@ export class NanoAgent {
   switchMode(mode: string): void {
     if (!AGENT_MODES.some((item) => item.id === mode)) throw new Error(`未知模式：${mode}`);
     this.mode = mode as AgentMode;
+  }
+
+  setOutputLevel(level: RuntimeOutputLevel): void {
+    if (!RUNTIME_OUTPUT_LEVELS.includes(level)) throw new Error(`未知输出等级：${level}`);
+    this.outputLevel = level;
   }
 
   async contextInfo() {
@@ -343,11 +377,13 @@ export class NanoAgent {
     await this.traces.record(this.sessionId, type, data);
   }
 
-  async completeRun(answer: string): Promise<void> {
+  async completeRun(answer: string): Promise<RuntimeEffect[]> {
     await this.hooks.emit({ type: 'run_end', sessionId: this.sessionId, answer });
+    return this.applyPendingActions();
   }
 
   async failRun(error: unknown): Promise<void> {
+    this.pendingActions = [];
     await this.hooks.emit({
       type: 'run_error',
       sessionId: this.sessionId,
@@ -361,5 +397,28 @@ export class NanoAgent {
 
   private createSession(id: string): FileSession {
     return new FileSession(path.join(this.config.dataRoot, 'sessions'), id);
+  }
+
+  private async applyPendingActions(): Promise<RuntimeEffect[]> {
+    const actions = this.pendingActions.splice(0);
+    const effects: RuntimeEffect[] = [];
+    for (const action of actions) {
+      if (action.type === 'set_output_level') {
+        this.setOutputLevel(action.level);
+        effects.push({ type: 'output_level_changed', level: action.level });
+      } else if (action.type === 'clear_session') {
+        await this.clearSession();
+        effects.push({ type: 'session_cleared', sessionId: this.sessionId });
+      } else if (action.type === 'exit') {
+        effects.push({ type: 'exit_requested' });
+      } else if (action.type === 'reload_mcp') {
+        await this.reloadMcp();
+        effects.push({ type: 'mcp_reloaded' });
+      } else {
+        await this.switchSession(action.sessionId);
+        effects.push({ type: 'session_changed', sessionId: action.sessionId });
+      }
+    }
+    return effects;
   }
 }

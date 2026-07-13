@@ -8,5 +8,10 @@
     "name": "delegates an explicit review subtask",
     "input": "请调用 delegate_review 审查这句话是否正确：2+2=4，然后简短回复。",
     "expectedTool": "delegate_review"
+  },
+  {
+    "name": "changes its own runtime mode on request",
+    "input": "请调用 switch_mode 将 NanoAgent 切换到 code 模式，然后简短确认。",
+    "expectedTool": "switch_mode"
   }
 ]

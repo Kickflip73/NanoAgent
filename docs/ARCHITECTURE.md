@@ -24,6 +24,7 @@ CLI
     ├── nano-agent.ts    组合根与一轮运行
     ├── model.ts         OpenAI / DeepSeek 模型工厂
     ├── instructions.ts  基础指令与模式
+    ├── control.ts       Agent 可调用的运行时控制与延迟 Effects
     └── hooks.ts         生命周期事件总线
         ├── core/
         │   ├── context.ts  Token Budget 与动态上下文
@@ -53,6 +54,7 @@ CLI
 6. 主 Agent 获得本地 Tools、MCP Tools/Resources 和两个受控 SubAgent Tools
 7. Runner 流式执行，TerminalRenderer 分级展示事件
 8. SDK 追加完整 Session，HookBus 记录生命周期 Trace
+9. 当前回答完成后应用模型请求的 Session、输出或退出 Effects
 ```
 
 ## 上下文不变量
@@ -118,6 +120,12 @@ SubAgent 使用 Agents SDK `Agent.asTool()`，而不是 Handoff：
 - 主 Agent 继续控制会话、Goal、写操作和最终回答。
 
 这提供了上下文隔离与专业化，又不需要 Agent 图、队列或调度器。
+
+## Runtime Control
+
+`runtime/control.ts` 把 CLI 中有实际运行时语义的操作暴露为 Function Tools。查询、模型切换和模式切换直接复用 `NanoAgent` 方法；Session 切换/清空、MCP reload、输出等级和退出先进入内存队列，等 SDK 完成当前 Session 写入与 `run_end` Hook 后再应用，并把 Effect 交给 CLI 刷新界面。这样 Agent 能代替用户操作，又不会在 Tool Call 尚未闭合时替换持久化目标或关闭当前 MCP 连接。
+
+文件与 Shell 工具同时接受工作区相对路径和绝对路径。`runtime_status` 暴露 `workspaceRoot` 与 `runtimeRoot`，使明确授权的自检查、自修改和自测试不需要新增一套代码编辑协议。
 
 ## Memory 与 RAG
 

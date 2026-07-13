@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.9.0] - 2026-07-14
+
+### Added
+
+- expose model, mode, output, Session, history, runtime status, and MCP lifecycle controls as Agent-callable tools
+- defer destructive Session and terminal changes until the active turn is fully persisted
+- expose both workspace and NanoAgent runtime roots so the Agent can inspect and modify its own code with existing file and Shell tools
+
 ## [0.8.0] - 2026-07-14
 
 ### Added
