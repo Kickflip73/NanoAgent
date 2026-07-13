@@ -42,7 +42,7 @@ export class NanoAgent {
 
   private constructor(
     private readonly config: AppConfig,
-    private readonly model: string | OpenAIChatCompletionsModel,
+    private model: string | OpenAIChatCompletionsModel,
     components: {
       context: ContextManager;
       memory: MemoryStore;
@@ -80,7 +80,7 @@ export class NanoAgent {
     ];
   }
 
-  private readonly modelName: string;
+  private modelName: string;
 
   static async create(config: AppConfig): Promise<NanoAgent> {
     const model = config.provider === 'deepseek'
@@ -122,8 +122,9 @@ export class NanoAgent {
     return agent;
   }
 
-  async stream(input: string) {
+  async stream(input: string, signal?: AbortSignal) {
     await this.session.cleanupGeneratedSummaries();
+    await this.session.repairToolPairs();
     const [memories, documents, plan, history] = await Promise.all([
       this.memory.search(input),
       this.rag.search(input),
@@ -152,6 +153,7 @@ export class NanoAgent {
       sessionInputCallback: this.context.sessionInput,
       maxTurns: this.config.maxTurns,
       stream: true,
+      signal,
     });
   }
 
@@ -164,6 +166,10 @@ export class NanoAgent {
 
   async listSessions(): Promise<string[]> {
     return FileSession.list(path.join(this.config.dataRoot, 'sessions'));
+  }
+
+  async listSessionSummaries() {
+    return FileSession.listSummaries(path.join(this.config.dataRoot, 'sessions'));
   }
 
   async history(): Promise<unknown[]> {
@@ -187,16 +193,65 @@ export class NanoAgent {
   }
 
   async runtimeInfo() {
+    const sessionSummary = await this.session.summary();
     return {
       provider: this.config.provider,
       model: this.modelName,
       sessionId: this.sessionId,
+      sessionTitle: sessionSummary.title,
       workspaceRoot: this.config.workspaceRoot,
       maxTurns: this.config.maxTurns,
       skillCount: this.skills.list().length,
       memoryCount: (await this.memory.list()).length,
       mcpServers: this.mcpServerNames,
     };
+  }
+
+  availableModels(): string[] {
+    const configured = this.config.provider === 'deepseek'
+      ? process.env.DEEPSEEK_MODELS
+      : process.env.OPENAI_MODELS;
+    const defaults = this.config.provider === 'deepseek'
+      ? ['deepseek-chat', 'deepseek-reasoner']
+      : ['gpt-5.4-mini', 'gpt-5.4', 'gpt-5-mini'];
+    return [...new Set([
+      this.modelName,
+      ...(configured?.split(',').map((item) => item.trim()).filter(Boolean) ?? []),
+      ...defaults,
+    ])];
+  }
+
+  switchModel(modelName: string): void {
+    if (!/^[a-zA-Z0-9._:/-]+$/.test(modelName)) throw new Error('模型名称格式无效');
+    this.modelName = modelName;
+    this.model = this.config.provider === 'deepseek'
+      ? new OpenAIChatCompletionsModel(
+          new OpenAI({
+            apiKey: process.env.DEEPSEEK_API_KEY,
+            baseURL: process.env.DEEPSEEK_BASE_URL ?? 'https://api.deepseek.com',
+            fetch: globalThis.fetch,
+          }),
+          modelName,
+        )
+      : modelName;
+  }
+
+  async contextInfo() {
+    const [history, memories, plan] = await Promise.all([
+      this.session.getItems(),
+      this.memory.list(),
+      this.plans.get(),
+    ]);
+    return {
+      historyItems: history.length,
+      historyLimit: this.config.historyLimit,
+      memories: memories.length,
+      planSteps: plan.length,
+    };
+  }
+
+  get toolNames(): string[] {
+    return this.tools.map((item) => item.name).sort();
   }
 
   async indexKnowledge(target?: string) {

@@ -25,6 +25,21 @@ test('persists sessions and returns the latest items', async () => {
   assert.deepEqual(await FileSession.list(root), ['demo']);
 });
 
+test('summarizes and sorts sessions from recent conversation content', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'nano-session-summary-'));
+  const session = new FileSession(root, 'opaque-id');
+  await session.addItems([
+    { role: 'user', content: '帮我优化 NanoAgent 的终端交互体验' },
+    { role: 'user', content: '还要支持任务排队' },
+  ] as AgentInputItem[]);
+
+  const [summary] = await FileSession.listSummaries(root);
+  assert.equal(summary?.id, 'opaque-id');
+  assert.equal(summary?.title, '优化 NanoAgent 的终端交互体验');
+  assert.equal(summary?.preview, '还要支持任务排队');
+  assert.equal(summary?.turns, 2);
+});
+
 test('removes summaries accidentally persisted by older context management', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'nano-session-cleanup-'));
   const session = new FileSession(root, 'demo');
@@ -35,6 +50,22 @@ test('removes summaries accidentally persisted by older context management', asy
 
   assert.equal(await session.cleanupGeneratedSummaries(), 1);
   assert.deepEqual(await session.getItems(), [{ role: 'user', content: 'real message' }]);
+});
+
+test('repairs dangling tool calls left by an interrupted task', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'nano-session-repair-'));
+  const session = new FileSession(root, 'demo');
+  await session.addItems([
+    { type: 'message', role: 'user', content: 'run it' },
+    { type: 'function_call', name: 'run_shell', callId: 'dangling', arguments: '{}' },
+    { type: 'function_call', name: 'read_file', callId: 'paired', arguments: '{}' },
+    { type: 'function_call_result', name: 'read_file', callId: 'paired', output: 'ok' },
+  ] as unknown as AgentInputItem[]);
+
+  assert.equal(await session.repairToolPairs(), 1);
+  const serialized = JSON.stringify(await session.getItems());
+  assert.doesNotMatch(serialized, /dangling/);
+  assert.match(serialized, /paired/);
 });
 
 test('stores, retrieves and forgets long-term memories', async () => {

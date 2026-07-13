@@ -151,6 +151,7 @@ export async function requestUrl(
   headers: Record<string, string>,
   body: string | undefined,
   timeoutSeconds: number,
+  signal?: AbortSignal,
 ) {
   const target = new URL(url);
   if (!['http:', 'https:'].includes(target.protocol)) throw new Error('只支持 HTTP 和 HTTPS URL');
@@ -158,7 +159,9 @@ export async function requestUrl(
     method,
     headers,
     body: method === 'GET' || method === 'HEAD' ? undefined : body,
-    signal: AbortSignal.timeout(timeoutSeconds * 1_000),
+    signal: signal
+      ? AbortSignal.any([signal, AbortSignal.timeout(timeoutSeconds * 1_000)])
+      : AbortSignal.timeout(timeoutSeconds * 1_000),
   });
   return {
     status: response.status,
@@ -172,6 +175,7 @@ export async function runShellCommand(
   workspaceRoot: string,
   command: string,
   timeoutSeconds: number,
+  signal?: AbortSignal,
 ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
   try {
     const { stdout, stderr } = await execFileAsync('/bin/zsh', ['-lc', command], {
@@ -179,6 +183,7 @@ export async function runShellCommand(
       timeout: timeoutSeconds * 1_000,
       maxBuffer: 2 * 1024 * 1024,
       env: process.env,
+      signal,
     });
     return { exitCode: 0, stdout: truncate(stdout), stderr: truncate(stderr) };
   } catch (error) {
@@ -294,8 +299,8 @@ export function createTools(workspaceRoot: string, includeOpenAIHostedTools = tr
       command: z.string().min(1),
       timeoutSeconds: z.number().int().min(1).max(300).default(60),
     }),
-    execute: async ({ command, timeoutSeconds }) =>
-      runShellCommand(workspaceRoot, command, timeoutSeconds),
+    execute: async ({ command, timeoutSeconds }, _context, details) =>
+      runShellCommand(workspaceRoot, command, timeoutSeconds, details?.signal),
   });
 
   const calculate = tool({
@@ -328,8 +333,8 @@ export function createTools(workspaceRoot: string, includeOpenAIHostedTools = tr
       body: z.string().optional(),
       timeoutSeconds: z.number().int().min(1).max(120).default(30),
     }),
-    execute: async ({ url, method, headers, body, timeoutSeconds }) =>
-      requestUrl(url, method, headers, body, timeoutSeconds),
+    execute: async ({ url, method, headers, body, timeoutSeconds }, _context, details) =>
+      requestUrl(url, method, headers, body, timeoutSeconds, details?.signal),
   });
 
   const localTools = [

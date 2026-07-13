@@ -23,18 +23,46 @@ const ansi = {
   bold: '\x1b[1m',
   dim: '\x1b[2m',
   italic: '\x1b[3m',
-  code: '\x1b[38;2;214;157;101m',
-  gray: '\x1b[38;2;145;141;135m',
+  code: '\x1b[38;2;148;166;173m',
+  gray: '\x1b[38;2;145;151;158m',
 };
 
 const badges: Record<StatusTone | 'answer' | 'done', { icon: string; label: string; rgb: string }> = {
-  agent: { icon: '◆', label: 'Agent', rgb: '165;158;148' },
-  thinking: { icon: '✦', label: '思考', rgb: '165;158;148' },
-  tool: { icon: '●', label: '工具', rgb: '217;149;85' },
-  success: { icon: '└', label: '结果', rgb: '111;174;130' },
-  answer: { icon: '◆', label: '回答', rgb: '217;119;87' },
-  done: { icon: '✓', label: '完成', rgb: '111;174;130' },
+  agent: { icon: '◆', label: 'Agent', rgb: '148;156;166' },
+  thinking: { icon: '✦', label: '思考', rgb: '126;156;196' },
+  tool: { icon: '●', label: '工具', rgb: '93;170;160' },
+  success: { icon: '└', label: '结果', rgb: '124;170;122' },
+  answer: { icon: '◆', label: '回答', rgb: '157;142;198' },
+  done: { icon: '✓', label: '完成', rgb: '124;170;122' },
 };
+
+export interface BannerInfo {
+  version: string;
+  provider: string;
+  model: string;
+  sessionTitle: string;
+  workspaceRoot: string;
+  skillCount: number;
+  mcpServers: string[];
+}
+
+export function renderBanner(info: BannerInfo, tty = true): string {
+  const accent = (text: string) => tty ? `\x1b[38;2;93;170;160m${text}${ansi.reset}` : text;
+  const muted = (text: string) => tty ? `${ansi.gray}${text}${ansi.reset}` : text;
+  const strong = (text: string) => tty ? `${ansi.bold}${text}${ansi.reset}` : text;
+  return [
+    `  ${accent('╭──────╮')}   ${strong('NanoAgent')} ${muted(`v${info.version}`)}`,
+    `  ${accent('│  ◉ ◉ │')}   轻量级 Agent 助手`,
+    `  ${accent('│   ᴗ  │')}`,
+    `  ${accent('╰──┬───╯')}   ${muted('Esc 中止 · / 查看命令')}`,
+    `     ${accent('╵')}`,
+    '',
+    `  模型    ${info.provider} · ${info.model}`,
+    `  对话    ${info.sessionTitle}`,
+    `  扩展    Skills ${info.skillCount} · MCP ${info.mcpServers.length || '未连接'}`,
+    `  工作区  ${info.workspaceRoot}`,
+  ].join('\n');
+}
 
 function record(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === 'object'

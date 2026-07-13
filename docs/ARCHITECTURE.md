@@ -104,7 +104,11 @@ npm install / npm link
   → nano
 ```
 
-`nano --help` 和 `nano --version` 在创建模型客户端之前处理，因此不需要 API Key。交互模式中的斜杠命令由 `commands.ts` 统一解析，`index.ts` 只负责输入循环和流消费。未知斜杠命令不会被发送给模型。
+`nano --help` 和 `nano --version` 在创建模型客户端之前处理，因此不需要 API Key。交互模式中的斜杠命令由 `commands.ts` 统一解析，`interactive.ts` 提供轻量键盘输入、命令补全和选择器，`index.ts` 只负责 FIFO 调度和流消费。未知斜杠命令不会被发送给模型。
+
+交互输入和 Agent 执行彼此独立。每次提交进入内存队列，调度器逐条执行；当前任务持有独立的 `AbortController`，按 `Esc` 会通过 SDK 的 `AbortSignal` 中止模型请求及工具链，然后继续处理剩余队列。会话选择器读取本地 JSON 会话，以首条有效用户消息生成标题、以最近用户消息生成预览，不产生额外模型调用。
+
+模型选择属于运行时状态：`/model` 更新 `NanoAgent` 当前的模型实例，Provider 和 API Key 仍由启动配置决定。OpenAI 使用 SDK 模型名，DeepSeek 则重建兼容的 `OpenAIChatCompletionsModel`，不会重建会话、工具、MCP 或其他核心组件。顶部 Banner 和清屏后的重新渲染仍由终端层负责。
 
 内置命令只做运行时管理和高频查看；需要模型推理的能力应实现为 Tool、Skill 或 MCP，而不是 CLI 命令。
 

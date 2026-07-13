@@ -74,7 +74,8 @@ src/
 git clone https://github.com/Kickflip73/NanoAgent.git
 cd NanoAgent
 npm install
-cp .env.example .env
+mkdir -p ~/.nano-agent
+cp .env.example ~/.nano-agent/.env
 npm link
 ```
 
@@ -116,9 +117,11 @@ nano --version
 
 开发时也可以不建立全局链接，直接运行 `npm run dev`。`npm install`/`npm link` 会自动构建 `dist/`，`npm start` 则执行已构建版本。
 
+NanoAgent 始终从 `~/.nano-agent/.env` 读取模型和 API Key 配置，因此从任何目录启动都会使用同一套环境变量。需要使用其他配置文件时，可以通过 `DOTENV_CONFIG_PATH` 显式指定。
+
 > macOS 和 Linux 通常已经安装 GNU nano 编辑器。执行 `type -a nano` 可以查看命令解析顺序；如果系统编辑器排在前面，请运行 `export PATH="$(npm prefix -g)/bin:$PATH"`，并把它加入 shell 配置。运行 `npm unlink --global nano-agent` 可移除项目链接并恢复原编辑器命令。
 
-`.env` 和运行目录 `.nano-agent/` 已被 Git 忽略。不要将真实 API Key 写入代码、配置示例或提交记录。
+项目内的 `.env` 和运行目录 `.nano-agent/` 已被 Git 忽略。不要将真实 API Key 写入代码、配置示例或提交记录。
 
 ### 可选配置
 
@@ -138,13 +141,17 @@ nano --version
 
 | 命令 | 作用 |
 |---|---|
+| `/model [name]` | 查看或切换当前 Provider 下的模型；无参数时使用选择器 |
 | `/new [id]` | 新建并切换会话 |
-| `/sessions` | 列出本地会话 |
+| `/sessions` | 按内容摘要列出最近对话，使用 ↑↓ 和 Enter 切换 |
 | `/switch <id>` | 切换已有会话 |
 | `/history` | 查看当前完整历史 |
 | `/clear` | 清空当前会话 |
 | `/status` | 查看模型、会话、Skills、Memory 和 MCP 状态 |
 | `/skills` | 列出可用 Skills |
+| `/tools` | 列出当前可用工具 |
+| `/mcp` | 查看 MCP Server 连接 |
+| `/context` | 查看历史、记忆和计划用量 |
 | `/memories` | 列出长期记忆 |
 | `/plan` | 查看当前任务计划 |
 | `/index [path]` | 构建 RAG 索引，默认 `knowledge/` |
@@ -153,6 +160,10 @@ nano --version
 | `/exit` | 退出 |
 
 完整会话保存在 `.nano-agent/sessions/`。发送给模型时会从最近的完整用户轮次开始保留约 `HISTORY_LIMIT` 条历史，避免拆散工具调用与工具结果；更早的人类对话压缩到动态 Instructions，且不会反向写入会话。完整原始历史不会因此删除。
+
+交互模式不会阻塞输入：Agent 执行时仍可继续提交消息，消息会进入 FIFO 队列并在当前任务结束后依次执行。按 `Esc` 可停止当前任务，队列中的后续消息不受影响。输入 `/` 会展示命令面板，使用黑色活动光标配合 `↑` / `↓` 选择、`Tab` 补全。`/new`、`/clear` 和会话切换会清理终端画面，并重新展示包含机器人标识、模型、对话、扩展和工作区的项目 Banner。
+
+`/model` 默认展示当前 Provider 的常用模型，也会合并 `OPENAI_MODELS` 或 `DEEPSEEK_MODELS` 中以逗号分隔的自定义模型名称。`/model <name>` 可以直接切换未列出的兼容模型；切换只影响当前进程，不修改 `.env`。
 
 ## 终端展示
 

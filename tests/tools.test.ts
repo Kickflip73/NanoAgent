@@ -73,3 +73,15 @@ test('runs shell commands in the workspace', async () => {
   assert.equal(result.exitCode, 0);
   assert.equal(result.stdout.trim(), await realpath(root));
 });
+
+test('stops a running shell tool when the Agent task is aborted', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'nano-agent-'));
+  const controller = new AbortController();
+  const startedAt = Date.now();
+  const running = runShellCommand(root, 'sleep 10', 30, controller.signal);
+  setTimeout(() => controller.abort(), 30);
+  const result = await running;
+
+  assert.equal(result.exitCode, 1);
+  assert.ok(Date.now() - startedAt < 2_000);
+});

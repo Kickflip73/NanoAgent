@@ -1,15 +1,16 @@
 #!/usr/bin/env node
-import 'dotenv/config';
 import process from 'node:process';
 import { readFile } from 'node:fs/promises';
-import readline from 'node:readline/promises';
 import { setDefaultOpenAIClient, setTracingDisabled } from '@openai/agents';
 import OpenAI from 'openai';
 import { EnvHttpProxyAgent, fetch as undiciFetch } from 'undici';
 import { NanoAgent } from './agent.js';
-import { CommandHandler, commandHelp } from './commands.js';
-import { loadConfig } from './config.js';
-import { parseRunEvent, TerminalRenderer } from './terminal.js';
+import { COMMANDS, CommandHandler, commandHelp } from './commands.js';
+import { loadConfig, loadEnvironment } from './config.js';
+import { InteractiveTerminal } from './interactive.js';
+import { parseRunEvent, renderBanner, TerminalRenderer } from './terminal.js';
+
+loadEnvironment();
 
 const proxyDispatcher = process.env.HTTPS_PROXY || process.env.HTTP_PROXY
   ? new EnvHttpProxyAgent()
@@ -73,12 +74,15 @@ async function main(): Promise<void> {
   const agent = await NanoAgent.create(config);
   const oneShotInput = args.join(' ').trim();
 
-  const runTask = async (input: string): Promise<void> => {
-    const renderer = new TerminalRenderer();
+  const runTask = async (
+    input: string,
+    signal?: AbortSignal,
+    renderer = new TerminalRenderer(),
+  ): Promise<void> => {
     let finalAnswer = '';
     renderer.start();
     try {
-      const stream = await agent.stream(input);
+      const stream = await agent.stream(input, signal);
       for await (const event of stream) {
         renderer.handle(event);
         const display = parseRunEvent(event);
@@ -101,27 +105,104 @@ async function main(): Promise<void> {
       return;
     }
 
-    const terminal = readline.createInterface({ input: process.stdin, output: process.stdout });
-    const commands = new CommandHandler(agent, runTask);
-    console.log(`NanoAgent v${await version()} · 输入 /help 查看命令`);
-    console.log(`模型：${config.provider} · 会话：${agent.currentSessionId}`);
-    console.log(`工作区：${config.workspaceRoot}`);
-    if (agent.mcpServerNames.length) console.log(`MCP：${agent.mcpServerNames.join(', ')}`);
+    const terminal = new InteractiveTerminal([...COMMANDS]);
+    const stdout = terminal.createWriter(process.stdout);
+    const stderr = terminal.createWriter(process.stderr);
+    const appVersion = await version();
+    const banner = async () => {
+      const info = await agent.runtimeInfo();
+      return renderBanner({
+        version: appVersion,
+        provider: info.provider,
+        model: info.model,
+        sessionTitle: info.sessionTitle,
+        workspaceRoot: info.workspaceRoot,
+        skillCount: info.skillCount,
+        mcpServers: info.mcpServers,
+      }, Boolean(process.stdout.isTTY));
+    };
+    let currentAbort: AbortController | undefined;
+    let drainPromise: Promise<void> | undefined;
+    let exitRequested = false;
+    const queue: string[] = [];
+    const queuedRunTask = (input: string) => runTask(input, currentAbort?.signal, new TerminalRenderer(stderr, stdout));
+    const commands = new CommandHandler(agent, queuedRunTask, {
+      write: (text) => terminal.notify(text),
+      resetScreen: async () => terminal.clearScreen(await banner()),
+      selectSession: async (sessions) => terminal.select(sessions.map((session) => ({
+        value: session.id,
+        label: `${session.id === agent.currentSessionId ? '● ' : ''}${session.title}`,
+        detail: `${session.turns} 轮 · ${session.preview}`,
+      })), '选择对话'),
+      selectModel: async (models, current) => terminal.select(models.map((model) => ({
+        value: model,
+        label: `${model === current ? '● ' : ''}${model}`,
+        detail: model === current ? '当前模型' : config.provider,
+      })), '选择模型'),
+    });
+    console.log(await banner());
+
+    const drain = async (): Promise<void> => {
+      if (drainPromise) return drainPromise;
+      drainPromise = (async () => {
+        terminal.setBusy(true);
+        while (queue.length && !exitRequested) {
+          const input = queue.shift()!;
+          currentAbort = new AbortController();
+          try {
+            const result = await commands.execute(input);
+            if (result === 'exit') {
+              exitRequested = true;
+              queue.length = 0;
+              terminal.close();
+              resolveClosed();
+              break;
+            }
+            if (result === 'handled') continue;
+            commands.remember(input);
+            await queuedRunTask(input);
+          } catch (error) {
+            if (currentAbort.signal.aborted) {
+              terminal.notify('已停止当前任务。');
+            } else {
+              terminal.notify(`运行失败：${error instanceof Error ? error.message : String(error)}`);
+            }
+          } finally {
+            currentAbort = undefined;
+          }
+        }
+        terminal.setBusy(false);
+      })().finally(() => {
+        drainPromise = undefined;
+        if (queue.length && !exitRequested) void drain();
+      });
+      return drainPromise;
+    };
+
+    let resolveClosed!: () => void;
+    const closed = new Promise<void>((resolve) => { resolveClosed = resolve; });
+    terminal.start({
+      onLine: (input) => {
+        queue.push(input);
+        if (currentAbort || queue.length > 1) terminal.notify(`已加入队列 · 等待 ${queue.length} 条`);
+        void drain();
+      },
+      onEscape: () => {
+        if (!currentAbort || currentAbort.signal.aborted) return;
+        currentAbort.abort(new Error('用户按下 Esc 停止任务'));
+      },
+      onExit: () => {
+        exitRequested = true;
+        queue.length = 0;
+        currentAbort?.abort(new Error('用户退出'));
+        terminal.close();
+        resolveClosed();
+      },
+    });
 
     try {
-      while (true) {
-        const input = (await terminal.question('\n你> ')).trim();
-        if (!input) continue;
-        try {
-          const result = await commands.execute(input);
-          if (result === 'exit') break;
-          if (result === 'handled') continue;
-          commands.remember(input);
-          await runTask(input);
-        } catch (error) {
-          console.error(`\n运行失败：${error instanceof Error ? error.message : String(error)}`);
-        }
-      }
+      await closed;
+      await drainPromise;
     } finally {
       terminal.close();
     }

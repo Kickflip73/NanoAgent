@@ -10,6 +10,7 @@ function fakeAgent(): NanoAgent {
       provider: 'deepseek',
       model: 'deepseek-chat',
       sessionId: 'demo',
+      sessionTitle: '讨论 NanoAgent',
       workspaceRoot: '/tmp/demo',
       maxTurns: 200,
       skillCount: 2,
@@ -17,6 +18,13 @@ function fakeAgent(): NanoAgent {
       mcpServers: [],
     }),
     listSessions: async () => ['demo'],
+    listSessionSummaries: async () => [{
+      id: 'demo',
+      title: '讨论 NanoAgent',
+      preview: '增加交互能力',
+      updatedAt: new Date().toISOString(),
+      turns: 2,
+    }],
     switchSession: async () => undefined,
     history: async () => [],
     clearSession: async () => undefined,
@@ -24,6 +32,11 @@ function fakeAgent(): NanoAgent {
     listMemories: async () => [{ id: 'm1', type: 'fact', content: 'uses TS', createdAt: '' }],
     currentPlan: async () => [{ id: '1', description: 'test', status: 'running' }],
     indexKnowledge: async () => ({ files: 1, chunks: 1, embeddings: false }),
+    availableModels: () => ['deepseek-chat', 'deepseek-reasoner'],
+    switchModel: () => undefined,
+    contextInfo: async () => ({ historyItems: 4, historyLimit: 40, memories: 1, planSteps: 1 }),
+    toolNames: ['read_file', 'run_shell'],
+    mcpServerNames: [],
   } as unknown as NanoAgent;
 }
 
@@ -64,4 +77,42 @@ test('retries the previous user input without sending slash commands to the mode
   } finally {
     console.log = original;
   }
+});
+
+test('selects sessions by summary and clears the terminal for clean context changes', async () => {
+  const switched: string[] = [];
+  const output: string[] = [];
+  let clears = 0;
+  const agent = fakeAgent() as NanoAgent & { switchSession: (id: string) => Promise<void> };
+  agent.switchSession = async (id) => { switched.push(id); };
+  const handler = new CommandHandler(agent, async () => undefined, {
+    write: (text) => output.push(text),
+    resetScreen: () => { clears += 1; },
+    selectSession: async () => 'demo',
+  });
+
+  assert.equal(await handler.execute('/sessions'), 'handled');
+  assert.deepEqual(switched, ['demo']);
+  assert.equal(clears, 1);
+  assert.match(output.join('\n'), /讨论 NanoAgent/);
+});
+
+test('selects a model and exposes common runtime inspection commands', async () => {
+  const switched: string[] = [];
+  const output: string[] = [];
+  const agent = fakeAgent() as NanoAgent & { switchModel: (name: string) => void };
+  agent.switchModel = (name) => switched.push(name);
+  const handler = new CommandHandler(agent, async () => undefined, {
+    write: (text) => output.push(text),
+    selectModel: async () => 'deepseek-reasoner',
+  });
+
+  assert.equal(await handler.execute('/model'), 'handled');
+  assert.equal(await handler.execute('/context'), 'handled');
+  assert.equal(await handler.execute('/tools'), 'handled');
+  assert.equal(await handler.execute('/mcp'), 'handled');
+  assert.deepEqual(switched, ['deepseek-reasoner']);
+  assert.match(output.join('\n'), /历史条目/);
+  assert.match(output.join('\n'), /run_shell/);
+  assert.match(output.join('\n'), /MCP 未连接/);
 });

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { RunStreamEvent } from '@openai/agents';
-import { parseRunEvent, renderMarkdownLine, TerminalRenderer } from '../src/terminal.js';
+import { parseRunEvent, renderBanner, renderMarkdownLine, TerminalRenderer } from '../src/terminal.js';
 
 class BufferWriter {
   isTTY = false;
@@ -83,8 +83,8 @@ test('separates event blocks and uses subtle ANSI badges in a TTY', () => {
   } as RunStreamEvent);
   renderer.finish();
 
-  assert.match(status.value, /\x1b\[38;2;217;149;85m/);
-  assert.match(answer.value, /\x1b\[38;2;217;119;87m/);
+  assert.match(status.value, /\x1b\[38;2;93;170;160m/);
+  assert.match(answer.value, /\x1b\[38;2;157;142;198m/);
   assert.doesNotMatch(answer.value, /###|\*\*/);
   const plain = answer.value.replace(/\x1b\[[0-9;]*m/g, '');
   assert.match(plain, /结果\n\n•/);
@@ -106,4 +106,21 @@ test('flushes a one-line answer incrementally before completion', async () => {
 
   assert.match(answer.value, /这是一段没有换行的流式回答/);
   renderer.stop();
+});
+
+test('renders a compact robot banner without ANSI in plain output', () => {
+  const banner = renderBanner({
+    version: '0.5.0',
+    provider: 'deepseek',
+    model: 'deepseek-chat',
+    sessionTitle: '优化终端交互',
+    workspaceRoot: '/tmp/NanoAgent',
+    skillCount: 2,
+    mcpServers: ['filesystem'],
+  }, false);
+
+  assert.match(banner, /◉ ◉/);
+  assert.match(banner, /NanoAgent/);
+  assert.match(banner, /优化终端交互/);
+  assert.doesNotMatch(banner, /\x1b/);
 });

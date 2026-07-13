@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.5.0] - 2026-07-13 22:28
+
+### Added
+
+- Esc cancellation backed by SDK abort signals
+- non-blocking FIFO input queue while an Agent task is running
+- interactive slash-command completion and session picker
+- `/model` runtime model selector plus `/context`, `/tools`, and `/mcp` inspection commands
+- compact robot project banner with model, conversation, extension, and workspace details
+- expanded interactive controls and navigation (@Kickflip73)
+
+### Changed
+
+- derive session titles and recent previews from conversation content
+- clear the terminal after `/new`, `/clear`, and session switches
+- restore the project banner after clearing or creating a conversation
+- use a solid black cursor for active command, model, and session selections
+
 ## [0.4.0] - 2026-07-13 22:05
 
 ### Added

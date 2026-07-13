@@ -1,22 +1,56 @@
 import { randomUUID } from 'node:crypto';
 import type { NanoAgent } from './agent.js';
+import type { SessionSummary } from './core/session.js';
 
 export type CommandResult = 'handled' | 'exit' | 'pass';
 
+export const COMMANDS = [
+  { value: '/status', description: '查看运行状态' },
+  { value: '/model', description: '查看或切换模型' },
+  { value: '/new', description: '新建对话' },
+  { value: '/sessions', description: '选择最近对话' },
+  { value: '/switch', description: '按 ID 切换对话' },
+  { value: '/history', description: '查看当前历史' },
+  { value: '/clear', description: '清空当前对话' },
+  { value: '/skills', description: '列出 Skills' },
+  { value: '/tools', description: '列出可用工具' },
+  { value: '/mcp', description: '查看 MCP 连接' },
+  { value: '/context', description: '查看上下文用量' },
+  { value: '/memories', description: '列出长期记忆' },
+  { value: '/plan', description: '查看任务计划' },
+  { value: '/index', description: '索引本地知识库' },
+  { value: '/retry', description: '重试上一条输入' },
+  { value: '/help', description: '显示命令帮助' },
+  { value: '/exit', description: '退出 NanoAgent' },
+] as const;
+
 const HELP = `内置命令：
   /status             查看模型、会话和扩展状态
-  /new [id]           新建并切换会话
-  /sessions           列出会话
-  /switch <id>        切换会话
-  /history            查看当前会话历史
-  /clear              清空当前会话
+  /model [name]       查看或切换当前模型
+  /new [id]           新建并切换对话
+  /sessions           选择并切换最近对话
+  /switch <id>        按 ID 切换对话
+  /history            查看当前对话历史
+  /clear              清空当前对话
   /skills             列出可用 Skills
+  /tools              列出当前可用工具
+  /mcp                查看 MCP Server 连接
+  /context            查看上下文、记忆和计划用量
   /memories           列出长期记忆
   /plan               查看当前任务计划
   /index [path]       索引知识库，默认 knowledge
   /retry              重新执行上一条用户输入
   /help               显示帮助
-  /exit               退出`;
+  /exit               退出
+
+交互快捷键：Esc 停止当前任务 · 输入 / 查看命令 · ↑↓ 选择 · Tab 补全`;
+
+export interface CommandUI {
+  write?: (text: string) => void;
+  resetScreen?: () => void | Promise<void>;
+  selectSession?: (sessions: SessionSummary[]) => Promise<string | undefined>;
+  selectModel?: (models: string[], current: string) => Promise<string | undefined>;
+}
 
 export class CommandHandler {
   private lastInput?: string;
@@ -24,6 +58,7 @@ export class CommandHandler {
   constructor(
     private readonly agent: NanoAgent,
     private readonly runTask: (input: string) => Promise<void>,
+    private readonly ui: CommandUI = {},
   ) {}
 
   remember(input: string): void {
@@ -36,13 +71,10 @@ export class CommandHandler {
     const argument = rest.join(' ').trim();
 
     if (command === '/exit') return 'exit';
-    if (command === '/help') {
-      console.log(HELP);
-      return 'handled';
-    }
+    if (command === '/help') return this.handled(HELP);
     if (command === '/status') {
       const info = await this.agent.runtimeInfo();
-      console.log([
+      return this.handled([
         `模型      ${info.provider} / ${info.model}`,
         `会话      ${info.sessionId}`,
         `工作区    ${info.workspaceRoot}`,
@@ -51,67 +83,100 @@ export class CommandHandler {
         `Memories  ${info.memoryCount}`,
         `MCP       ${info.mcpServers.join(', ') || '未连接'}`,
       ].join('\n'));
-      return 'handled';
+    }
+    if (command === '/model') {
+      const current = (await this.agent.runtimeInfo()).model;
+      const selected = argument || await this.ui.selectModel?.(this.agent.availableModels(), current);
+      if (!selected) return this.ui.selectModel ? 'handled' : this.handled(`当前模型：${current}`);
+      this.agent.switchModel(selected);
+      return this.handled(`已切换模型：${selected}`);
     }
     if (command === '/new') {
-      const id = argument || randomUUID().slice(0, 8);
-      await this.agent.switchSession(id);
-      console.log(`已创建并切换到会话：${id}`);
-      return 'handled';
+      await this.agent.switchSession(argument || randomUUID().slice(0, 8));
+      await this.ui.resetScreen?.();
+      return this.handled('新对话已就绪。');
     }
-    if (command === '/sessions') {
-      const sessions = await this.agent.listSessions();
-      console.log(sessions.map((id) => `${id === this.agent.currentSessionId ? '*' : ' '} ${id}`).join('\n') || '暂无会话');
-      return 'handled';
+    if (command === '/sessions' || command === '/session') {
+      const sessions = await this.agent.listSessionSummaries();
+      if (!sessions.length) return this.handled('暂无对话。');
+      const selected = this.ui.selectSession
+        ? await this.ui.selectSession(sessions)
+        : undefined;
+      if (selected) {
+        const summary = sessions.find((item) => item.id === selected);
+        await this.agent.switchSession(selected);
+        await this.ui.resetScreen?.();
+        return this.handled(`已切换到：${summary?.title ?? '最近对话'}`);
+      }
+      if (this.ui.selectSession) return 'handled';
+      return this.handled(sessions.map((item) => `${item.id === this.agent.currentSessionId ? '*' : ' '} ${item.title}  ${item.preview}`).join('\n'));
     }
     if (command === '/switch') {
       if (!argument) throw new Error('用法：/switch <session-id>');
       await this.agent.switchSession(argument);
-      console.log(`已切换到会话：${argument}`);
-      return 'handled';
+      await this.ui.resetScreen?.();
+      return this.handled('对话已切换。');
     }
     if (command === '/history') {
       const items = await this.agent.history();
-      console.log(items.map((item, index) => `${index + 1}. ${JSON.stringify(item)}`).join('\n') || '当前会话为空');
-      return 'handled';
+      return this.handled(items.map((item, index) => `${index + 1}. ${JSON.stringify(item)}`).join('\n') || '当前对话为空');
     }
     if (command === '/clear') {
       await this.agent.clearSession();
-      console.log('当前会话已清空。');
-      return 'handled';
+      await this.ui.resetScreen?.();
+      return this.handled('当前对话已清空。');
     }
     if (command === '/skills') {
       const skills = this.agent.listSkills();
-      console.log(skills.map((skill) => `- ${skill.name}: ${skill.description}`).join('\n') || '暂无 Skills');
-      return 'handled';
+      return this.handled(skills.map((skill) => `- ${skill.name}: ${skill.description}`).join('\n') || '暂无 Skills');
+    }
+    if (command === '/tools') {
+      return this.handled(this.agent.toolNames.map((name) => `- ${name}`).join('\n') || '暂无工具');
+    }
+    if (command === '/mcp') {
+      const servers = this.agent.mcpServerNames;
+      return this.handled(servers.length ? servers.map((name) => `● ${name}`).join('\n') : 'MCP 未连接');
+    }
+    if (command === '/context') {
+      const info = await this.agent.contextInfo();
+      return this.handled([
+        `历史条目  ${info.historyItems} / ${info.historyLimit}`,
+        `长期记忆  ${info.memories}`,
+        `计划步骤  ${info.planSteps}`,
+        '更早历史会在发送模型前自动压缩。',
+      ].join('\n'));
     }
     if (command === '/memories') {
       const memories = await this.agent.listMemories();
-      console.log(memories.map((memory) => `- ${memory.id} [${memory.type}] ${memory.content}`).join('\n') || '暂无长期记忆');
-      return 'handled';
+      return this.handled(memories.map((memory) => `- ${memory.id} [${memory.type}] ${memory.content}`).join('\n') || '暂无长期记忆');
     }
     if (command === '/plan') {
       const plan = await this.agent.currentPlan();
-      console.log(plan.map((step) => `- [${step.status}] ${step.id}. ${step.description}`).join('\n') || '当前没有计划');
-      return 'handled';
+      return this.handled(plan.map((step) => `- [${step.status}] ${step.id}. ${step.description}`).join('\n') || '当前没有计划');
     }
     if (command === '/index') {
-      console.log('正在构建知识库索引...');
-      console.log(await this.agent.indexKnowledge(argument || 'knowledge'));
-      return 'handled';
+      this.print('正在构建知识库索引...');
+      const result = await this.agent.indexKnowledge(argument || 'knowledge');
+      return this.handled(JSON.stringify(result));
     }
     if (command === '/retry') {
-      if (!this.lastInput) {
-        console.log('没有可重试的用户输入。');
-        return 'handled';
-      }
-      console.log(`重新执行：${this.lastInput}`);
+      if (!this.lastInput) return this.handled('没有可重试的用户输入。');
+      this.print(`重新执行：${this.lastInput}`);
       await this.runTask(this.lastInput);
       return 'handled';
     }
 
-    console.log(`未知命令：${command}。输入 /help 查看可用命令。`);
+    return this.handled(`未知命令：${command}。输入 /help 查看可用命令。`);
+  }
+
+  private handled(text: string): CommandResult {
+    this.print(text);
     return 'handled';
+  }
+
+  private print(text: string): void {
+    if (this.ui.write) this.ui.write(text);
+    else console.log(text);
   }
 }
 
