@@ -98,3 +98,20 @@ test('records submitted user input as a permanent conversation line', () => {
   assert.match(plain, /◇ 就绪.*\n┊ >/);
   terminal.close();
 });
+
+test('appends streamed chunks at the real text column without padding to the terminal edge', () => {
+  const input = new FakeInput();
+  const output = new FakeOutput();
+  output.columns = 120;
+  const terminal = new InteractiveTerminal([], input as never, output as never);
+  terminal.start({ onLine: () => undefined, onEscape: () => undefined, onExit: () => undefined });
+  const writer = terminal.createWriter(output as never);
+  output.value = '';
+
+  writer.write('从此');
+  writer.write(' 7×24 自动接单');
+
+  assert.doesNotMatch(output.value, /\x1b\[999C/);
+  assert.match(output.value, /\x1b\[1A\r\x1b\[4C/);
+  terminal.close();
+});

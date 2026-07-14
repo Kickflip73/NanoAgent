@@ -46,6 +46,7 @@ export class InteractiveTerminal {
   private statusTimer?: NodeJS.Timeout;
   private queued: string[] = [];
   private outputOpen = false;
+  private outputOpenWidth = 0;
   private renderedRows = 0;
   private started = false;
   private closed = false;
@@ -143,10 +144,21 @@ export class InteractiveTerminal {
       return;
     }
     this.eraseUi();
-    if (this.outputOpen) this.output.write('\x1b[1A\x1b[999C');
+    const wasOpen = this.outputOpen;
+    if (wasOpen) {
+      const width = Math.max(1, this.output.columns ?? 80);
+      const column = this.outputOpenWidth % width;
+      this.output.write(`\x1b[1A\r${column ? `\x1b[${column}C` : ''}`);
+    }
     stream.write(chunk);
     this.outputOpen = !chunk.endsWith('\n');
-    if (this.outputOpen) this.output.write('\n');
+    if (this.outputOpen) {
+      const lastLine = chunk.slice(Math.max(chunk.lastIndexOf('\n'), chunk.lastIndexOf('\r')) + 1);
+      this.outputOpenWidth = (wasOpen && !chunk.includes('\n') ? this.outputOpenWidth : 0) + displayWidth(lastLine);
+      this.output.write('\n');
+    } else {
+      this.outputOpenWidth = 0;
+    }
     this.draw();
   }
 
@@ -191,6 +203,7 @@ export class InteractiveTerminal {
 
   clearScreen(content = ''): void {
     this.outputOpen = false;
+    this.outputOpenWidth = 0;
     this.output.write('\x1b[2J\x1b[H');
     if (content) this.output.write(`${content}\n\n`);
     this.draw();

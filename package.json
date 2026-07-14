@@ -1,6 +1,6 @@
 {
   "name": "nano-agent",
-  "version": "0.10.0",
+  "version": "0.10.1",
   "description": "A lightweight, general-purpose AI agent for real work, built with TypeScript and the OpenAI Agents SDK.",
   "license": "MIT",
   "repository": {
