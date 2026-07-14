@@ -1,4 +1,5 @@
-import { readFile, readdir, realpath } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { open, readdir, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { tool } from '@openai/agents';
 import { parse as parseYaml } from 'yaml';
@@ -12,6 +13,26 @@ const metadataSchema = z.object({
   metadata: z.record(z.string(), z.unknown()).optional(),
   'allowed-tools': z.string().optional(),
 }).passthrough();
+
+const MAX_SKILL_BYTES = 512_000;
+const MAX_RESOURCE_BYTES = 256_000;
+const MAX_SKILLS = 200;
+const MAX_TOTAL_SKILL_BYTES = 10_000_000;
+
+async function readBoundedUtf8(file: string, maxBytes: number, label: string): Promise<string> {
+  const handle = await open(file, constants.O_RDONLY | constants.O_NONBLOCK);
+  try {
+    const info = await handle.stat();
+    if (!info.isFile()) throw new Error(`${label} 必须是常规文件`);
+    if (info.size > maxBytes) throw new Error(`${label} 超过 ${Math.floor(maxBytes / 1_000)}KB`);
+    const buffer = Buffer.alloc(Math.min(info.size + 1, maxBytes + 1));
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    if (bytesRead > maxBytes) throw new Error(`${label} 超过 ${Math.floor(maxBytes / 1_000)}KB`);
+    return buffer.subarray(0, bytesRead).toString('utf8');
+  } finally {
+    await handle.close();
+  }
+}
 
 export interface Skill {
   name: string;
@@ -48,12 +69,15 @@ export class SkillLoader {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
       throw error;
     }
-    for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
+    const directories = entries.filter((entry) => entry.isDirectory());
+    let totalBytes = 0;
+    for (const entry of directories.slice(0, MAX_SKILLS)) {
       const root = path.join(this.directory, entry.name);
       const file = path.join(root, 'SKILL.md');
       try {
-        const content = await readFile(file, 'utf8');
+        const content = await readBoundedUtf8(file, MAX_SKILL_BYTES, 'SKILL.md');
+        totalBytes += Buffer.byteLength(content, 'utf8');
+        if (totalBytes > MAX_TOTAL_SKILL_BYTES) throw new Error('Skill 总文本超过 10MB');
         const metadata = parseFrontmatter(content);
         if (metadata.name !== entry.name) {
           throw new Error(`目录名 ${entry.name} 必须与 name ${metadata.name} 一致`);
@@ -72,6 +96,7 @@ export class SkillLoader {
         this.warnings.push(`${entry.name}: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
+    if (directories.length > MAX_SKILLS) this.warnings.push(`Skill 目录超过 ${MAX_SKILLS} 项，仅加载前 ${MAX_SKILLS} 项`);
   }
 
   catalog(): string {
@@ -104,8 +129,7 @@ export class SkillLoader {
     if (canonicalRelative.startsWith('..') || path.isAbsolute(canonicalRelative)) {
       throw new Error('Skill 资源不能通过符号链接超出 Skill 目录');
     }
-    const content = await readFile(canonicalTarget, 'utf8');
-    if (Buffer.byteLength(content, 'utf8') > 256_000) throw new Error('Skill 文本资源超过 256KB');
+    const content = await readBoundedUtf8(canonicalTarget, MAX_RESOURCE_BYTES, 'Skill 文本资源');
     return { path: canonicalTarget, content };
   }
 

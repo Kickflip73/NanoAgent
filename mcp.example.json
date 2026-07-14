@@ -9,6 +9,7 @@
     "remote-example": {
       "type": "http",
       "url": "https://example.com/mcp",
+      "allowedEnv": ["MCP_TOKEN"],
       "headers": {
         "Authorization": "Bearer ${MCP_TOKEN}"
       },

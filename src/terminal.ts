@@ -1,16 +1,18 @@
 import type { AgentInputItem, RunStreamEvent } from '@openai/agents';
+import type { RunCheckpoint } from './core/session.js';
+import type { RuntimeEvent } from './runtime/hooks.js';
 
 type Writable = {
   write(chunk: string): unknown;
   isTTY?: boolean;
 };
 
-type StatusTone = 'agent' | 'thinking' | 'tool' | 'success';
+type StatusTone = 'agent' | 'thinking' | 'tool' | 'success' | 'failure';
 
 export const OUTPUT_LEVELS = [
   { id: 'answer', label: '答案', description: '只显示最终答案', rank: 0 },
   { id: 'thinking', label: '思考', description: '显示思考过程和最终答案', rank: 1 },
-  { id: 'tools', label: '工具', description: '增加工具调用名称', rank: 2 },
+  { id: 'tools', label: '工具', description: '显示工具调用和简要结果', rank: 2 },
   { id: 'trace', label: '详细', description: '显示输入、工具参数和完整结果', rank: 3 },
 ] as const;
 
@@ -38,16 +40,17 @@ const ansi = {
   dim: '\x1b[2m',
   italic: '\x1b[3m',
   code: '\x1b[38;2;148;166;173m',
-  gray: '\x1b[38;2;145;151;158m',
+  gray: '\x1b[90m',
 };
 
-const badges: Record<StatusTone | 'answer' | 'done', { icon: string; label: string; rgb: string }> = {
-  agent: { icon: '◆', label: 'Agent', rgb: '148;156;166' },
-  thinking: { icon: '✦', label: '思考', rgb: '126;156;196' },
-  tool: { icon: '●', label: '工具', rgb: '93;170;160' },
-  success: { icon: '└', label: '结果', rgb: '124;170;122' },
-  answer: { icon: '◆', label: '回答', rgb: '157;142;198' },
-  done: { icon: '✓', label: '完成', rgb: '124;170;122' },
+const badges: Record<StatusTone | 'answer' | 'done', { icon: string; label: string; color: string }> = {
+  agent: { icon: '◆', label: 'Agent', color: '\x1b[90m' },
+  thinking: { icon: '✦', label: '思考', color: '\x1b[94m' },
+  tool: { icon: '●', label: '工具', color: '\x1b[96m' },
+  success: { icon: '└', label: '结果', color: '\x1b[92m' },
+  failure: { icon: '×', label: '失败', color: '\x1b[91m' },
+  answer: { icon: '◆', label: '回答', color: '\x1b[95m' },
+  done: { icon: '✓', label: '完成', color: '\x1b[92m' },
 };
 
 export interface BannerInfo {
@@ -85,6 +88,23 @@ function sessionItemText(content: unknown): string {
   }).filter(Boolean).join('\n');
 }
 
+export function renderUserInput(value: string, tty = true): string {
+  const lines = value.replace(/\x1b/g, '').trim().split(/\r?\n/);
+  if (!tty) return lines.map((line, index) => `${index === 0 ? '▸' : ' '} ${line}`).join('\n');
+  const marker = '\x1b[96m▸\x1b[0m';
+  return lines.map((line, index) => {
+    const content = `\x1b[100;97m ${line} \x1b[0m`;
+    return `${index === 0 ? marker : ' '}${content}`;
+  }).join('\n');
+}
+
+export function renderRecoveryCheckpoint(checkpoint: RunCheckpoint | undefined, tty = true): string {
+  if (!checkpoint || checkpoint.status === 'completed') return '';
+  const label = tty ? '\x1b[96m↻ 可恢复\x1b[0m' : '↻ 可恢复';
+  const detail = [checkpoint.phase, checkpoint.lastEvent].filter(Boolean).join(' · ');
+  return `${label}  ${detail || checkpoint.input}  ${tty ? '\x1b[90m/resume 继续\x1b[0m' : '/resume 继续'}`;
+}
+
 /** Render persisted user/assistant messages for terminal scrollback after a session switch. */
 export function renderSessionTranscript(items: AgentInputItem[], tty = true): string {
   const blocks: string[] = [];
@@ -93,9 +113,7 @@ export function renderSessionTranscript(items: AgentInputItem[], tty = true): st
     const text = sessionItemText(item.content).replace(/\x1b/g, '').trim();
     if (!text) continue;
     if (item.role === 'user') {
-      const lines = text.split(/\r?\n/);
-      const marker = tty ? `\x1b[38;2;148;166;173m>\x1b[0m` : '>';
-      blocks.push(lines.map((line, index) => `${index === 0 ? marker : ' '} ${line}`).join('\n'));
+      blocks.push(renderUserInput(text, tty));
       continue;
     }
     const state = { code: false };
@@ -115,7 +133,7 @@ function compact(value: unknown, limit = 160): string {
   const text = typeof value === 'string' ? value : JSON.stringify(value);
   if (!text) return '';
   const singleLine = text.replace(/\s+/g, ' ').trim();
-  return singleLine.length <= limit ? singleLine : `${singleLine.slice(0, limit)}…`;
+  return singleLine.length <= limit ? singleLine : `${singleLine.slice(0, Math.max(0, limit - 3))}...`;
 }
 
 function detailed(value: unknown): string {
@@ -158,6 +176,16 @@ export function parseRunEvent(event: RunStreamEvent): DisplayEvent | undefined {
     if (event.name === 'tool_output') {
       const item = record(event.item);
       const name = typeof raw?.name === 'string' ? raw.name : 'tool';
+      if (name === 'run_team') {
+        return {
+          kind: 'status',
+          tone: 'success',
+          title: 'Ultra Team',
+          detail: '本轮并行任务已结束',
+          fullDetail: detailed(item?.output),
+          next: '模型继续思考',
+        };
+      }
       return {
         kind: 'status',
         tone: 'success',
@@ -332,7 +360,7 @@ class MarkdownStream {
 function badge(tone: keyof typeof badges, tty: boolean): string {
   const item = badges[tone];
   if (!tty) return `${item.icon} ${item.label}`;
-  return `\x1b[38;2;${item.rgb}m${item.icon} ${item.label}${ansi.reset}`;
+  return `${item.color}${item.icon} ${item.label}${ansi.reset}`;
 }
 
 export class TerminalRenderer {
@@ -382,16 +410,11 @@ export class TerminalRenderer {
       if (display.tone === 'agent' && this.levelRank < 3) return;
       if (display.tone === 'thinking' && this.levelRank < 1) return;
       if (display.tone === 'tool' && this.levelRank < 2) return;
-      if (display.tone === 'success' && this.levelRank < 3) return;
+      if (display.tone === 'success' && this.levelRank < 2) return;
     }
 
     if (display.kind === 'status') {
-      this.stopSpinner();
-      this.closeActive();
-      this.beginBlock(this.status);
-      const detail = this.levelRank >= 3 ? display.fullDetail : undefined;
-      this.status.write(`${badge(display.tone, Boolean(this.status.isTTY))}  ${display.title}${detail ? `\n${this.renderDetail(detail)}` : ''}\n`);
-      this.start(display.next);
+      this.renderStatus(display.tone, display.title, display.detail, display.fullDetail, display.next);
       return;
     }
 
@@ -420,6 +443,24 @@ export class TerminalRenderer {
     this.markdown?.write(display.text);
   }
 
+  handleRuntimeEvent(event: RuntimeEvent): void {
+    if (event.type !== 'team_worker_event' || this.levelRank < 2) return;
+    const name = `子代理 ${event.role} · ${event.taskId}`;
+    if (event.eventType === 'start') {
+      this.renderStatus('agent', name, `分配任务：${compact(event.description, 160)}`, event.description, `${event.role} 子代理执行中`);
+      return;
+    }
+    const result = event.result || (event.eventType === 'error' ? '未返回错误信息' : '未返回结果摘要');
+    const failed = event.eventType === 'error';
+    this.renderStatus(
+      failed ? 'failure' : 'success',
+      name,
+      `${failed ? '失败' : '完成'}：${compact(result, 180)}`,
+      result,
+      'Ultra Team 继续执行',
+    );
+  }
+
   finish(): void {
     this.stopSpinner();
     this.closeActive();
@@ -438,6 +479,18 @@ export class TerminalRenderer {
   private beginBlock(output: Writable): void {
     if (this.hasBlock) output.write('\n');
     this.hasBlock = true;
+  }
+
+  private renderStatus(tone: StatusTone, title: string, detail: string | undefined, fullDetail: string | undefined, next: string): void {
+    this.stopSpinner();
+    this.closeActive();
+    this.beginBlock(this.status);
+    const value = this.levelRank >= 3 ? fullDetail : detail;
+    const renderedDetail = value
+      ? this.levelRank >= 3 ? `\n${this.renderDetail(value)}` : `  ${value}`
+      : '';
+    this.status.write(`${badge(tone, Boolean(this.status.isTTY))}  ${title}${renderedDetail}\n`);
+    this.start(next);
   }
 
   private closeActive(): void {

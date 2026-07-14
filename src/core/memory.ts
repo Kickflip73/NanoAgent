@@ -1,8 +1,10 @@
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
-import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { tool } from '@openai/agents';
 import { z } from 'zod';
+import { AtomicJsonStore } from './state-file.js';
+import { explicitlyRequestsMemory } from './user-intent.js';
+
+export { explicitlyRequestsMemory } from './user-intent.js';
 
 export type MemoryType = 'preference' | 'fact' | 'decision' | 'todo';
 
@@ -14,7 +16,26 @@ export interface Memory {
   updatedAt?: string;
   importance?: number;
   source?: 'user' | 'agent';
+  sourceSessionId?: string;
+  confirmedAt?: string;
 }
+
+export interface MemoryToolContext {
+  input: string;
+  sessionId: string;
+}
+
+const memoryFileSchema = z.array(z.object({
+  id: z.string(),
+  type: z.enum(['preference', 'fact', 'decision', 'todo']),
+  content: z.string(),
+  createdAt: z.string(),
+  updatedAt: z.string().optional(),
+  importance: z.number().optional(),
+  source: z.enum(['user', 'agent']).optional(),
+  sourceSessionId: z.string().optional(),
+  confirmedAt: z.string().optional(),
+}));
 
 function terms(text: string): Set<string> {
   const normalized = text.toLowerCase();
@@ -32,48 +53,57 @@ export function textScore(query: string, content: string): number {
 }
 
 export class MemoryStore {
-  constructor(private readonly file: string) {}
+  private readonly state: AtomicJsonStore<Memory[]>;
+
+  constructor(file: string) {
+    this.state = new AtomicJsonStore(file, {
+      defaultValue: () => [],
+      decode: (value) => memoryFileSchema.parse(value),
+      recoverCorrupt: true,
+    });
+  }
 
   async remember(
     content: string,
     type: MemoryType,
-    options: { importance?: number; source?: 'user' | 'agent' } = {},
+    options: { importance?: number; source?: 'user' | 'agent'; sourceSessionId?: string; confirmed?: boolean } = {},
   ): Promise<Memory> {
-    const memories = await this.list();
-    const duplicate = memories.find(
-      (memory) => memory.content.toLowerCase() === content.trim().toLowerCase(),
-    );
-    if (duplicate) {
-      duplicate.updatedAt = new Date().toISOString();
-      duplicate.importance = Math.max(duplicate.importance ?? 3, options.importance ?? 3);
-      await this.save(memories);
-      return duplicate;
+    if (options.confirmed !== true) {
+      throw new Error('长期记忆未写入：缺少用户明确确认');
     }
-    const memory: Memory = {
-      id: randomUUID().slice(0, 8),
-      type,
-      content: content.trim(),
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      importance: options.importance ?? 3,
-      source: options.source ?? 'user',
-    };
-    memories.push(memory);
-    await this.save(memories);
-    return memory;
+    return this.state.update((memories) => {
+      const duplicate = memories.find(
+        (memory) => memory.content.toLowerCase() === content.trim().toLowerCase(),
+      );
+      if (duplicate) {
+        duplicate.updatedAt = new Date().toISOString();
+        duplicate.importance = Math.max(duplicate.importance ?? 3, options.importance ?? 3);
+        if (options.sourceSessionId) duplicate.sourceSessionId = options.sourceSessionId;
+        duplicate.confirmedAt = new Date().toISOString();
+        return duplicate;
+      }
+      const memory: Memory = {
+        id: randomUUID().slice(0, 8),
+        type,
+        content: content.trim(),
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        importance: options.importance ?? 3,
+        source: options.source ?? 'user',
+        sourceSessionId: options.sourceSessionId,
+        confirmedAt: new Date().toISOString(),
+      };
+      memories.push(memory);
+      return memory;
+    });
   }
 
   async list(): Promise<Memory[]> {
-    try {
-      return JSON.parse(await readFile(this.file, 'utf8')) as Memory[];
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
-      throw error;
-    }
+    return this.state.read();
   }
 
   async search(query: string, limit = 5): Promise<Memory[]> {
-    return (await this.list())
+    return (await this.listConfirmed())
       .map((memory) => ({ memory, lexical: textScore(query, memory.content) }))
       .filter(({ lexical }) => lexical > 0)
       .map(({ memory, lexical }) => ({
@@ -85,25 +115,41 @@ export class MemoryStore {
       .map(({ memory }) => memory);
   }
 
-  async forget(id: string): Promise<boolean> {
-    const memories = await this.list();
-    const next = memories.filter((memory) => memory.id !== id);
-    if (next.length === memories.length) return false;
-    await this.save(next);
-    return true;
+  async listConfirmed(): Promise<Memory[]> {
+    return (await this.list()).filter((memory) => Boolean(memory.confirmedAt));
   }
 
-  createTools() {
+  async forget(id: string): Promise<boolean> {
+    return this.state.update((memories) => {
+      const index = memories.findIndex((memory) => memory.id === id);
+      if (index < 0) return false;
+      memories.splice(index, 1);
+      return true;
+    });
+  }
+
+  createTools(context?: () => MemoryToolContext | undefined) {
     return [
       tool({
         name: 'remember',
-        description: '保存值得跨会话记住的用户偏好、事实、决策或待办。用户明确说“记住”时使用。',
+        description: '把用户明确确认要跨 Session 共享的信息保存为长期记忆。没有“记住/保存为长期记忆”等明确请求时禁止调用。',
         parameters: z.object({
           content: z.string().min(1),
           type: z.enum(['preference', 'fact', 'decision', 'todo']).default('fact'),
           importance: z.number().int().min(1).max(5).default(3),
         }),
-        execute: async ({ content, type, importance }) => this.remember(content, type, { importance, source: 'user' }),
+        execute: async ({ content, type, importance }) => {
+          const request = context?.();
+          if (!request || !explicitlyRequestsMemory(request.input)) {
+            throw new Error('长期记忆未写入：本轮用户没有明确确认要跨 Session 保存');
+          }
+          return this.remember(content, type, {
+            importance,
+            source: 'user',
+            sourceSessionId: request.sessionId,
+            confirmed: true,
+          });
+        },
       }),
       tool({
         name: 'recall',
@@ -113,9 +159,9 @@ export class MemoryStore {
       }),
       tool({
         name: 'list_memories',
-        description: '列出全部长期记忆。',
+        description: '列出已由用户确认、可跨 Session 共享的长期记忆。',
         parameters: z.object({}),
-        execute: async () => this.list(),
+        execute: async () => this.listConfirmed(),
       }),
       tool({
         name: 'forget',
@@ -124,12 +170,5 @@ export class MemoryStore {
         execute: async ({ id }) => ({ removed: await this.forget(id) }),
       }),
     ];
-  }
-
-  private async save(memories: Memory[]): Promise<void> {
-    await mkdir(path.dirname(this.file), { recursive: true });
-    const temporary = `${this.file}.tmp`;
-    await writeFile(temporary, `${JSON.stringify(memories, null, 2)}\n`, 'utf8');
-    await rename(temporary, this.file);
   }
 }

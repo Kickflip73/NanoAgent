@@ -1,16 +1,10 @@
 import path from 'node:path';
+import { realpathSync } from 'node:fs';
 import { Agent, Runner, tool, type Tool } from '@openai/agents';
 import { z } from 'zod';
 import type { TeamRole, TeamTask, TeamTaskStore } from '../core/team.js';
 import type { AgentModel } from '../runtime/model.js';
-
-const ROLE_TOOLS: Record<TeamRole, string[]> = {
-  explorer: ['current_time', 'read_file', 'list_directory', 'search_files', 'http_request', 'web_search', 'search_knowledge'],
-  architect: ['read_file', 'list_directory', 'search_files', 'web_search', 'search_knowledge'],
-  builder: ['current_time', 'calculate', 'read_file', 'write_file', 'edit_file', 'move_file', 'list_directory', 'search_files', 'run_shell', 'search_knowledge'],
-  tester: ['current_time', 'calculate', 'read_file', 'list_directory', 'search_files', 'run_shell', 'search_knowledge'],
-  reviewer: ['read_file', 'list_directory', 'search_files', 'run_shell', 'search_knowledge'],
-};
+import { teamRoleToolNames } from '../runtime/tool-policy.js';
 
 const ROLE_INSTRUCTIONS: Record<TeamRole, string> = {
   explorer: '调查代码、资料与事实，给出证据、来源和明确结论；保持只读。',
@@ -35,22 +29,41 @@ export interface TeamToolsOptions {
   persistentInstructions?: string;
   maxConcurrency?: number;
   signal?: AbortSignal;
+  allowUnsandboxedShell?: boolean;
+  workerToolFactory?: (task: TeamTask) => Tool[];
   onEvent?: (task: TeamTask, event: 'start' | 'end' | 'error') => void | Promise<void>;
   runWorker?: (task: TeamTask, prompt: string, tools: Tool[], signal?: AbortSignal) => Promise<string>;
 }
 
-function selectTools(tools: Tool[], names: string[]): Tool[] {
+function selectTools(tools: Tool[], names: readonly string[]): Tool[] {
   const allowed = new Set(names);
   return tools.filter((item) => allowed.has(item.name));
 }
 
-function overlap(left: string, right: string): boolean {
-  const a = path.normalize(left).replace(/[/\\]+$/, '');
-  const b = path.normalize(right).replace(/[/\\]+$/, '');
+function canonicalOwnershipPath(workspaceRoot: string, value: string): string {
+  let current = path.resolve(workspaceRoot, value);
+  const suffix: string[] = [];
+  while (true) {
+    try {
+      const canonical = path.join(realpathSync(current), ...suffix).replace(/[/\\]+$/, '');
+      return process.platform === 'darwin' || process.platform === 'win32' ? canonical.toLowerCase() : canonical;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return path.resolve(workspaceRoot, value);
+      const parent = path.dirname(current);
+      if (parent === current) return path.resolve(workspaceRoot, value);
+      suffix.unshift(path.basename(current));
+      current = parent;
+    }
+  }
+}
+
+function overlap(left: string, right: string, workspaceRoot: string): boolean {
+  const a = canonicalOwnershipPath(workspaceRoot, left);
+  const b = canonicalOwnershipPath(workspaceRoot, right);
   return a === b || a.startsWith(`${b}${path.sep}`) || b.startsWith(`${a}${path.sep}`);
 }
 
-export function assertParallelSafe(tasks: TeamTask[]): void {
+export function assertParallelSafe(tasks: TeamTask[], workspaceRoot = process.cwd()): void {
   const builders = tasks.filter((task) => task.role === 'builder');
   for (const task of builders) {
     if (!task.paths.length) throw new Error(`builder task ${task.id} 必须声明 paths，才能安全并行`);
@@ -59,7 +72,7 @@ export function assertParallelSafe(tasks: TeamTask[]): void {
     for (let other = index + 1; other < builders.length; other += 1) {
       const left = builders[index]!;
       const right = builders[other]!;
-      if (left.paths.some((a) => right.paths.some((b) => overlap(a, b)))) {
+      if (left.paths.some((a) => right.paths.some((b) => overlap(a, b, workspaceRoot)))) {
         throw new Error(`builder tasks ${left.id} 与 ${right.id} 的 paths 重叠，不能并行`);
       }
     }
@@ -80,15 +93,33 @@ function workerPrompt(task: TeamTask, allTasks: TeamTask[], workspaceRoot: strin
   ].filter(Boolean).join('\n\n');
 }
 
-async function defaultWorker(options: TeamToolsOptions, task: TeamTask, prompt: string, workerTools: Tool[]): Promise<string> {
+async function defaultWorker(
+  options: TeamToolsOptions,
+  task: TeamTask,
+  prompt: string,
+  workerTools: Tool[],
+  signal?: AbortSignal,
+): Promise<string> {
   const agent = new Agent({ name: `Nano ${task.role} · ${task.id}`, model: options.model, instructions: prompt, tools: workerTools });
   const runner = new Runner({ workflowName: `NanoAgent Ultra · ${task.role}`, tracingDisabled: true, traceIncludeSensitiveData: false });
   const result = await runner.run(agent, task.description, {
     maxTurns: task.role === 'builder' ? 24 : task.role === 'tester' ? 20 : 16,
-    signal: options.signal,
+    signal,
     toolExecution: { maxFunctionToolConcurrency: task.role === 'builder' ? 1 : 2 },
   });
   return String(result.finalOutput ?? 'Worker 未返回摘要');
+}
+
+async function emitWorkerEvent(
+  options: TeamToolsOptions,
+  task: TeamTask,
+  event: 'start' | 'end' | 'error',
+): Promise<void> {
+  try {
+    await options.onEvent?.(task, event);
+  } catch {
+    // Observability callbacks must not change the durable worker outcome.
+  }
 }
 
 export async function runTeamWave(options: TeamToolsOptions, taskIds: string[]): Promise<TeamWorkerResult[]> {
@@ -102,38 +133,77 @@ export async function runTeamWave(options: TeamToolsOptions, taskIds: string[]):
   const ready = new Set((await options.store.ready()).map((item) => item.id));
   const blocked = selected.filter((task) => !ready.has(task.id));
   if (blocked.length) throw new Error(`以下 Team task 尚未 ready：${blocked.map((task) => task.id).join(', ')}`);
-  assertParallelSafe(selected);
+  assertParallelSafe(selected, options.workspaceRoot);
+  if (selected.some((task) => task.role === 'builder') && !options.workerToolFactory) {
+    throw new Error('builder worker 必须使用带 paths 强制约束的 workerToolFactory');
+  }
 
-  const claimed: TeamTask[] = [];
-  for (const task of selected) claimed.push(await options.store.claim(task.id, `${task.role}-${task.id}`));
+  const claimed = await options.store.claimMany(selected.map((task) => ({
+    id: task.id,
+    owner: `${task.role}-${task.id}`,
+  })));
   const results: TeamWorkerResult[] = new Array(claimed.length);
   let cursor = 0;
   const requested = Number.isFinite(options.maxConcurrency) ? options.maxConcurrency! : 4;
   const concurrency = Math.max(1, Math.min(4, Math.floor(requested), claimed.length));
+  const workerControllers = new Map(claimed.map((task) => [task.id, new AbortController()]));
+  const heartbeat = setInterval(() => {
+    for (const task of claimed) {
+      const controller = workerControllers.get(task.id);
+      if (!controller || controller.signal.aborted) continue;
+      void options.store.renew(task.id, task.claimId!).catch((error) => {
+        controller.abort(error instanceof Error ? error : new Error(String(error)));
+      });
+    }
+  }, 5_000);
+  heartbeat.unref();
   const execute = async (): Promise<void> => {
     while (cursor < claimed.length) {
       const index = cursor++;
       const task = claimed[index]!;
+      const controller = workerControllers.get(task.id)!;
+      const signals = [controller.signal, AbortSignal.timeout(10 * 60_000)];
+      if (options.signal) signals.push(options.signal);
+      const signal = AbortSignal.any(signals);
       try {
-        if (options.signal?.aborted) throw options.signal.reason ?? new Error('Ultra Team 已中止');
-        await options.onEvent?.(task, 'start');
+        signal.throwIfAborted();
+        await emitWorkerEvent(options, task, 'start');
         const prompt = workerPrompt(task, allTasks, options.workspaceRoot, options.persistentInstructions);
-        const workerTools = selectTools(options.tools, ROLE_TOOLS[task.role]);
+        const availableTools = options.workerToolFactory?.(task) ?? options.tools;
+        const workerTools = selectTools(
+          availableTools,
+          teamRoleToolNames(task.role, options.allowUnsandboxedShell === true),
+        );
         const output = await (options.runWorker
-          ? options.runWorker(task, prompt, workerTools, options.signal)
-          : defaultWorker(options, task, prompt, workerTools));
-        await options.store.update(task.id, 'completed', output);
-        await options.onEvent?.(task, 'end');
+          ? options.runWorker(task, prompt, workerTools, signal)
+          : defaultWorker(options, task, prompt, workerTools, signal));
+        signal.throwIfAborted();
+        const completed = await options.store.update(task.id, 'completed', output, task.claimId);
+        await emitWorkerEvent(options, completed, 'end');
         results[index] = { taskId: task.id, role: task.role, status: 'completed', output };
       } catch (error) {
-        const output = error instanceof Error ? error.message : String(error);
-        await options.store.update(task.id, 'failed', output);
-        await options.onEvent?.(task, 'error');
+        let output = error instanceof Error ? error.message : String(error);
+        let failed = task;
+        try {
+          failed = await options.store.update(task.id, 'failed', output, task.claimId);
+        } catch (stateError) {
+          const detail = stateError instanceof Error ? stateError.message : String(stateError);
+          output = `${output}\n状态提交失败：${detail}`;
+          failed = (await options.store.list().catch(() => []))
+            .find((item) => item.id === task.id) ?? task;
+        }
+        await emitWorkerEvent(options, failed, 'error');
         results[index] = { taskId: task.id, role: task.role, status: 'failed', output };
+      } finally {
+        workerControllers.delete(task.id);
       }
     }
   };
-  await Promise.all(Array.from({ length: concurrency }, execute));
+  try {
+    await Promise.all(Array.from({ length: concurrency }, execute));
+  } finally {
+    clearInterval(heartbeat);
+  }
   return results;
 }
 
@@ -142,8 +212,8 @@ export function createTeamTools(options: TeamToolsOptions): Tool[] {
     ...options.store.createTools(),
     tool({
       name: 'run_team',
-      description: '并行执行当前 task list 中 2～4 个依赖已完成且路径不冲突的 ready 子任务；返回每个 worker 的独立结果。',
-      parameters: z.object({ taskIds: z.array(z.string().min(1).max(80)).min(2).max(4) }),
+      description: '执行当前 task list 中 1～4 个依赖已完成且路径不冲突的 ready 子任务；多个任务并行，单个任务用于推进依赖流水线。',
+      parameters: z.object({ taskIds: z.array(z.string().min(1).max(80)).min(1).max(4) }),
       execute: async ({ taskIds }) => ({ results: await runTeamWave(options, taskIds) }),
     }),
   ];

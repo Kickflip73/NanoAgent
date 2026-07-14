@@ -1,7 +1,7 @@
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
-import path from 'node:path';
 import { tool } from '@openai/agents';
 import { z } from 'zod';
+import { assertSessionId } from './session-id.js';
+import { AtomicJsonStore } from './state-file.js';
 
 export interface PlanStep {
   id: string;
@@ -27,40 +27,81 @@ interface TaskState {
 
 type StoredPlans = Record<string, PlanStep[] | TaskState>;
 type Plans = Record<string, TaskState>;
+type PlanListener = (sessionId: string, steps: PlanStep[]) => void | Promise<void>;
+
+const planStepSchema = z.object({
+  id: z.string(),
+  description: z.string(),
+  status: z.enum(['pending', 'running', 'completed', 'failed']),
+});
+const goalSchema = z.object({
+  objective: z.string(),
+  status: z.enum(['active', 'paused', 'completed', 'failed']),
+  nextAction: z.string().optional(),
+  checkpoint: z.string().optional(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+});
+const taskStateSchema = z.object({ steps: z.array(planStepSchema).default([]), goal: goalSchema.optional() });
+const storedPlansSchema = z.record(z.string(), z.union([z.array(planStepSchema), taskStateSchema]));
+
+function decodePlans(value: unknown): Plans {
+  const stored = storedPlansSchema.parse(value) as StoredPlans;
+  return Object.assign(Object.create(null), Object.fromEntries(Object.entries(stored).map(([session, state]) => [
+    session,
+    Array.isArray(state) ? { steps: state } : { steps: state.steps ?? [], goal: state.goal },
+  ]))) as Plans;
+}
 
 export class PlanStore {
-  private writeQueue: Promise<void> = Promise.resolve();
+  private readonly state: AtomicJsonStore<Plans>;
+  private listeners = new Set<PlanListener>();
 
   constructor(
-    private readonly file: string,
+    file: string,
     private sessionId: string,
-  ) {}
+  ) {
+    assertSessionId(sessionId);
+    this.state = new AtomicJsonStore(file, {
+      defaultValue: () => Object.create(null) as Plans,
+      decode: decodePlans,
+      recoverCorrupt: true,
+    });
+  }
 
   useSession(sessionId: string): void {
+    assertSessionId(sessionId);
     this.sessionId = sessionId;
   }
 
   async get(): Promise<PlanStep[]> {
-    await this.writeQueue;
-    return (await this.load())[this.sessionId]?.steps ?? [];
+    const sessionId = this.sessionId;
+    return (await this.state.read())[sessionId]?.steps ?? [];
   }
 
   async update(steps: PlanStep[]): Promise<PlanStep[]> {
     const sessionId = this.sessionId;
-    return this.mutate((plans) => {
+    const updated = await this.mutate((plans) => {
       plans[sessionId] = { ...plans[sessionId], steps };
       return steps;
     });
+    await this.notify(sessionId, updated);
+    return updated;
+  }
+
+  onChange(listener: PlanListener): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
   }
 
   async getGoal(): Promise<Goal | undefined> {
-    await this.writeQueue;
-    return (await this.load())[this.sessionId]?.goal;
+    const sessionId = this.sessionId;
+    return (await this.state.read())[sessionId]?.goal;
   }
 
   async setGoal(objective: string): Promise<Goal> {
     const sessionId = this.sessionId;
-    return this.mutate((plans) => {
+    const goal = await this.mutate((plans) => {
       const now = new Date().toISOString();
       const goal: Goal = {
         objective: objective.trim(),
@@ -71,6 +112,8 @@ export class PlanStore {
       plans[sessionId] = { steps: [], goal };
       return goal;
     });
+    await this.notify(sessionId, []);
+    return goal;
   }
 
   async checkpoint(update: {
@@ -108,6 +151,14 @@ export class PlanStore {
     ].filter(Boolean).join('\n\n');
   }
 
+  async clear(sessionId = this.sessionId): Promise<void> {
+    assertSessionId(sessionId);
+    await this.state.update((plans) => {
+      delete plans[sessionId];
+    });
+    await this.notify(sessionId, []);
+  }
+
   createTools() {
     const step = z.object({
       id: z.string().min(1),
@@ -117,7 +168,7 @@ export class PlanStore {
     return [
       tool({
         name: 'update_plan',
-        description: '为多步骤任务创建或更新简洁的执行计划；简单问题无需使用。',
+        description: '为多步骤任务创建或更新执行计划。阶段开始前将对应步骤设为 running，结束后立即设为 completed 或 failed，再推进下一步；返回的完整列表是本轮后续执行的当前权威状态。简单问题无需使用。',
         parameters: z.object({ steps: z.array(step).max(20) }),
         execute: async ({ steps }) => this.update(steps),
       }),
@@ -152,34 +203,13 @@ export class PlanStore {
     ];
   }
 
-  private async load(): Promise<Plans> {
-    try {
-      const stored = JSON.parse(await readFile(this.file, 'utf8')) as StoredPlans;
-      return Object.fromEntries(Object.entries(stored).map(([session, value]) => [
-        session,
-        Array.isArray(value) ? { steps: value } : { steps: value.steps ?? [], goal: value.goal },
-      ]));
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return {};
-      throw error;
-    }
-  }
-
   private mutate<T>(mutation: (plans: Plans) => T): Promise<T> {
-    const operation = this.writeQueue.then(async () => {
-      const plans = await this.load();
-      const result = mutation(plans);
-      await this.save(plans);
-      return result;
-    });
-    this.writeQueue = operation.then(() => undefined, () => undefined);
-    return operation;
+    return this.state.update(mutation);
   }
 
-  private async save(plans: Plans): Promise<void> {
-    await mkdir(path.dirname(this.file), { recursive: true });
-    const temporary = `${this.file}.tmp`;
-    await writeFile(temporary, `${JSON.stringify(plans, null, 2)}\n`, 'utf8');
-    await rename(temporary, this.file);
+  private async notify(sessionId: string, steps: PlanStep[]): Promise<void> {
+    const snapshot = steps.map((step) => ({ ...step }));
+    await Promise.all([...this.listeners].map((listener) => listener(sessionId, snapshot)));
   }
+
 }

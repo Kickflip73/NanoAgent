@@ -1,7 +1,8 @@
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
-import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { tool } from '@openai/agents';
 import { z } from 'zod';
+import { assertSessionId } from './session-id.js';
+import { AtomicJsonStore } from './state-file.js';
 
 export type TeamRole = 'explorer' | 'architect' | 'builder' | 'tester' | 'reviewer';
 export type TeamTaskStatus = 'pending' | 'running' | 'completed' | 'failed';
@@ -14,34 +15,70 @@ export interface TeamTask {
   dependencies: string[];
   paths: string[];
   owner?: string;
+  ownerPid?: number;
+  claimId?: string;
+  claimedAt?: string;
+  leaseExpiresAt?: string;
   result?: string;
   createdAt: string;
   updatedAt: string;
 }
 
-type TeamTaskInput = Pick<TeamTask, 'id' | 'description' | 'role' | 'dependencies' | 'paths'>;
+export type TeamTaskInput = Pick<TeamTask, 'id' | 'description' | 'role' | 'dependencies' | 'paths'>;
 type StoredTeams = Record<string, TeamTask[]>;
+const TEAM_LEASE_MS = 5 * 60_000;
+
+const storedTeamsSchema = z.record(z.string(), z.array(z.object({
+  id: z.string(),
+  description: z.string(),
+  role: z.enum(['explorer', 'architect', 'builder', 'tester', 'reviewer']),
+  status: z.enum(['pending', 'running', 'completed', 'failed']),
+  dependencies: z.array(z.string()),
+  paths: z.array(z.string()),
+  owner: z.string().optional(),
+  ownerPid: z.number().int().positive().optional(),
+  claimId: z.string().optional(),
+  claimedAt: z.string().optional(),
+  leaseExpiresAt: z.string().optional(),
+  result: z.string().optional(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+})));
 
 export class TeamTaskStore {
-  private writeQueue: Promise<void> = Promise.resolve();
+  private readonly state: AtomicJsonStore<StoredTeams>;
 
-  constructor(private readonly file: string, private sessionId: string) {}
+  constructor(file: string, private sessionId: string) {
+    assertSessionId(sessionId);
+    this.state = new AtomicJsonStore(file, {
+      defaultValue: () => Object.create(null) as StoredTeams,
+      decode: (value) => Object.assign(Object.create(null), storedTeamsSchema.parse(value)) as StoredTeams,
+      recoverCorrupt: true,
+    });
+  }
 
   useSession(sessionId: string): void {
+    assertSessionId(sessionId);
     this.sessionId = sessionId;
   }
 
   async set(inputs: TeamTaskInput[]): Promise<TeamTask[]> {
-    this.validate(inputs);
+    const normalized = inputs.map((item) => ({
+      ...item,
+      id: item.id.trim(),
+      description: item.description.trim(),
+      dependencies: [...new Set(item.dependencies.map((value) => value.trim()).filter(Boolean))],
+      paths: [...new Set(item.paths.map((value) => value.trim()).filter(Boolean))],
+    }));
+    this.validate(normalized);
     const sessionId = this.sessionId;
     return this.mutate((teams) => {
+      if ((teams[sessionId] ?? []).some((task) => task.status === 'running')) {
+        throw new Error('当前 Team 仍有 running task，不能替换 task list');
+      }
       const now = new Date().toISOString();
-      const tasks = inputs.map((item) => ({
+      const tasks = normalized.map((item) => ({
         ...item,
-        id: item.id.trim(),
-        description: item.description.trim(),
-        dependencies: [...new Set(item.dependencies)],
-        paths: [...new Set(item.paths.map((value) => value.trim()).filter(Boolean))],
         status: 'pending' as const,
         createdAt: now,
         updatedAt: now,
@@ -52,8 +89,8 @@ export class TeamTaskStore {
   }
 
   async list(): Promise<TeamTask[]> {
-    await this.writeQueue;
-    return (await this.load())[this.sessionId] ?? [];
+    const sessionId = this.sessionId;
+    return (await this.state.read())[sessionId] ?? [];
   }
 
   async ready(): Promise<TeamTask[]> {
@@ -63,31 +100,73 @@ export class TeamTaskStore {
   }
 
   async claim(id: string, owner: string): Promise<TeamTask> {
+    const [claimed] = await this.claimMany([{ id, owner }]);
+    return claimed!;
+  }
+
+  async claimMany(claims: Array<{ id: string; owner: string }>): Promise<TeamTask[]> {
+    if (!claims.length) throw new Error('至少需要领取一个 Team task');
+    if (new Set(claims.map((claim) => claim.id)).size !== claims.length) {
+      throw new Error('批量领取的 Team task id 不能重复');
+    }
     const sessionId = this.sessionId;
     return this.mutate((teams) => {
       const tasks = teams[sessionId] ?? [];
-      const task = tasks.find((item) => item.id === id);
-      if (!task) throw new Error(`Team task 不存在：${id}`);
-      if (task.status !== 'pending') throw new Error(`Team task ${id} 当前为 ${task.status}，无法领取`);
       const completed = new Set(tasks.filter((item) => item.status === 'completed').map((item) => item.id));
-      const blocked = task.dependencies.filter((dependency) => !completed.has(dependency));
-      if (blocked.length) throw new Error(`Team task ${id} 尚有未完成依赖：${blocked.join(', ')}`);
-      task.status = 'running';
-      task.owner = owner.trim();
-      task.updatedAt = new Date().toISOString();
+      const selected = claims.map(({ id, owner }) => {
+        const task = tasks.find((item) => item.id === id);
+        if (!task) throw new Error(`Team task 不存在：${id}`);
+        if (task.status !== 'pending') throw new Error(`Team task ${id} 当前为 ${task.status}，无法领取`);
+        if (!owner.trim()) throw new Error(`Team task ${id} 的 owner 不能为空`);
+        const blocked = task.dependencies.filter((dependency) => !completed.has(dependency));
+        if (blocked.length) throw new Error(`Team task ${id} 尚有未完成依赖：${blocked.join(', ')}`);
+        return { task, owner: owner.trim() };
+      });
+      const now = new Date();
+      const leaseExpiresAt = new Date(now.getTime() + TEAM_LEASE_MS).toISOString();
+      for (const { task, owner } of selected) {
+        task.status = 'running';
+        task.owner = owner;
+        task.ownerPid = process.pid;
+        task.claimId = randomUUID();
+        task.claimedAt = now.toISOString();
+        task.leaseExpiresAt = leaseExpiresAt;
+        task.updatedAt = now.toISOString();
+      }
+      return selected.map(({ task }) => ({ ...task }));
+    });
+  }
+
+  async renew(id: string, claimId: string, now = Date.now()): Promise<TeamTask> {
+    const sessionId = this.sessionId;
+    return this.mutate((teams) => {
+      const task = (teams[sessionId] ?? []).find((item) => item.id === id);
+      if (!task || task.status !== 'running' || task.claimId !== claimId) {
+        throw new Error(`Team task ${id} 的领取凭证已失效`);
+      }
+      task.leaseExpiresAt = new Date(now + TEAM_LEASE_MS).toISOString();
+      task.updatedAt = new Date(now).toISOString();
       return { ...task };
     });
   }
 
-  async update(id: string, status: Exclude<TeamTaskStatus, 'pending'>, result?: string): Promise<TeamTask> {
+  async update(
+    id: string,
+    status: Exclude<TeamTaskStatus, 'pending'>,
+    result?: string,
+    expectedClaimId?: string,
+  ): Promise<TeamTask> {
     const sessionId = this.sessionId;
     return this.mutate((teams) => {
       const task = (teams[sessionId] ?? []).find((item) => item.id === id);
       if (!task) throw new Error(`Team task 不存在：${id}`);
       if (task.status === 'completed' || task.status === 'failed') throw new Error(`Team task ${id} 已结束`);
       if (task.status !== 'running') throw new Error(`Team task ${id} 尚未领取`);
+      if (expectedClaimId && task.claimId !== expectedClaimId) throw new Error(`Team task ${id} 的领取凭证已失效`);
       task.status = status;
       task.result = result?.trim().slice(0, 12_000) || task.result;
+      if (status !== 'running') task.leaseExpiresAt = undefined;
+      if (status !== 'running') task.ownerPid = undefined;
       task.updatedAt = new Date().toISOString();
       return { ...task };
     });
@@ -101,6 +180,10 @@ export class TeamTaskStore {
       if (task.status !== 'failed') throw new Error(`只有 failed Team task 可以重试：${id}`);
       task.status = 'pending';
       task.owner = undefined;
+      task.ownerPid = undefined;
+      task.claimId = undefined;
+      task.claimedAt = undefined;
+      task.leaseExpiresAt = undefined;
       task.result = undefined;
       task.updatedAt = new Date().toISOString();
       return { ...task };
@@ -116,6 +199,32 @@ export class TeamTaskStore {
       task.paths.length ? `路径=${task.paths.join(',')}` : '',
       task.result ? `结果=${task.result.slice(0, 500)}` : '',
     ].filter(Boolean).join(' · ')).join('\n');
+  }
+
+  async clear(sessionId = this.sessionId): Promise<void> {
+    assertSessionId(sessionId);
+    await this.mutate((teams) => {
+      delete teams[sessionId];
+    });
+  }
+
+  async recoverExpired(sessionId = this.sessionId, now = Date.now()): Promise<TeamTask[]> {
+    assertSessionId(sessionId);
+    return this.mutate((teams) => {
+      const recovered: TeamTask[] = [];
+      for (const task of teams[sessionId] ?? []) {
+        if (task.status !== 'running') continue;
+        const expiresAt = task.leaseExpiresAt ? Date.parse(task.leaseExpiresAt) : 0;
+        if (expiresAt > now) continue;
+        if (task.ownerPid && this.processIsAlive(task.ownerPid)) continue;
+        task.status = 'failed';
+        task.result = task.result ?? 'Worker 运行中断或领取租约已过期，请显式重试';
+        task.leaseExpiresAt = undefined;
+        task.updatedAt = new Date(now).toISOString();
+        recovered.push({ ...task });
+      }
+      return recovered;
+    });
   }
 
   createTools() {
@@ -147,9 +256,14 @@ export class TeamTaskStore {
       }),
       tool({
         name: 'update_team_task',
-        description: '更新已领取 Team task 的运行、完成或失败状态与摘要结果。',
-        parameters: z.object({ id: z.string().min(1), status: z.enum(['running', 'completed', 'failed']), result: z.string().max(12_000).optional() }),
-        execute: async ({ id, status, result }) => this.update(id, status, result),
+        description: '使用领取时返回的 claimId 更新 Team task，防止迟到 worker 覆盖新领取。',
+        parameters: z.object({
+          id: z.string().min(1),
+          claimId: z.string().min(1),
+          status: z.enum(['running', 'completed', 'failed']),
+          result: z.string().max(12_000).optional(),
+        }),
+        execute: async ({ id, claimId, status, result }) => this.update(id, status, result, claimId),
       }),
       tool({
         name: 'retry_team_task',
@@ -198,30 +312,17 @@ export class TeamTaskStore {
     }
   }
 
-  private async load(): Promise<StoredTeams> {
+  private processIsAlive(pid: number): boolean {
     try {
-      return JSON.parse(await readFile(this.file, 'utf8')) as StoredTeams;
+      process.kill(pid, 0);
+      return true;
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return {};
-      throw error;
+      return (error as NodeJS.ErrnoException).code === 'EPERM';
     }
   }
 
   private mutate<T>(mutation: (teams: StoredTeams) => T): Promise<T> {
-    const operation = this.writeQueue.then(async () => {
-      const teams = await this.load();
-      const result = mutation(teams);
-      await this.save(teams);
-      return result;
-    });
-    this.writeQueue = operation.then(() => undefined, () => undefined);
-    return operation;
+    return this.state.update(mutation);
   }
 
-  private async save(teams: StoredTeams): Promise<void> {
-    await mkdir(path.dirname(this.file), { recursive: true });
-    const temporary = `${this.file}.tmp`;
-    await writeFile(temporary, `${JSON.stringify(teams, null, 2)}\n`, 'utf8');
-    await rename(temporary, this.file);
-  }
 }

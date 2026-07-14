@@ -2,9 +2,11 @@ import type { AgentInputItem, SessionInputCallback } from '@openai/agents';
 import type { Memory } from './memory.js';
 import type { Goal, PlanStep } from './plan.js';
 import type { RagMatch } from '../extensions/rag.js';
+import type { ContextArchive } from './session.js';
 
 export interface ContextParts {
   baseInstructions: string;
+  sessionState?: string;
   persistentInstructions?: string;
   historySummary: string;
   skillCatalog: string;
@@ -13,6 +15,22 @@ export interface ContextParts {
   plan: PlanStep[];
   goal?: Goal;
   teamSummary?: string;
+  recoverySummary?: string;
+}
+
+export interface ContextStats {
+  rawTokens: number;
+  effectiveTokens: number;
+  archiveTokens: number;
+  coveredItems: number;
+  strategies: string[];
+}
+
+export interface RequestBudget {
+  contextWindow: number;
+  outputReserveTokens: number;
+  toolSchemaTokens: number;
+  inputBudget: number;
 }
 
 export function estimateTokens(value: unknown): number {
@@ -25,23 +43,102 @@ export function estimateTokens(value: unknown): number {
 export class ContextManager {
   private readonly historyTokenBudget: number;
   private readonly instructionTokenBudget: number;
+  private readonly contextWindow: number;
 
   constructor(
     private readonly historyLimit = 40,
     contextWindow = 128_000,
     historyBudgetRatio = 0.55,
+    private readonly outputReserveTokens = Math.max(4_096, Math.floor(contextWindow * 0.1)),
   ) {
+    this.contextWindow = contextWindow;
     this.historyTokenBudget = Math.max(2_000, Math.floor(contextWindow * historyBudgetRatio));
     this.instructionTokenBudget = Math.max(2_000, Math.floor(contextWindow * 0.35));
   }
 
-  readonly sessionInput: SessionInputCallback = async (history, input) => [
-    ...this.trimHistory(history),
-    ...input,
-  ];
+  requestBudget(toolSchemas: unknown): RequestBudget {
+    const estimatedSchemas = estimateTokens(toolSchemas);
+    // Covers provider/SDK message wrappers and MCP tools whose schemas are resolved lazily.
+    const protocolReserve = Math.max(1_000, Math.floor(this.contextWindow * 0.02));
+    const toolSchemaTokens = estimatedSchemas + protocolReserve;
+    const inputBudget = this.contextWindow - this.outputReserveTokens - toolSchemaTokens;
+    if (inputBudget < 256) throw new Error('模型上下文窗口不足以容纳工具定义和输出预留');
+    return {
+      contextWindow: this.contextWindow,
+      outputReserveTokens: this.outputReserveTokens,
+      toolSchemaTokens,
+      inputBudget,
+    };
+  }
 
-  buildInstructions(parts: ContextParts): string {
+  readonly sessionInput: SessionInputCallback = async (history, input) => this.effectiveHistory(history, input);
+
+  inputCallback(archive?: ContextArchive, tokenBudget?: number): SessionInputCallback {
+    return async (history, input) => this.effectiveHistory(history, input, archive, tokenBudget);
+  }
+
+  effectiveHistory(
+    history: AgentInputItem[],
+    input: AgentInputItem[],
+    archive?: ContextArchive,
+    tokenBudget = this.historyTokenBudget,
+  ): AgentInputItem[] {
+    const start = archive && archive.coveredItems <= history.length ? archive.coveredItems : 0;
+    const visible = this.microcompact(history.slice(start));
+    const fittedInput = this.fitInput(input, tokenBudget);
+    const historyBudget = Math.max(0, tokenBudget - estimateTokens(fittedInput));
+    return [...this.trimHistory(visible, historyBudget), ...fittedInput];
+  }
+
+  compactArchive(
+    history: AgentInputItem[],
+    previous?: ContextArchive,
+    strategy: ContextArchive['strategy'] = 'collapse',
+  ): ContextArchive | undefined {
+    const previousCovered = previous && previous.coveredItems <= history.length ? previous.coveredItems : 0;
+    const uncovered = history.slice(previousCovered);
+    const shouldCollapse = uncovered.length > this.historyLimit || estimateTokens(uncovered) > this.historyTokenBudget;
+    if (strategy === 'collapse' && !shouldCollapse) return previous;
+
+    const cutoff = strategy === 'full'
+      ? this.startOfRecentTurns(history, 2)
+      : previousCovered + this.historyStart(this.microcompact(uncovered));
+    if (cutoff <= previousCovered) return previous;
+
+    const addition = history.slice(previousCovered, cutoff)
+      .map((item) => this.compactItem(item))
+      .filter(Boolean)
+      .join('\n');
+    if (!addition) return previous;
+    const summary = this.mergeSummary(previousCovered ? previous?.summary ?? '' : '', addition);
+    return {
+      coveredItems: cutoff,
+      summary,
+      strategy,
+      originalTokens: (previousCovered ? previous?.originalTokens ?? 0 : 0) + estimateTokens(history.slice(previousCovered, cutoff)),
+      compactedTokens: estimateTokens(summary),
+      updatedAt: new Date().toISOString(),
+    };
+  }
+
+  stats(history: AgentInputItem[], effective: AgentInputItem[], archive?: ContextArchive, inputItems = 0): ContextStats {
+    const strategies: string[] = [];
+    if (archive?.coveredItems) strategies.push(archive.strategy === 'full' ? 'full-compact' : 'context-collapse');
+    const visible = history.slice(archive?.coveredItems ?? 0);
+    if (JSON.stringify(this.microcompact(visible)) !== JSON.stringify(visible)) strategies.push('microcompact');
+    if (effective.length < visible.length + inputItems) strategies.push('ptl-truncation');
+    return {
+      rawTokens: estimateTokens(history),
+      effectiveTokens: estimateTokens(effective),
+      archiveTokens: archive?.compactedTokens ?? 0,
+      coveredItems: archive?.coveredItems ?? 0,
+      strategies,
+    };
+  }
+
+  buildInstructions(parts: ContextParts, tokenBudget = this.instructionTokenBudget): string {
     const candidates = [parts.baseInstructions];
+    if (parts.sessionState) candidates.push(`当前会话状态：\n${parts.sessionState}`);
     if (parts.persistentInstructions) candidates.push(parts.persistentInstructions);
     if (parts.goal) {
       candidates.push([
@@ -56,6 +153,8 @@ export class ContextManager {
       );
     }
     if (parts.teamSummary) candidates.push(`当前 Ultra Team task list：\n${parts.teamSummary}`);
+    if (parts.recoverySummary) candidates.push(`最近一次未完成运行：\n${parts.recoverySummary}`);
+    if (parts.historySummary) candidates.push(`较早会话的结构化摘要：\n${parts.historySummary}`);
     if (parts.memories.length) {
       candidates.push(
         `与当前问题相关的长期记忆：\n${parts.memories.map((memory) => `- [${memory.type}:${memory.id}] ${memory.content}`).join('\n')}`,
@@ -67,10 +166,9 @@ export class ContextManager {
         `知识库检索结果（回答时标注来源）：\n${parts.documents.map((match) => `- [${match.source}] ${match.content}`).join('\n')}`,
       );
     }
-    if (parts.historySummary) candidates.push(`较早会话的结构化摘要：\n${parts.historySummary}`);
 
     const sections: string[] = [];
-    let remaining = this.instructionTokenBudget;
+    let remaining = Math.max(0, tokenBudget);
     for (const candidate of candidates) {
       if (remaining <= 0) break;
       const fitted = this.fitTokens(candidate, remaining);
@@ -78,7 +176,7 @@ export class ContextManager {
       sections.push(fitted);
       remaining -= estimateTokens(fitted);
     }
-    return this.fitTokens(sections.join('\n\n'), this.instructionTokenBudget);
+    return this.fitTokens(sections.join('\n\n'), Math.max(0, tokenBudget));
   }
 
   summarizeHistory(history: AgentInputItem[]): string {
@@ -92,12 +190,29 @@ export class ContextManager {
       .slice(-8_000);
   }
 
-  private trimHistory(history: AgentInputItem[]): AgentInputItem[] {
+  private trimHistory(history: AgentInputItem[], tokenBudget = this.historyTokenBudget): AgentInputItem[] {
     const cleaned = history.filter((item) => !this.isGeneratedSummary(item));
-    return cleaned.slice(this.historyStart(cleaned));
+    return cleaned.slice(this.historyStart(cleaned, tokenBudget));
   }
 
-  private historyStart(history: AgentInputItem[]): number {
+  private microcompact(history: AgentInputItem[]): AgentInputItem[] {
+    const starts = history
+      .map((item, index) => this.itemRole(item) === 'user' ? index : -1)
+      .filter((index) => index >= 0);
+    const keepFullFrom = starts.length > 2 ? starts.at(-2)! : 0;
+    return history.map((item, index) => {
+      const value = item as unknown as Record<string, unknown>;
+      if (index >= keepFullFrom || value.type !== 'function_call_result') return item;
+      const output = this.extractText(value.output);
+      if (output.length <= 800) return item;
+      return {
+        ...value,
+        output: `[较早工具结果已压缩，原始内容保存在 Session] ${output.slice(0, 760)}...`,
+      } as unknown as AgentInputItem;
+    });
+  }
+
+  private historyStart(history: AgentInputItem[], tokenBudget = this.historyTokenBudget): number {
     const starts = history
       .map((item, index) => this.itemRole(item) === 'user' ? index : -1)
       .filter((index) => index >= 0);
@@ -110,12 +225,24 @@ export class ContextManager {
       const turn = history.slice(turnStart, start);
       const turnTokens = estimateTokens(turn);
       const exceedsItems = items > 0 && items + turn.length > this.historyLimit;
-      if (tokens + turnTokens > this.historyTokenBudget || exceedsItems) break;
+      if (tokens + turnTokens > tokenBudget || exceedsItems) break;
       start = turnStart;
       tokens += turnTokens;
       items += turn.length;
     }
     return start;
+  }
+
+  private fitInput(input: AgentInputItem[], tokenBudget: number): AgentInputItem[] {
+    if (estimateTokens(input) <= tokenBudget) return input;
+    if (!input.length || tokenBudget <= 0) return [];
+    const last = input.at(-1)!;
+    if ('role' in last && last.role === 'user' && 'content' in last && typeof last.content === 'string') {
+      const empty = { ...last, content: '' } as AgentInputItem;
+      const contentBudget = Math.max(0, tokenBudget - estimateTokens([empty]));
+      return [{ ...last, content: this.fitTokens(last.content, contentBudget) } as AgentInputItem];
+    }
+    return estimateTokens([last]) <= tokenBudget ? [last] : [];
   }
 
   private compactItem(item: AgentInputItem): string {
@@ -133,6 +260,22 @@ export class ContextManager {
       return `工具结果: ${String(value.name ?? 'unknown')} ${this.extractText(value.output).slice(0, 700)}`;
     }
     return '';
+  }
+
+  private startOfRecentTurns(history: AgentInputItem[], count: number): number {
+    const starts = history
+      .map((item, index) => this.itemRole(item) === 'user' ? index : -1)
+      .filter((index) => index >= 0);
+    return starts.length > count ? starts[starts.length - count]! : 0;
+  }
+
+  private mergeSummary(previous: string, addition: string): string {
+    const merged = [previous, addition].filter(Boolean).join('\n');
+    const limit = Math.min(16_000, Math.floor(this.contextWindow * 0.08));
+    if (merged.length <= limit) return merged;
+    const head = Math.floor(limit * 0.3);
+    const tail = limit - head - 32;
+    return `${merged.slice(0, head)}\n...[中间归档已省略]...\n${merged.slice(-tail)}`;
   }
 
   private extractText(content: unknown): string {

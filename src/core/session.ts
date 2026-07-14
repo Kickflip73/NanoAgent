@@ -1,12 +1,88 @@
-import { mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises';
+import { readdir } from 'node:fs/promises';
 import path from 'node:path';
 import type { AgentInputItem, Session } from '@openai/agents';
+import { z } from 'zod';
+import { assertSessionId } from './session-id.js';
+import { AtomicJsonStore, StateFileCorruptError } from './state-file.js';
+
+export type RunStatus = 'running' | 'completed' | 'interrupted' | 'failed';
+
+export interface RunCheckpoint {
+  runId: string;
+  status: RunStatus;
+  input: string;
+  phase: string;
+  lastEvent?: string;
+  answer?: string;
+  error?: string;
+  nextAction?: string;
+  ownerId?: string;
+  ownerPid?: number;
+  startedAt: string;
+  updatedAt: string;
+}
+
+export interface ContextArchive {
+  coveredItems: number;
+  summary: string;
+  strategy: 'collapse' | 'full';
+  originalTokens: number;
+  compactedTokens: number;
+  updatedAt: string;
+}
+
+export interface SessionPreferences {
+  mode?: string;
+  model?: string;
+  outputLevel?: string;
+}
 
 interface SessionFile {
   id: string;
   createdAt: string;
   updatedAt: string;
   items: AgentInputItem[];
+  checkpoint?: RunCheckpoint;
+  contextArchive?: ContextArchive;
+  preferences?: SessionPreferences;
+}
+
+const sessionFileSchema = z.object({
+  id: z.string(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+  items: z.array(z.record(z.string(), z.unknown())),
+  checkpoint: z.object({
+    runId: z.string(),
+    status: z.enum(['running', 'completed', 'interrupted', 'failed']),
+    input: z.string(),
+    phase: z.string(),
+    lastEvent: z.string().optional(),
+    answer: z.string().optional(),
+    error: z.string().optional(),
+    nextAction: z.string().optional(),
+    ownerId: z.string().optional(),
+    ownerPid: z.number().int().positive().optional(),
+    startedAt: z.string(),
+    updatedAt: z.string(),
+  }).optional(),
+  contextArchive: z.object({
+    coveredItems: z.number().int().nonnegative(),
+    summary: z.string(),
+    strategy: z.enum(['collapse', 'full']),
+    originalTokens: z.number().nonnegative(),
+    compactedTokens: z.number().nonnegative(),
+    updatedAt: z.string(),
+  }).optional(),
+  preferences: z.object({
+    mode: z.string().optional(),
+    model: z.string().optional(),
+    outputLevel: z.string().optional(),
+  }).optional(),
+});
+
+function decodeSessionFile(value: unknown): SessionFile {
+  return sessionFileSchema.parse(value) as unknown as SessionFile;
 }
 
 export interface SessionSummary {
@@ -15,9 +91,12 @@ export interface SessionSummary {
   preview: string;
   updatedAt: string;
   turns: number;
+  recoverable: boolean;
+  progress?: string;
 }
 
 function messageText(item: AgentInputItem): string | undefined {
+  if (!item || typeof item !== 'object') return undefined;
   if (!('role' in item) || item.role !== 'user' || !('content' in item)) return undefined;
   if (typeof item.content === 'string') return item.content;
   if (!Array.isArray(item.content)) return undefined;
@@ -42,36 +121,69 @@ function summarizeTitle(text: string): string {
   return compactText(clean, 32);
 }
 
+function isLowInformationOpening(text: string): boolean {
+  const clean = text.replace(/[\s，。！？!?,.、~～]+/gu, '').toLowerCase();
+  return /^(?:你好|您好|嗨|哈喽|在吗|有人吗|开始|继续|hello|hi|hey|test|测试)$/.test(clean);
+}
+
 function summarizeSession(session: SessionFile): SessionSummary {
   const messages = session.items.map(messageText).filter((text): text is string => Boolean(text?.trim()));
   const meaningful = messages.filter((text) => !text.trim().startsWith('/'));
-  const source = meaningful.length ? meaningful : messages;
+  const titled = meaningful.filter((text) => !isLowInformationOpening(text));
+  const source = titled.length ? titled : meaningful.length ? meaningful : messages;
   return {
     id: session.id,
-    title: summarizeTitle(source[0] ?? ''),
-    preview: compactText(source.at(-1) ?? '', 52),
+    title: summarizeTitle(source[0] ?? session.checkpoint?.input ?? ''),
+    preview: compactText(source.at(-1) ?? session.checkpoint?.input ?? '', 52),
     updatedAt: session.updatedAt,
     turns: messages.length,
+    recoverable: session.checkpoint?.status === 'running'
+      || session.checkpoint?.status === 'interrupted'
+      || session.checkpoint?.status === 'failed',
+    progress: session.checkpoint?.lastEvent ?? session.checkpoint?.phase,
   };
 }
 
-function safeId(id: string): string {
-  if (!/^[a-zA-Z0-9_-]+$/.test(id)) {
-    throw new Error('会话 ID 只能包含字母、数字、下划线和连字符');
+const activeRunOwners = new Set<string>();
+
+export function registerSessionRunOwner(ownerId: string): () => void {
+  activeRunOwners.add(ownerId);
+  return () => activeRunOwners.delete(ownerId);
+}
+
+function processIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH';
   }
-  return id;
+}
+
+function checkpointOwnerIsLive(checkpoint: RunCheckpoint): boolean {
+  if (checkpoint.ownerId && activeRunOwners.has(checkpoint.ownerId)) return true;
+  return checkpoint.ownerPid !== undefined
+    && checkpoint.ownerPid !== process.pid
+    && processIsAlive(checkpoint.ownerPid);
 }
 
 export class FileSession implements Session {
   private readonly file: string;
-  private cache?: SessionFile;
-  private writeQueue: Promise<void> = Promise.resolve();
+  private readonly state: AtomicJsonStore<SessionFile>;
 
   constructor(
     private readonly directory: string,
     private readonly id: string,
   ) {
-    this.file = path.join(directory, `${safeId(id)}.json`);
+    this.file = path.join(directory, `${assertSessionId(id)}.json`);
+    this.state = new AtomicJsonStore<SessionFile>(this.file, {
+      defaultValue: () => {
+        const now = new Date().toISOString();
+        return { id: this.id, createdAt: now, updatedAt: now, items: [] };
+      },
+      decode: decodeSessionFile,
+      pretty: false,
+    });
   }
 
   async getSessionId(): Promise<string> {
@@ -83,14 +195,127 @@ export class FileSession implements Session {
   }
 
   async getItems(limit?: number): Promise<AgentInputItem[]> {
-    await this.writeQueue;
     const items = (await this.load()).items;
     return limit === undefined ? [...items] : items.slice(-limit);
   }
 
   async addItems(items: AgentInputItem[]): Promise<void> {
+    const validated = z.array(z.record(z.string(), z.unknown())).parse(items) as unknown as AgentInputItem[];
     await this.mutate((session) => {
-      session.items.push(...items);
+      session.items.push(...validated);
+      session.updatedAt = new Date().toISOString();
+    });
+  }
+
+  async getCheckpoint(): Promise<RunCheckpoint | undefined> {
+    const checkpoint = (await this.load()).checkpoint;
+    return checkpoint ? { ...checkpoint } : undefined;
+  }
+
+  async beginRun(input: string, runId?: string, ownerId?: string): Promise<RunCheckpoint> {
+    return this.mutate((session) => {
+      if (session.checkpoint?.status === 'running' && checkpointOwnerIsLive(session.checkpoint)) {
+        throw new Error(`Session ${this.id} 已被另一个活跃 Run 占用`);
+      }
+      const now = new Date().toISOString();
+      const checkpoint: RunCheckpoint = {
+        runId: runId ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+        status: 'running',
+        input: input.trim().slice(0, 8_000),
+        phase: '准备上下文',
+        nextAction: '继续当前任务',
+        ownerId,
+        ownerPid: process.pid,
+        startedAt: now,
+        updatedAt: now,
+      };
+      session.checkpoint = checkpoint;
+      session.updatedAt = now;
+      return { ...checkpoint };
+    });
+  }
+
+  async updateRunProgress(
+    phase: string,
+    lastEvent?: string,
+    expectedRunId?: string,
+  ): Promise<RunCheckpoint | undefined> {
+    return this.mutateWhen((session) => {
+      if (!session.checkpoint
+        || session.checkpoint.status !== 'running'
+        || (expectedRunId && session.checkpoint.runId !== expectedRunId)) {
+        return { result: session.checkpoint ? { ...session.checkpoint } : undefined, changed: false };
+      }
+      session.checkpoint = {
+        ...session.checkpoint,
+        phase: phase.trim().slice(0, 200),
+        lastEvent: lastEvent?.trim().slice(0, 2_000) || session.checkpoint.lastEvent,
+        nextAction: '从最后记录的执行阶段继续',
+        updatedAt: new Date().toISOString(),
+      };
+      session.updatedAt = session.checkpoint.updatedAt;
+      return { result: { ...session.checkpoint }, changed: true };
+    });
+  }
+
+  async completeRun(answer: string, expectedRunId?: string): Promise<RunCheckpoint | undefined> {
+    return this.finishRun(
+      'completed',
+      { answer: answer.trim().slice(0, 8_000), phase: '已完成', nextAction: undefined },
+      expectedRunId,
+    );
+  }
+
+  async failRun(error: string, interrupted = false, expectedRunId?: string): Promise<RunCheckpoint | undefined> {
+    return this.finishRun(interrupted ? 'interrupted' : 'failed', {
+      error: error.trim().slice(0, 2_000),
+      phase: interrupted ? '已中断' : '执行失败',
+      nextAction: '检查最后进展并继续未完成任务',
+    }, expectedRunId);
+  }
+
+  async recoverInterruptedRun(expectedRunId?: string): Promise<RunCheckpoint | undefined> {
+    return this.mutateWhen((session) => {
+      if (!session.checkpoint
+        || session.checkpoint.status !== 'running'
+        || (expectedRunId && session.checkpoint.runId !== expectedRunId)
+        || checkpointOwnerIsLive(session.checkpoint)) {
+        return { result: session.checkpoint ? { ...session.checkpoint } : undefined, changed: false };
+      }
+      const now = new Date().toISOString();
+      session.checkpoint = {
+        ...session.checkpoint,
+        status: 'interrupted',
+        error: '进程在本轮完成前退出',
+        nextAction: '从最后记录的执行阶段继续',
+        ownerId: undefined,
+        ownerPid: undefined,
+        updatedAt: now,
+      };
+      session.updatedAt = now;
+      return { result: { ...session.checkpoint }, changed: true };
+    });
+  }
+
+  async getContextArchive(): Promise<ContextArchive | undefined> {
+    const archive = (await this.load()).contextArchive;
+    return archive ? { ...archive } : undefined;
+  }
+
+  async setContextArchive(archive: ContextArchive): Promise<void> {
+    await this.mutate((session) => {
+      session.contextArchive = { ...archive };
+      session.updatedAt = new Date().toISOString();
+    });
+  }
+
+  async getPreferences(): Promise<SessionPreferences> {
+    return { ...(await this.load()).preferences };
+  }
+
+  async setPreferences(preferences: Partial<SessionPreferences>): Promise<void> {
+    await this.mutate((session) => {
+      session.preferences = { ...session.preferences, ...preferences };
       session.updatedAt = new Date().toISOString();
     });
   }
@@ -103,15 +328,20 @@ export class FileSession implements Session {
     });
   }
 
-  async clearSession(): Promise<void> {
-    await this.mutate((session) => {
+  async clearSession(relatedCleanup?: () => Promise<void>): Promise<void> {
+    await this.mutate(async (session) => {
+      if (session.checkpoint?.status === 'running' && checkpointOwnerIsLive(session.checkpoint)) {
+        throw new Error(`Session ${this.id} 仍有任务运行中，不能清空`);
+      }
+      await relatedCleanup?.();
       session.items = [];
+      session.checkpoint = undefined;
+      session.contextArchive = undefined;
       session.updatedAt = new Date().toISOString();
     });
   }
 
   async summary(): Promise<SessionSummary> {
-    await this.writeQueue;
     return summarizeSession(await this.load());
   }
 
@@ -124,6 +354,7 @@ export class FileSession implements Session {
       const removed = session.items.length - items.length;
       if (removed > 0) {
         session.items = items;
+        session.contextArchive = undefined;
         session.updatedAt = new Date().toISOString();
       }
       return { result: removed, changed: removed > 0 };
@@ -132,25 +363,28 @@ export class FileSession implements Session {
 
   async repairToolPairs(): Promise<number> {
     return this.mutateWhen((session) => {
-      const calls = new Set(session.items.flatMap((item) =>
-        'type' in item && item.type === 'function_call' && 'callId' in item
-          ? [String(item.callId)]
-          : [],
-      ));
-      const results = new Set(session.items.flatMap((item) =>
-        'type' in item && item.type === 'function_call_result' && 'callId' in item
-          ? [String(item.callId)]
-          : [],
-      ));
-      const items = session.items.filter((item) => {
+      const callIndexes = new Map<string, number>();
+      const resultIndexes = new Map<string, number>();
+      session.items.forEach((item, index) => {
+        if (!('type' in item) || !('callId' in item)) return;
+        const callId = String(item.callId);
+        if (item.type === 'function_call' && !callIndexes.has(callId)) callIndexes.set(callId, index);
+        if (item.type === 'function_call_result') {
+          const callIndex = callIndexes.get(callId);
+          if (callIndex !== undefined && index > callIndex && !resultIndexes.has(callId)) resultIndexes.set(callId, index);
+        }
+      });
+      const items = session.items.filter((item, index) => {
         if (!('type' in item) || !('callId' in item)) return true;
-        if (item.type === 'function_call') return results.has(String(item.callId));
-        if (item.type === 'function_call_result') return calls.has(String(item.callId));
+        const callId = String(item.callId);
+        if (item.type === 'function_call') return callIndexes.get(callId) === index && resultIndexes.has(callId);
+        if (item.type === 'function_call_result') return resultIndexes.get(callId) === index;
         return true;
       });
       const removed = session.items.length - items.length;
       if (removed) {
         session.items = items;
+        session.contextArchive = undefined;
         session.updatedAt = new Date().toISOString();
       }
       return { result: removed, changed: removed > 0 };
@@ -171,50 +405,54 @@ export class FileSession implements Session {
 
   static async listSummaries(directory: string): Promise<SessionSummary[]> {
     const ids = await FileSession.list(directory);
-    const summaries = await Promise.all(ids.map((id) => new FileSession(directory, id).summary()));
-    return summaries.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+    const summaries = (await Promise.all(ids.map(async (id) => {
+      try {
+        return await new FileSession(directory, id).summary();
+      } catch (error) {
+        if (error instanceof StateFileCorruptError) return undefined;
+        throw error;
+      }
+    }))).filter((summary): summary is SessionSummary => summary !== undefined);
+    return summaries.sort((left, right) => {
+      const active = right.updatedAt.localeCompare(left.updatedAt);
+      return active || left.id.localeCompare(right.id);
+    });
   }
 
   private async load(): Promise<SessionFile> {
-    if (this.cache) return this.cache;
-    try {
-      this.cache = JSON.parse(await readFile(this.file, 'utf8')) as SessionFile;
-      return this.cache;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-      const now = new Date().toISOString();
-      this.cache = { id: this.id, createdAt: now, updatedAt: now, items: [] };
-      return this.cache;
-    }
+    return this.state.read();
   }
 
   private mutate<T>(mutation: (session: SessionFile) => T): Promise<T> {
-    const operation = this.writeQueue.then(async () => {
-      const session = await this.load();
-      const result = mutation(session);
-      await this.save(session);
-      return result;
-    });
-    this.writeQueue = operation.then(() => undefined, () => undefined);
-    return operation;
+    return this.state.update(mutation);
   }
 
   private mutateWhen<T>(mutation: (session: SessionFile) => { result: T; changed: boolean }): Promise<T> {
-    const operation = this.writeQueue.then(async () => {
-      const session = await this.load();
-      const { result, changed } = mutation(session);
-      if (changed) await this.save(session);
-      return result;
-    });
-    this.writeQueue = operation.then(() => undefined, () => undefined);
-    return operation;
+    return this.state.updateWhen(mutation);
   }
 
-  private async save(session: SessionFile): Promise<void> {
-    await mkdir(this.directory, { recursive: true });
-    const temporary = `${this.file}.tmp`;
-    await writeFile(temporary, `${JSON.stringify(session)}\n`, 'utf8');
-    await rename(temporary, this.file);
-    this.cache = session;
+  private async finishRun(
+    status: Exclude<RunStatus, 'running'>,
+    update: Pick<RunCheckpoint, 'phase'> & Partial<Pick<RunCheckpoint, 'answer' | 'error' | 'nextAction'>>,
+    expectedRunId?: string,
+  ): Promise<RunCheckpoint | undefined> {
+    return this.mutateWhen((session) => {
+      if (!session.checkpoint) return { result: undefined, changed: false };
+      if ((expectedRunId && session.checkpoint.runId !== expectedRunId)
+        || session.checkpoint.status !== 'running') {
+        return { result: { ...session.checkpoint }, changed: false };
+      }
+      const now = new Date().toISOString();
+      session.checkpoint = {
+        ...session.checkpoint,
+        ...update,
+        status,
+        ownerId: undefined,
+        ownerPid: undefined,
+        updatedAt: now,
+      };
+      session.updatedAt = now;
+      return { result: { ...session.checkpoint }, changed: true };
+    });
   }
 }

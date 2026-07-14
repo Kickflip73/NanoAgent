@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 
-test('prints nano help and version without requiring an API key', () => {
+test('prints nano-agent help and version without requiring an API key', () => {
   const environment = { ...process.env };
   delete environment.OPENAI_API_KEY;
   delete environment.DEEPSEEK_API_KEY;
@@ -20,7 +20,7 @@ test('prints nano help and version without requiring an API key', () => {
   });
 
   assert.equal(help.status, 0, help.stderr);
-  assert.match(help.stdout, /nano "任务"/);
+  assert.match(help.stdout, /nano-agent "任务"/);
   assert.match(help.stdout, /\/status/);
   assert.equal(version.status, 0, version.stderr);
   assert.match(version.stdout, /^\d+\.\d+\.\d+\s*$/);

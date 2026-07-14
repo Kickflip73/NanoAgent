@@ -1,5 +1,7 @@
 import readline from 'node:readline';
 import type { ReadStream, WriteStream } from 'node:tty';
+import type { PlanStep } from './core/plan.js';
+import { renderUserInput } from './terminal.js';
 
 export interface CompletionItem {
   value: string;
@@ -19,10 +21,10 @@ export interface RuntimeStatus {
   contextWindow: number;
 }
 
-type Key = { name?: string; ctrl?: boolean; shift?: boolean; sequence?: string };
+type Key = { name?: string; ctrl?: boolean; shift?: boolean; meta?: boolean; sequence?: string };
 
 const clearLine = '\r\x1b[2K';
-const selectionCursor = '\x1b[38;2;0;0;0m›\x1b[0m';
+const selectionCursor = '\x1b[96m›\x1b[0m';
 
 function displayWidth(value: string): number {
   const plain = value.replace(/\x1b\[[0-9;]*m/g, '');
@@ -37,6 +39,8 @@ export class InteractiveTerminal {
   private buffer: string[] = [];
   private cursor = 0;
   private history: string[] = [];
+  private histories = new Map<string, string[]>();
+  private sessionId = '';
   private historyIndex = 0;
   private completionIndex = 0;
   private busy = false;
@@ -45,11 +49,15 @@ export class InteractiveTerminal {
   private statusFrame = 0;
   private statusTimer?: NodeJS.Timeout;
   private queued: string[] = [];
+  private tasks: PlanStep[] = [];
   private outputOpen = false;
   private outputOpenWidth = 0;
   private renderedRows = 0;
   private started = false;
   private closed = false;
+  private bracketPaste = false;
+  private suppressPasteKeypress = false;
+  private pasteDataListener?: (chunk: Buffer | string) => void;
   private selectState?: {
     items: SelectItem[];
     index: number;
@@ -63,14 +71,24 @@ export class InteractiveTerminal {
     private readonly output: WriteStream = process.stdout,
   ) {}
 
-  start(handlers: { onLine: (line: string) => void; onEscape: () => void; onExit: () => void }): void {
+  start(handlers: { onLine: (line: string) => void; onEscape: () => void; onExit: () => void; onModeCycle?: () => void }): void {
     this.started = true;
+    this.pasteDataListener = (chunk) => this.handlePasteData(chunk);
+    this.input.prependListener('data', this.pasteDataListener);
     readline.emitKeypressEvents(this.input);
-    if (this.input.isTTY) this.input.setRawMode(true);
+    if (this.input.isTTY) {
+      this.input.setRawMode(true);
+      this.output.write('\x1b[?2004h');
+    }
     this.input.resume();
     this.input.on('keypress', (text: string, key: Key) => {
+      if (this.suppressPasteKeypress || this.bracketPaste) return;
       if (key.ctrl && (key.name === 'c' || key.name === 'd')) {
         handlers.onExit();
+        return;
+      }
+      if ((key.name === 'tab' && key.shift) || key.sequence === '\x1b[Z') {
+        handlers.onModeCycle?.();
         return;
       }
       if (this.selectState) {
@@ -81,8 +99,14 @@ export class InteractiveTerminal {
         handlers.onEscape();
         return;
       }
+      const shiftedEnter = ((key.name === 'return' || key.name === 'enter') && key.shift)
+        || key.sequence === '\x1b[13;2u' || key.sequence === '\x1b[27;2;13~';
+      if (shiftedEnter) {
+        this.insertText('\n');
+        return;
+      }
       if (key.name === 'return' || key.name === 'enter') {
-        const line = this.buffer.join('').trim();
+        const line = (this.suggestions[this.completionIndex]?.value ?? this.buffer.join('')).trim();
         this.eraseUi();
         this.output.write('\n');
         this.outputOpen = false;
@@ -107,13 +131,21 @@ export class InteractiveTerminal {
         this.redraw();
         return;
       }
+      if ((key.name === 'up' || key.name === 'down') && this.buffer.includes('\n')) {
+        this.moveVertical(key.name === 'up' ? -1 : 1);
+        return;
+      }
       if (key.name === 'up' || key.name === 'down') {
         if (!this.history.length) return;
         this.historyIndex = Math.max(0, Math.min(this.history.length, this.historyIndex + (key.name === 'up' ? -1 : 1)));
         this.setBuffer(this.history[this.historyIndex] ?? '');
         return;
       }
-      if (key.name === 'left') this.cursor = Math.max(0, this.cursor - 1);
+      const commandLeft = (key.meta && key.name === 'left') || key.sequence === '\x1b[1;9D';
+      const commandRight = (key.meta && key.name === 'right') || key.sequence === '\x1b[1;9C';
+      if (commandLeft) this.cursor = this.lineStart(this.cursor);
+      else if (commandRight) this.cursor = this.lineEnd(this.cursor);
+      else if (key.name === 'left') this.cursor = Math.max(0, this.cursor - 1);
       else if (key.name === 'right') this.cursor = Math.min(this.buffer.length, this.cursor + 1);
       else if (key.name === 'backspace' && this.cursor > 0) {
         this.buffer.splice(--this.cursor, 1);
@@ -121,7 +153,7 @@ export class InteractiveTerminal {
       } else if (key.name === 'delete' && this.cursor < this.buffer.length) {
         this.buffer.splice(this.cursor, 1);
         this.completionIndex = 0;
-      } else if (text && !key.ctrl && text >= ' ') {
+      } else if (text && !key.ctrl && !key.meta && text >= ' ') {
         this.buffer.splice(this.cursor, 0, ...Array.from(text));
         this.cursor += Array.from(text).length;
         this.completionIndex = 0;
@@ -169,8 +201,7 @@ export class InteractiveTerminal {
   recordInput(input: string): void {
     const text = input.replace(/\x1b/g, '').replace(/\s+/g, ' ').trim();
     if (!text) return;
-    const marker = this.output.isTTY ? '\x1b[38;2;148;166;173m>\x1b[0m' : '>';
-    this.write(`${marker} ${text}\n`);
+    this.write(`${renderUserInput(text, Boolean(this.output.isTTY))}\n`);
   }
 
   setBusy(value: boolean): void {
@@ -196,8 +227,25 @@ export class InteractiveTerminal {
     this.redraw();
   }
 
+  useSession(sessionId: string): void {
+    if (sessionId === this.sessionId) return;
+    if (this.sessionId) this.histories.set(this.sessionId, [...this.history]);
+    this.sessionId = sessionId;
+    this.history = [...(this.histories.get(sessionId) ?? [])];
+    this.historyIndex = this.history.length;
+    this.buffer = [];
+    this.cursor = 0;
+    this.completionIndex = 0;
+    this.redraw();
+  }
+
   setQueue(items: string[]): void {
     this.queued = [...items];
+    this.redraw();
+  }
+
+  setTasks(tasks: PlanStep[]): void {
+    this.tasks = tasks.map((task) => ({ ...task }));
     this.redraw();
   }
 
@@ -222,7 +270,12 @@ export class InteractiveTerminal {
     if (this.closed) return;
     if (this.statusTimer) clearInterval(this.statusTimer);
     this.eraseUi();
+    const selection = this.selectState;
+    this.selectState = undefined;
+    selection?.resolve();
     this.closed = true;
+    if (this.pasteDataListener) this.input.removeListener('data', this.pasteDataListener);
+    if (this.input.isTTY) this.output.write('\x1b[?2004l');
     this.output.write('\n');
     if (this.input.isTTY) this.input.setRawMode(false);
     this.input.pause();
@@ -257,6 +310,86 @@ export class InteractiveTerminal {
     this.redraw();
   }
 
+  private insertText(value: string): void {
+    this.insertRawText(value);
+    this.redraw();
+  }
+
+  private insertRawText(value: string): void {
+    const characters = Array.from(value.replace(/\r\n?/g, '\n').replace(/\x1b/g, ''));
+    if (!characters.length) return;
+    this.buffer.splice(this.cursor, 0, ...characters);
+    this.cursor += characters.length;
+    this.completionIndex = 0;
+  }
+
+  private handlePasteData(chunk: Buffer | string): void {
+    const value = chunk.toString();
+    const startMarker = '\x1b[200~';
+    const endMarker = '\x1b[201~';
+    if (!this.bracketPaste && !value.includes(startMarker)) return;
+    this.suppressPasteKeypress = true;
+    queueMicrotask(() => { this.suppressPasteKeypress = false; });
+    let offset = 0;
+    let changed = false;
+    while (offset < value.length) {
+      if (!this.bracketPaste) {
+        const start = value.indexOf(startMarker, offset);
+        if (start < 0) {
+          this.insertRawText(value.slice(offset));
+          changed = offset < value.length;
+          break;
+        }
+        if (start > offset) {
+          this.insertRawText(value.slice(offset, start));
+          changed = true;
+        }
+        this.bracketPaste = true;
+        offset = start + startMarker.length;
+      } else {
+        const end = value.indexOf(endMarker, offset);
+        const content = end < 0 ? value.slice(offset) : value.slice(offset, end);
+        if (content) {
+          this.insertRawText(content);
+          changed = true;
+        }
+        if (end < 0) break;
+        this.bracketPaste = false;
+        offset = end + endMarker.length;
+      }
+    }
+    if (changed) this.redraw();
+  }
+
+  private lineStart(position: number): number {
+    let index = Math.max(0, Math.min(position, this.buffer.length));
+    while (index > 0 && this.buffer[index - 1] !== '\n') index -= 1;
+    return index;
+  }
+
+  private lineEnd(position: number): number {
+    let index = Math.max(0, Math.min(position, this.buffer.length));
+    while (index < this.buffer.length && this.buffer[index] !== '\n') index += 1;
+    return index;
+  }
+
+  private moveVertical(direction: -1 | 1): void {
+    const start = this.lineStart(this.cursor);
+    const column = this.cursor - start;
+    if (direction < 0) {
+      if (start === 0) return;
+      const previousEnd = start - 1;
+      const previousStart = this.lineStart(previousEnd);
+      this.cursor = Math.min(previousStart + column, previousEnd);
+    } else {
+      const end = this.lineEnd(this.cursor);
+      if (end === this.buffer.length) return;
+      const nextStart = end + 1;
+      this.cursor = Math.min(nextStart + column, this.lineEnd(nextStart));
+    }
+    this.redraw();
+  }
+
   private redraw(): void {
     if (this.closed || !this.started) return;
     this.eraseUi();
@@ -278,17 +411,21 @@ export class InteractiveTerminal {
     if (this.selectState) {
       const state = this.selectState;
       const visible = this.window(state.items, state.index, 7);
-      rows.push(`${state.title} · ↑↓ 移动，Enter 确认，Esc 取消`);
+      rows.push(this.truncateDisplay(
+        `${state.title} · ↑↓ 移动，Enter 确认，Esc 取消`,
+        Math.max(4, (this.output.columns ?? 80) - 1),
+      ));
       for (const { item, index } of visible) {
         const marker = index === state.index ? selectionCursor : ' ';
-        rows.push(`${marker} ${item.label}${item.detail ? `  \x1b[2m${item.detail}\x1b[0m` : ''}`);
+        rows.push(this.selectionLine(marker, item));
       }
+      rows.push(...this.taskRows());
       rows.push(this.statusLine());
       const input = this.inputBox();
-      rows.push(input.line);
+      rows.push(...input.lines);
       this.output.write(rows.join('\n'));
-      this.renderedRows = rows.length;
-      this.output.write(`\r\x1b[${input.cursorColumn}C`);
+      this.renderedRows = this.physicalRows(rows);
+      this.placeInputCursor(input);
       return;
     }
 
@@ -298,36 +435,60 @@ export class InteractiveTerminal {
       const active = index === this.completionIndex;
       rows.push(`${active ? selectionCursor : ' '} ${item.value.padEnd(12)} \x1b[2m${item.description}\x1b[0m`);
     }
+    rows.push(...this.taskRows());
     rows.push(this.statusLine());
     const input = this.inputBox();
-    rows.push(input.line);
+    rows.push(...input.lines);
     this.output.write(rows.join('\n'));
-    this.renderedRows = rows.length;
-    this.output.write(`\r\x1b[${input.cursorColumn}C`);
+    this.renderedRows = this.physicalRows(rows);
+    this.placeInputCursor(input);
   }
 
-  private inputBox(): { line: string; cursorColumn: number } {
+  private physicalRows(rows: string[]): number {
+    const width = Math.max(1, this.output.columns ?? 80);
+    return rows.reduce((total, row) => total + Math.max(1, Math.ceil(displayWidth(row) / width)), 0);
+  }
+
+  private inputBox(): { lines: string[]; cursorRow: number; cursorColumn: number } {
     const width = Math.max(24, (this.output.columns ?? 80) - 1);
-    const prefix = '┊ > ';
-    const suffix = ' ┊';
-    const available = width - displayWidth(prefix) - displayWidth(suffix);
-    let start = this.cursor;
-    while (start > 0 && displayWidth(this.buffer.slice(start - 1, this.cursor).join('')) <= available) start -= 1;
-    if (displayWidth(this.buffer.slice(start, this.cursor).join('')) > available) start += 1;
-    const visible: string[] = [];
-    let used = 0;
-    for (const character of this.buffer.slice(start)) {
-      const characterWidth = displayWidth(character);
-      if (used + characterWidth > available) break;
-      visible.push(character);
-      used += characterWidth;
-    }
-    const value = visible.join('');
-    const padding = ' '.repeat(Math.max(0, available - displayWidth(value)));
+    const prefix = '┊> ';
+    const available = width - displayWidth(prefix);
+    const value = this.buffer.join('');
+    const logicalLines = value.split('\n');
+    const beforeCursor = this.buffer.slice(0, this.cursor).join('');
+    const cursorRow = beforeCursor.split('\n').length - 1;
+    const cursorOffset = Array.from(beforeCursor.split('\n').at(-1) ?? '').length;
+    let cursorColumn = displayWidth(prefix);
+    const lines = logicalLines.map((line, index) => {
+      const linePrefix = index === 0 ? '\x1b[90m┊\x1b[0m> ' : '\x1b[90m┊\x1b[0m  ';
+      if (index !== cursorRow) return `${linePrefix}${this.truncateDisplay(line, available)}`;
+      const characters = Array.from(line);
+      let start = cursorOffset;
+      while (start > 0 && displayWidth(characters.slice(start - 1, cursorOffset).join('')) <= available) start -= 1;
+      if (displayWidth(characters.slice(start, cursorOffset).join('')) > available) start += 1;
+      const visible: string[] = [];
+      let used = 0;
+      for (const character of characters.slice(start)) {
+        const characterWidth = displayWidth(character);
+        if (used + characterWidth > available) break;
+        visible.push(character);
+        used += characterWidth;
+      }
+      cursorColumn = displayWidth(prefix) + displayWidth(characters.slice(start, cursorOffset).join(''));
+      return `${linePrefix}${visible.join('')}`;
+    });
     return {
-      line: `\x1b[38;2;145;151;158m┊\x1b[0m > ${value}${padding} \x1b[38;2;145;151;158m┊\x1b[0m`,
-      cursorColumn: displayWidth(prefix) + displayWidth(this.buffer.slice(start, this.cursor).join('')),
+      lines,
+      cursorRow,
+      cursorColumn,
     };
+  }
+
+  private placeInputCursor(input: { lines: string[]; cursorRow: number; cursorColumn: number }): void {
+    this.output.write('\r');
+    const rowsUp = input.lines.length - 1 - input.cursorRow;
+    if (rowsUp > 0) this.output.write(`\x1b[${rowsUp}A`);
+    this.output.write(`\x1b[${input.cursorColumn}C`);
   }
 
   private compactQueueItem(value: string): string {
@@ -345,14 +506,49 @@ export class InteractiveTerminal {
     return `${visible.join('')}...`;
   }
 
+  private selectionLine(marker: string, item: SelectItem): string {
+    const width = Math.max(4, (this.output.columns ?? 80) - 1);
+    const prefix = `${marker} `;
+    const available = Math.max(1, width - displayWidth(prefix));
+    const label = item.label.replace(/\s+/g, ' ').trim();
+    const detail = item.detail?.replace(/\s+/g, ' ').trim();
+    if (!detail || displayWidth(label) + displayWidth(detail) + 2 > available) {
+      const shortLabel = this.truncateDisplay(label, available);
+      const remaining = available - displayWidth(shortLabel) - 2;
+      if (!detail || remaining < 4) return `${prefix}${shortLabel}`;
+      return `${prefix}${shortLabel}  \x1b[2m${this.truncateDisplay(detail, remaining)}\x1b[0m`;
+    }
+    return `${prefix}${label}  \x1b[2m${detail}\x1b[0m`;
+  }
+
   private statusLine(): string {
     const frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
     const icon = this.busy ? frames[this.statusFrame % frames.length] : '◇';
     const state = this.busy ? (this.transient || '运行中') : '就绪';
     const model = this.truncateDisplay(this.runtime.model, 24);
     const text = `${icon} ${state} · 模式 ${this.runtime.mode} · 模型 ${model} · 上下文 ${this.formatTokens(this.runtime.contextUsed)}/${this.formatTokens(this.runtime.contextWindow)}`;
-    const color = this.busy ? '126;156;196' : '145;151;158';
-    return `\x1b[38;2;${color}m${this.truncateDisplay(text, Math.max(24, (this.output.columns ?? 80) - 1))}\x1b[0m`;
+    return `\x1b[90m${this.truncateDisplay(text, Math.max(24, (this.output.columns ?? 80) - 1))}\x1b[0m`;
+  }
+
+  private taskRows(): string[] {
+    if (!this.tasks.length) return [];
+    const completed = this.tasks.filter((task) => task.status === 'completed').length;
+    const width = Math.max(4, (this.output.columns ?? 80) - 1);
+    if (completed === this.tasks.length) {
+      return [`\x1b[92m${this.truncateDisplay(`✓ 任务 ${completed}/${this.tasks.length} · 已全部完成`, width)}\x1b[0m`];
+    }
+    const runningIndex = this.tasks.findIndex((task) => task.status === 'running');
+    const pendingIndex = this.tasks.findIndex((task) => task.status !== 'completed');
+    const activeIndex = runningIndex >= 0 ? runningIndex : Math.max(0, pendingIndex);
+    const rows = [`\x1b[90m任务 ${completed}/${this.tasks.length}\x1b[0m`];
+    for (const { item } of this.window(this.tasks, activeIndex, 5)) {
+      const style = item.status === 'completed' ? '\x1b[92m✓'
+        : item.status === 'running' ? '\x1b[96m●'
+          : item.status === 'failed' ? '\x1b[91m×' : '\x1b[90m○';
+      rows.push(`${style}\x1b[0m ${this.truncateDisplay(item.description.replace(/\s+/g, ' ').trim(), width - 2)}`);
+    }
+    if (this.tasks.length > 5) rows.push(`\x1b[90m${this.truncateDisplay(`… 其余 ${this.tasks.length - 5} 项`, width)}\x1b[0m`);
+    return rows;
   }
 
   private formatTokens(value: number): string {
@@ -363,6 +559,7 @@ export class InteractiveTerminal {
 
   private truncateDisplay(value: string, width: number): string {
     if (displayWidth(value) <= width) return value;
+    if (width <= 3) return '.'.repeat(Math.max(0, width));
     const visible: string[] = [];
     let used = 0;
     for (const character of Array.from(value)) {

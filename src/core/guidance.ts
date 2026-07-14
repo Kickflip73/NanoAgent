@@ -1,4 +1,5 @@
-import { readFile } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { open } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -47,11 +48,18 @@ export class GuidanceLoader {
   }
 
   private async read(scope: GuidanceFile['scope'], file: string): Promise<GuidanceFile | undefined> {
+    let handle;
     try {
-      const raw = await readFile(file, 'utf8');
+      handle = await open(file, constants.O_RDONLY | constants.O_NONBLOCK);
+      const maxBytes = this.maxCharsPerFile * 4;
+      const info = await handle.stat();
+      if (!info.isFile()) throw new Error('持久指令必须是常规文件');
+      const buffer = Buffer.alloc(Math.min(info.size, maxBytes));
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+      const raw = buffer.subarray(0, bytesRead).toString('utf8');
       const content = raw.trim();
       if (!content) return undefined;
-      const truncated = content.length > this.maxCharsPerFile;
+      const truncated = info.size > bytesRead || content.length > this.maxCharsPerFile;
       return {
         scope,
         path: file,
@@ -61,6 +69,8 @@ export class GuidanceLoader {
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
       throw new Error(`无法读取 ${file}: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      await handle?.close();
     }
   }
 }

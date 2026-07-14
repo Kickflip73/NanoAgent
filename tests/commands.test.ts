@@ -27,6 +27,7 @@ function fakeAgent(): NanoAgent {
       preview: '增加交互能力',
       updatedAt: new Date().toISOString(),
       turns: 2,
+      recoverable: false,
     }],
     switchSession: async () => undefined,
     history: async () => [],
@@ -43,6 +44,11 @@ function fakeAgent(): NanoAgent {
     availableModels: () => ['deepseek-chat', 'deepseek-reasoner'],
     switchModel: () => undefined,
     contextInfo: async () => ({ historyItems: 4, historyLimit: 40, estimatedTokens: 1200, contextWindow: 128000, memories: 1, planSteps: 1, goal: 'active' }),
+    compactContext: async () => ({
+      changed: true,
+      archive: { coveredItems: 8, summary: 'summary', strategy: 'full', originalTokens: 2000, compactedTokens: 200, updatedAt: '' },
+      message: '已归档 8 个历史条目。',
+    }),
     availableModes: () => [
       { id: 'general', label: '通用', description: '大多数任务' },
       { id: 'ultra', label: 'Ultra Team', description: '大型任务' },
@@ -82,6 +88,22 @@ test('handles status and high-frequency inspection commands', async () => {
   }
 });
 
+test('passes command cancellation to knowledge indexing', async () => {
+  const agent = fakeAgent();
+  let received: AbortSignal | undefined;
+  agent.indexKnowledge = async (_target?: string, signal?: AbortSignal) => {
+    received = signal;
+    signal?.throwIfAborted();
+    return { files: 0, chunks: 0, embeddings: false };
+  };
+  const controller = new AbortController();
+  controller.abort(new Error('stop index'));
+  const handler = new CommandHandler(agent, async () => undefined, { write: () => undefined });
+
+  await assert.rejects(handler.execute('/index knowledge', controller.signal), /stop index/);
+  assert.equal(received, controller.signal);
+});
+
 test('retries the previous user input without sending slash commands to the model', async () => {
   const tasks: string[] = [];
   const original = console.log;
@@ -99,6 +121,28 @@ test('retries the previous user input without sending slash commands to the mode
   } finally {
     console.log = original;
   }
+});
+
+test('keeps retry input isolated by session', async () => {
+  const tasks: string[] = [];
+  const messages: string[] = [];
+  const agent = fakeAgent();
+  const mutable = agent as unknown as { currentSessionId: string };
+  const handler = new CommandHandler(agent, async (input) => { tasks.push(input); }, {
+    write: (text) => messages.push(text),
+  });
+
+  mutable.currentSessionId = 'first';
+  handler.remember('first message');
+  mutable.currentSessionId = 'second';
+  assert.equal(await handler.execute('/retry'), 'handled');
+  assert.match(messages.at(-1) ?? '', /当前对话没有/);
+  handler.remember('second message');
+  await handler.execute('/retry');
+  mutable.currentSessionId = 'first';
+  await handler.execute('/retry');
+
+  assert.deepEqual(tasks, ['second message', 'first message']);
 });
 
 test('selects sessions and restores their persisted transcript', async () => {
@@ -124,7 +168,7 @@ test('selects a model and exposes common runtime inspection commands', async () 
   const switched: string[] = [];
   const output: string[] = [];
   const agent = fakeAgent() as NanoAgent & { switchModel: (name: string) => void };
-  agent.switchModel = (name) => switched.push(name);
+  agent.switchModel = async (name) => { switched.push(name); };
   const handler = new CommandHandler(agent, async () => undefined, {
     write: (text) => output.push(text),
     selectModel: async () => 'deepseek-reasoner',
@@ -132,10 +176,12 @@ test('selects a model and exposes common runtime inspection commands', async () 
 
   assert.equal(await handler.execute('/model'), 'handled');
   assert.equal(await handler.execute('/context'), 'handled');
+  assert.equal(await handler.execute('/compact'), 'handled');
   assert.equal(await handler.execute('/tools'), 'handled');
   assert.equal(await handler.execute('/mcp'), 'handled');
   assert.deepEqual(switched, ['deepseek-reasoner']);
   assert.match(output.join('\n'), /历史条目/);
+  assert.match(output.join('\n'), /已归档 8 个历史条目/);
   assert.match(output.join('\n'), /run_shell/);
   assert.match(output.join('\n'), /MCP 未配置/);
 });
@@ -143,7 +189,7 @@ test('selects a model and exposes common runtime inspection commands', async () 
 test('selects a preset Agent mode', async () => {
   const switched: string[] = [];
   const agent = fakeAgent() as NanoAgent & { switchMode: (mode: string) => void };
-  agent.switchMode = (mode) => switched.push(mode);
+  agent.switchMode = async (mode) => { switched.push(mode); };
   const handler = new CommandHandler(agent, async () => undefined, {
     write: () => undefined,
     selectMode: async () => 'ultra',

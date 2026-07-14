@@ -1,20 +1,22 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, symlink, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, stat, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import type { AgentInputItem } from '@openai/agents';
+import { RunContext, type AgentInputItem } from '@openai/agents';
 import { ContextManager, estimateTokens } from '../src/core/context.js';
 import { GuidanceLoader } from '../src/core/guidance.js';
-import { MemoryStore } from '../src/core/memory.js';
+import { explicitlyRequestsMemory, MemoryStore } from '../src/core/memory.js';
 import { PlanStore } from '../src/core/plan.js';
-import { FileSession } from '../src/core/session.js';
+import { FileSession, registerSessionRunOwner } from '../src/core/session.js';
+import { TeamTaskStore } from '../src/core/team.js';
 import { TraceStore } from '../src/core/trace.js';
 import { HookBus } from '../src/runtime/hooks.js';
-import { MCPManager, parseMcpConfig } from '../src/extensions/mcp.js';
+import { expandMcpEnvironment, MCPManager, parseMcpConfig } from '../src/extensions/mcp.js';
 import { RagStore } from '../src/extensions/rag.js';
 import { SkillLoader } from '../src/extensions/skills.js';
 import { createSubAgentTools } from '../src/extensions/subagents.js';
+import { NanoAgent } from '../src/agent.js';
 
 test('persists sessions and returns the latest items', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'nano-session-'));
@@ -27,6 +29,297 @@ test('persists sessions and returns the latest items', async () => {
 
   assert.deepEqual(await new FileSession(root, 'demo').getItems(1), [items[1]]);
   assert.deepEqual(await FileSession.list(root), ['demo']);
+});
+
+test('keeps runtime preferences isolated between sessions', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'nano-session-preferences-'));
+  const dataRoot = path.join(root, '.nano-agent');
+  const previous = {
+    session: process.env.AGENT_SESSION,
+    mode: process.env.AGENT_MODE,
+    output: process.env.OUTPUT_LEVEL,
+    model: process.env.OPENAI_MODEL,
+  };
+  process.env.AGENT_SESSION = 'first';
+  process.env.AGENT_MODE = 'general';
+  process.env.OUTPUT_LEVEL = 'tools';
+  process.env.OPENAI_MODEL = 'gpt-5.4-mini';
+  const agent = await NanoAgent.create({
+    provider: 'openai', workspaceRoot: root, dataRoot,
+    skillsRoot: path.join(root, 'skills'), mcpConfig: path.join(root, 'mcp.json'),
+    historyLimit: 40, contextWindow: 128_000, maxTurns: 20,
+  });
+  try {
+    await agent.switchMode('plan');
+    await agent.switchModel('gpt-5-mini');
+    await agent.setOutputLevel('trace');
+
+    await agent.switchSession('second');
+    let info = await agent.runtimeInfo();
+    assert.equal(info.mode.id, 'general');
+    assert.equal(info.model, 'gpt-5.4-mini');
+    assert.equal(info.outputLevel, 'tools');
+
+    await agent.switchMode('ultra');
+    await agent.switchModel('gpt-5.4');
+    await agent.setOutputLevel('answer');
+
+    await agent.switchSession('first');
+    info = await agent.runtimeInfo();
+    assert.equal(info.mode.id, 'plan');
+    assert.equal(info.model, 'gpt-5-mini');
+    assert.equal(info.outputLevel, 'trace');
+
+    await agent.switchSession('second');
+    info = await agent.runtimeInfo();
+    assert.equal(info.mode.id, 'ultra');
+    assert.equal(info.model, 'gpt-5.4');
+    assert.equal(info.outputLevel, 'answer');
+  } finally {
+    await agent.close();
+    if (previous.session === undefined) delete process.env.AGENT_SESSION;
+    else process.env.AGENT_SESSION = previous.session;
+    if (previous.mode === undefined) delete process.env.AGENT_MODE;
+    else process.env.AGENT_MODE = previous.mode;
+    if (previous.output === undefined) delete process.env.OUTPUT_LEVEL;
+    else process.env.OUTPUT_LEVEL = previous.output;
+    if (previous.model === undefined) delete process.env.OPENAI_MODEL;
+    else process.env.OPENAI_MODEL = previous.model;
+  }
+});
+
+test('releases an active run owner when stream setup fails', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'nano-stream-setup-failure-'));
+  const dataRoot = path.join(root, '.nano-agent');
+  const previousSession = process.env.AGENT_SESSION;
+  process.env.AGENT_SESSION = 'blocked';
+  const agent = await NanoAgent.create({
+    provider: 'openai', workspaceRoot: root, dataRoot,
+    skillsRoot: path.join(root, 'skills'), mcpConfig: path.join(root, 'mcp.json'),
+    historyLimit: 40, maxTurns: 20,
+  });
+  const ownerId = 'external-owner';
+  const release = registerSessionRunOwner(ownerId);
+  try {
+    await new FileSession(path.join(dataRoot, 'sessions'), 'blocked')
+      .beginRun('external work', 'external-run', ownerId);
+    await assert.rejects(agent.stream('should not start'), /活跃 Run 占用/);
+    await assert.doesNotReject(agent.switchSession('other'));
+  } finally {
+    release();
+    await agent.close();
+    if (previousSession === undefined) delete process.env.AGENT_SESSION;
+    else process.env.AGENT_SESSION = previousSession;
+  }
+});
+
+test('releases the active run when asynchronous Runner setup rejects', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'nano-runner-rejection-'));
+  const dataRoot = path.join(root, '.nano-agent');
+  const agent = await NanoAgent.create({
+    provider: 'openai', workspaceRoot: root, dataRoot,
+    skillsRoot: path.join(root, 'skills'), mcpConfig: path.join(root, 'mcp.json'),
+    historyLimit: 40, maxTurns: 20,
+  });
+  const runner = (agent as unknown as { runner: { run: (...args: unknown[]) => Promise<never> } }).runner;
+  runner.run = async () => { throw new Error('async runner setup failed'); };
+  try {
+    await assert.rejects(agent.stream('start'), /async runner setup failed/);
+    await assert.doesNotReject(agent.switchSession('after-failure'));
+  } finally {
+    await agent.close();
+  }
+});
+
+test('does not clear durable Session state while its Run is active', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'nano-active-clear-'));
+  const dataRoot = path.join(root, '.nano-agent');
+  const agent = await NanoAgent.create({
+    provider: 'openai', workspaceRoot: root, dataRoot,
+    skillsRoot: path.join(root, 'skills'), mcpConfig: path.join(root, 'mcp.json'),
+    historyLimit: 40, maxTurns: 20,
+  });
+  const runner = (agent as unknown as { runner: { run: (...args: unknown[]) => Promise<unknown> } }).runner;
+  runner.run = async () => ({});
+  try {
+    await agent.stream('still active');
+    await assert.rejects(agent.clearSession(), /仍有任务运行中/);
+    await agent.failRun(new Error('test cleanup'), true);
+  } finally {
+    await agent.close();
+  }
+});
+
+test('isolates transcript and context archives while sharing only explicit long-term memory', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'nano-session-context-isolation-'));
+  const dataRoot = path.join(root, '.nano-agent');
+  const sessionsRoot = path.join(dataRoot, 'sessions');
+  const first = new FileSession(sessionsRoot, 'first');
+  const second = new FileSession(sessionsRoot, 'second');
+  const firstItems = Array.from({ length: 6 }, (_, index) => [
+    { role: 'user', content: `FIRST_PRIVATE_REQUEST_${index}` },
+    { role: 'assistant', content: `FIRST_PRIVATE_ANSWER_${index}` },
+  ]).flat() as AgentInputItem[];
+  await first.addItems(firstItems);
+  await second.addItems([
+    { role: 'user', content: 'SECOND_PRIVATE_REQUEST' },
+    { role: 'assistant', content: 'SECOND_PRIVATE_ANSWER' },
+  ] as AgentInputItem[]);
+  await new MemoryStore(path.join(dataRoot, 'memories.json')).remember(
+    'SHARED_CONFIRMED_MEMORY',
+    'fact',
+    { source: 'user', confirmed: true, sourceSessionId: 'first' },
+  );
+
+  const previousSession = process.env.AGENT_SESSION;
+  process.env.AGENT_SESSION = 'first';
+  const agent = await NanoAgent.create({
+    provider: 'openai', workspaceRoot: root, dataRoot,
+    skillsRoot: path.join(root, 'skills'), mcpConfig: path.join(root, 'mcp.json'),
+    historyLimit: 4, contextWindow: 4_000, maxTurns: 20,
+  });
+  try {
+    let serialized = JSON.stringify(await agent.history());
+    assert.match(serialized, /FIRST_PRIVATE_REQUEST_0/);
+    assert.doesNotMatch(serialized, /SECOND_PRIVATE_REQUEST/);
+    assert.match(JSON.stringify(await agent.listMemories()), /SHARED_CONFIRMED_MEMORY/);
+
+    const compacted = await agent.compactContext();
+    assert.equal(compacted.changed, true);
+    assert.ok((await agent.contextInfo()).archivedItems > 0);
+
+    await agent.switchSession('second');
+    serialized = JSON.stringify(await agent.history());
+    assert.match(serialized, /SECOND_PRIVATE_REQUEST/);
+    assert.doesNotMatch(serialized, /FIRST_PRIVATE_REQUEST/);
+    assert.equal((await agent.contextInfo()).archivedItems, 0);
+    assert.match(JSON.stringify(await agent.listMemories()), /SHARED_CONFIRMED_MEMORY/);
+
+    const secondPlan = new PlanStore(path.join(dataRoot, 'plans.json'), 'second');
+    await secondPlan.setGoal('SECOND_DURABLE_GOAL');
+    await secondPlan.update([{ id: 'work', description: 'SECOND_PLAN', status: 'running' }]);
+    const secondTeam = new TeamTaskStore(path.join(dataRoot, 'teams.json'), 'second');
+    await secondTeam.set([
+      { id: 'inspect', description: 'SECOND_TEAM_A', role: 'explorer', dependencies: [], paths: [] },
+      { id: 'review', description: 'SECOND_TEAM_B', role: 'reviewer', dependencies: [], paths: [] },
+    ]);
+    await agent.switchMode('ultra');
+    await agent.clearSession();
+    assert.deepEqual(await agent.history(), []);
+    assert.deepEqual(await agent.currentPlan(), []);
+    assert.equal(await agent.currentGoal(), undefined);
+    assert.deepEqual(await agent.currentTeam(), []);
+    assert.equal((await agent.runtimeInfo()).mode.id, 'ultra');
+    assert.match(JSON.stringify(await agent.listMemories()), /SHARED_CONFIRMED_MEMORY/);
+    await agent.switchSession('first');
+    serialized = JSON.stringify(await agent.history());
+    assert.match(serialized, /FIRST_PRIVATE_REQUEST_0/);
+    assert.doesNotMatch(serialized, /SECOND_PRIVATE_REQUEST/);
+    assert.equal((await agent.contextInfo()).archivedItems, compacted.archive?.coveredItems);
+  } finally {
+    await agent.close();
+    if (previousSession === undefined) delete process.env.AGENT_SESSION;
+    else process.env.AGENT_SESSION = previousSession;
+  }
+});
+
+test('uses DeepSeek V4 Pro by default and lists both V4 models', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'nano-deepseek-models-'));
+  const previous = {
+    session: process.env.AGENT_SESSION,
+    model: process.env.DEEPSEEK_MODEL,
+    key: process.env.DEEPSEEK_API_KEY,
+  };
+  process.env.AGENT_SESSION = 'deepseek-default';
+  delete process.env.DEEPSEEK_MODEL;
+  process.env.DEEPSEEK_API_KEY = 'test-key';
+  const agent = await NanoAgent.create({
+    provider: 'deepseek', workspaceRoot: root, dataRoot: path.join(root, '.nano-agent'),
+    skillsRoot: path.join(root, 'skills'), mcpConfig: path.join(root, 'mcp.json'),
+    historyLimit: 40, maxTurns: 20,
+  });
+  try {
+    assert.equal((await agent.runtimeInfo()).model, 'deepseek-v4-pro');
+    assert.deepEqual(agent.availableModels().slice(0, 2), ['deepseek-v4-pro', 'deepseek-v4-flash']);
+    assert.equal((await agent.contextInfo()).contextWindow, 1_048_576);
+    assert.equal((await agent.contextInfo()).outputReserve, 65_536);
+    await agent.switchModel('deepseek-v4-flash');
+    assert.equal((await agent.contextInfo()).contextWindow, 128_000);
+    assert.equal((await agent.contextInfo()).outputReserve, 16_384);
+    await agent.switchModel('deepseek-v4-pro');
+    assert.equal((await agent.contextInfo()).contextWindow, 1_048_576);
+  } finally {
+    await agent.close();
+    if (previous.session === undefined) delete process.env.AGENT_SESSION;
+    else process.env.AGENT_SESSION = previous.session;
+    if (previous.model === undefined) delete process.env.DEEPSEEK_MODEL;
+    else process.env.DEEPSEEK_MODEL = previous.model;
+    if (previous.key === undefined) delete process.env.DEEPSEEK_API_KEY;
+    else process.env.DEEPSEEK_API_KEY = previous.key;
+  }
+});
+
+test('restores the complete session state after a process restart', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'nano-session-restart-'));
+  const dataRoot = path.join(root, '.nano-agent');
+  const sessions = path.join(dataRoot, 'sessions');
+  const previous = {
+    session: process.env.AGENT_SESSION,
+    mode: process.env.AGENT_MODE,
+    output: process.env.OUTPUT_LEVEL,
+    model: process.env.OPENAI_MODEL,
+  };
+  process.env.AGENT_SESSION = 'durable';
+  process.env.AGENT_MODE = 'general';
+  process.env.OUTPUT_LEVEL = 'tools';
+  process.env.OPENAI_MODEL = 'gpt-5.4-mini';
+  const config = {
+    provider: 'openai' as const, workspaceRoot: root, dataRoot,
+    skillsRoot: path.join(root, 'skills'), mcpConfig: path.join(root, 'mcp.json'),
+    historyLimit: 40, contextWindow: 128_000, maxTurns: 20,
+  };
+  let first: NanoAgent | undefined;
+  let reopened: NanoAgent | undefined;
+  try {
+    first = await NanoAgent.create(config);
+    await first.switchMode('ultra');
+    await first.switchModel('gpt-5.4');
+    await first.setOutputLevel('trace');
+    await new FileSession(sessions, 'durable').addItems([
+      { role: 'user', content: '继续完整状态恢复' },
+    ] as AgentInputItem[]);
+    const plans = new PlanStore(path.join(dataRoot, 'plans.json'), 'durable');
+    await plans.update([
+      { id: 'inspect', description: '检查状态', status: 'completed' },
+      { id: 'build', description: '继续实现', status: 'running' },
+    ]);
+    await new FileSession(sessions, 'durable').beginRun('继续未完成任务');
+    await first.close();
+    first = undefined;
+
+    reopened = await NanoAgent.create(config);
+    const info = await reopened.runtimeInfo();
+    assert.equal(info.sessionId, 'durable');
+    assert.equal(info.mode.id, 'ultra');
+    assert.equal(info.model, 'gpt-5.4');
+    assert.equal(info.outputLevel, 'trace');
+    assert.deepEqual((await reopened.currentPlan()).map((step) => step.status), ['completed', 'running']);
+    assert.match(JSON.stringify(await reopened.history()), /继续完整状态恢复/);
+    assert.equal((await reopened.recoveryInfo())?.status, 'interrupted');
+    assert.match(await reopened.resumePrompt(), /继续未完成任务/);
+    assert.match(await reopened.resumePrompt(), /继续实现/);
+  } finally {
+    await first?.close();
+    await reopened?.close();
+    if (previous.session === undefined) delete process.env.AGENT_SESSION;
+    else process.env.AGENT_SESSION = previous.session;
+    if (previous.mode === undefined) delete process.env.AGENT_MODE;
+    else process.env.AGENT_MODE = previous.mode;
+    if (previous.output === undefined) delete process.env.OUTPUT_LEVEL;
+    else process.env.OUTPUT_LEVEL = previous.output;
+    if (previous.model === undefined) delete process.env.OPENAI_MODEL;
+    else process.env.OPENAI_MODEL = previous.model;
+  }
 });
 
 test('loads user and project NANO.md on every turn with project precedence', async () => {
@@ -46,6 +339,15 @@ test('loads user and project NANO.md on every turn with project precedence', asy
   assert.match((await loader.load()).instructions, /Run npm test/);
 });
 
+test('reads only the bounded prefix of oversized persistent guidance', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'nano-guidance-limit-'));
+  await writeFile(path.join(root, 'NANO.md'), `PREFIX-${'x'.repeat(100_000)}-TAIL`);
+  const snapshot = await new GuidanceLoader(root, path.join(root, 'missing.md'), 20).load();
+  assert.equal(snapshot.files[0]?.truncated, true);
+  assert.match(snapshot.instructions, /PREFIX/);
+  assert.doesNotMatch(snapshot.instructions, /TAIL/);
+});
+
 test('serializes concurrent session writes and keeps an in-process cache', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'nano-session-concurrent-'));
   const session = new FileSession(root, 'demo');
@@ -60,6 +362,7 @@ test('summarizes and sorts sessions from recent conversation content', async () 
   const root = await mkdtemp(path.join(os.tmpdir(), 'nano-session-summary-'));
   const session = new FileSession(root, 'opaque-id');
   await session.addItems([
+    { role: 'user', content: '你好' },
     { role: 'user', content: '帮我优化 NanoAgent 的终端交互体验' },
     { role: 'user', content: '还要支持任务排队' },
   ] as AgentInputItem[]);
@@ -68,7 +371,123 @@ test('summarizes and sorts sessions from recent conversation content', async () 
   assert.equal(summary?.id, 'opaque-id');
   assert.equal(summary?.title, '优化 NanoAgent 的终端交互体验');
   assert.equal(summary?.preview, '还要支持任务排队');
-  assert.equal(summary?.turns, 2);
+  assert.equal(summary?.turns, 3);
+  assert.equal(summary?.recoverable, false);
+});
+
+test('orders session summaries by latest activity', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'nano-session-order-'));
+  const older = new FileSession(root, 'older');
+  const newer = new FileSession(root, 'newer');
+  await older.addItems([{ role: 'user', content: '较早的任务' }] as AgentInputItem[]);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  await newer.addItems([{ role: 'user', content: '较新的任务' }] as AgentInputItem[]);
+  assert.deepEqual((await FileSession.listSummaries(root)).map((item) => item.id), ['newer', 'older']);
+
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  await older.addItems([{ role: 'user', content: '重新继续这个任务' }] as AgentInputItem[]);
+  assert.deepEqual((await FileSession.listSummaries(root)).map((item) => item.id), ['older', 'newer']);
+});
+
+test('persists run checkpoints and recovers a process exit at the latest progress point', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'nano-session-recovery-'));
+  const session = new FileSession(root, 'demo');
+  await session.beginRun('继续实现上下文管理');
+  await session.updateRunProgress('正在执行 read_file', 'read_file · src/core/context.ts');
+
+  const reopened = new FileSession(root, 'demo');
+  const checkpoint = await reopened.recoverInterruptedRun();
+  assert.equal(checkpoint?.status, 'interrupted');
+  assert.equal(checkpoint?.input, '继续实现上下文管理');
+  assert.match(checkpoint?.lastEvent ?? '', /context\.ts/);
+  assert.match(checkpoint?.nextAction ?? '', /继续/);
+
+  const [summary] = await FileSession.listSummaries(root);
+  assert.equal(summary?.recoverable, true);
+  assert.match(summary?.progress ?? '', /context\.ts/);
+});
+
+test('keeps completed and failed run outcomes in session metadata', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'nano-session-outcome-'));
+  const session = new FileSession(root, 'demo');
+  await session.beginRun('first');
+  await session.completeRun('完成结果');
+  assert.equal((await session.getCheckpoint())?.status, 'completed');
+  assert.match((await session.getCheckpoint())?.answer ?? '', /完成结果/);
+
+  await session.beginRun('second');
+  await session.failRun('用户停止', true);
+  assert.equal((await session.getCheckpoint())?.status, 'interrupted');
+  assert.match((await session.getCheckpoint())?.error ?? '', /用户停止/);
+});
+
+test('resumes an interrupted ordinary task without requiring a Goal', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'nano-runtime-resume-'));
+  const dataRoot = path.join(root, '.nano-agent');
+  const sessionId = 'resume-test';
+  const session = new FileSession(path.join(dataRoot, 'sessions'), sessionId);
+  await session.beginRun('实现任务恢复能力');
+  await session.updateRunProgress('正在执行测试', 'npm test · 42 passed');
+  const previousSession = process.env.AGENT_SESSION;
+  process.env.AGENT_SESSION = sessionId;
+  const agent = await NanoAgent.create({
+    provider: 'openai',
+    workspaceRoot: root,
+    dataRoot,
+    skillsRoot: path.join(root, 'skills'),
+    mcpConfig: path.join(root, 'mcp.json'),
+    historyLimit: 40,
+    contextWindow: 128_000,
+    maxTurns: 20,
+  });
+  try {
+    assert.equal((await agent.recoveryInfo())?.status, 'interrupted');
+    const prompt = await agent.resumePrompt();
+    assert.match(prompt, /实现任务恢复能力/);
+    assert.match(prompt, /npm test · 42 passed/);
+    assert.match(prompt, /不要重复已经完成的步骤/);
+
+    const switched = new FileSession(path.join(dataRoot, 'sessions'), 'switched');
+    await switched.beginRun('切换后恢复的任务');
+    await switched.updateRunProgress('正在修改文件', 'write_file · src/index.ts');
+    await agent.switchSession('switched');
+    assert.equal((await agent.recoveryInfo())?.status, 'interrupted');
+    assert.match(await agent.resumePrompt(), /write_file · src\/index\.ts/);
+  } finally {
+    await agent.close();
+    if (previousSession === undefined) delete process.env.AGENT_SESSION;
+    else process.env.AGENT_SESSION = previousSession;
+  }
+});
+
+test('manually compacts a session without deleting its archived transcript', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'nano-runtime-compact-'));
+  const dataRoot = path.join(root, '.nano-agent');
+  const sessionId = 'compact-test';
+  const session = new FileSession(path.join(dataRoot, 'sessions'), sessionId);
+  const items = Array.from({ length: 5 }, (_, index) => [
+    { role: 'user', content: `question-${index}` },
+    { role: 'assistant', content: `answer-${index}` },
+  ]).flat() as AgentInputItem[];
+  await session.addItems(items);
+  const previousSession = process.env.AGENT_SESSION;
+  process.env.AGENT_SESSION = sessionId;
+  const agent = await NanoAgent.create({
+    provider: 'openai', workspaceRoot: root, dataRoot,
+    skillsRoot: path.join(root, 'skills'), mcpConfig: path.join(root, 'mcp.json'),
+    historyLimit: 40, contextWindow: 128_000, maxTurns: 20,
+  });
+  try {
+    const result = await agent.compactContext();
+    assert.equal(result.changed, true);
+    assert.equal(result.archive?.coveredItems, 6);
+    assert.equal((await agent.history()).length, items.length);
+    assert.equal((await new FileSession(path.join(dataRoot, 'sessions'), sessionId).getContextArchive())?.strategy, 'full');
+  } finally {
+    await agent.close();
+    if (previousSession === undefined) delete process.env.AGENT_SESSION;
+    else process.env.AGENT_SESSION = previousSession;
+  }
 });
 
 test('removes summaries accidentally persisted by older context management', async () => {
@@ -91,23 +510,66 @@ test('repairs dangling tool calls left by an interrupted task', async () => {
     { type: 'function_call', name: 'run_shell', callId: 'dangling', arguments: '{}' },
     { type: 'function_call', name: 'read_file', callId: 'paired', arguments: '{}' },
     { type: 'function_call_result', name: 'read_file', callId: 'paired', output: 'ok' },
+    { type: 'function_call_result', name: 'read_file', callId: 'paired', output: 'duplicate' },
   ] as unknown as AgentInputItem[]);
 
-  assert.equal(await session.repairToolPairs(), 1);
+  assert.equal(await session.repairToolPairs(), 2);
   const serialized = JSON.stringify(await session.getItems());
   assert.doesNotMatch(serialized, /dangling/);
+  assert.doesNotMatch(serialized, /duplicate/);
   assert.match(serialized, /paired/);
 });
 
 test('stores, retrieves and forgets long-term memories', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'nano-memory-'));
   const store = new MemoryStore(path.join(root, 'memories.json'));
-  const memory = await store.remember('用户偏好 TypeScript', 'preference');
+  const memory = await store.remember('用户偏好 TypeScript', 'preference', { confirmed: true });
 
   assert.equal((await store.search('TypeScript 偏好'))[0]?.id, memory.id);
   assert.deepEqual(await store.search('完全无关'), []);
   assert.equal(await store.forget(memory.id), true);
   assert.deepEqual(await store.list(), []);
+});
+
+test('requires an explicit user confirmation before a memory tool can share across sessions', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'nano-memory-confirmation-'));
+  const store = new MemoryStore(path.join(root, 'memories.json'));
+  let input = '我的编辑器是 Vim';
+  const [remember] = store.createTools(() => ({ input, sessionId: 'private-a' }));
+  assert.ok(remember && 'invoke' in remember);
+  const invoke = () => remember!.invoke(new RunContext({}), JSON.stringify({
+    content: '用户使用 Vim', type: 'preference', importance: 3,
+  }));
+
+  assert.match(String(await invoke()), /没有明确确认/);
+  assert.deepEqual(await store.list(), []);
+
+  input = '请记住：我的编辑器是 Vim，作为长期记忆';
+  await invoke();
+  const [saved] = await store.list();
+  assert.equal(saved?.sourceSessionId, 'private-a');
+  assert.ok(saved?.confirmedAt);
+});
+
+test('does not treat memory questions or negated requests as write consent', () => {
+  assert.equal(explicitlyRequestsMemory('请记住我喜欢简洁输出'), true);
+  assert.equal(explicitlyRequestsMemory('不要记住我的密码'), false);
+  assert.equal(explicitlyRequestsMemory('你还记住我什么？'), false);
+  assert.equal(explicitlyRequestsMemory('please do not remember this password'), false);
+});
+
+test('does not inject legacy or unconfirmed memory across sessions', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'nano-memory-unconfirmed-'));
+  const file = path.join(root, 'memories.json');
+  await writeFile(file, JSON.stringify([
+    { id: 'legacy', type: 'fact', content: 'PRIVATE_LEGACY_SENTINEL', createdAt: new Date().toISOString() },
+    { id: 'confirmed', type: 'fact', content: 'SHARED_CONFIRMED_SENTINEL', createdAt: new Date().toISOString(), confirmedAt: new Date().toISOString() },
+  ]));
+  const store = new MemoryStore(file);
+
+  assert.deepEqual((await store.search('PRIVATE_LEGACY_SENTINEL')).map((item) => item.id), []);
+  assert.deepEqual((await store.search('SHARED_CONFIRMED_SENTINEL')).map((item) => item.id), ['confirmed']);
+  assert.deepEqual((await store.listConfirmed()).map((item) => item.id), ['confirmed']);
 });
 
 test('loads skill metadata and content on demand', async () => {
@@ -141,6 +603,24 @@ test('reports invalid skills without breaking valid skill discovery', async () =
   assert.equal(loader.diagnostics().length, 1);
 });
 
+test('rejects oversized skill instructions and resources before loading them fully', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'nano-skill-limit-'));
+  const oversized = path.join(root, 'oversized');
+  const valid = path.join(root, 'valid');
+  await mkdir(oversized, { recursive: true });
+  await mkdir(valid, { recursive: true });
+  await writeFile(path.join(oversized, 'SKILL.md'), 'x'.repeat(512_001));
+  await writeFile(path.join(valid, 'SKILL.md'), '---\nname: valid\ndescription: Valid\n---\nUse it.');
+  await writeFile(path.join(valid, 'large.md'), 'x'.repeat(256_001));
+  const loader = new SkillLoader(root);
+  await loader.load();
+
+  assert.equal(loader.get('oversized'), undefined);
+  assert.ok(loader.get('valid'));
+  assert.match(loader.diagnostics().join('\n'), /SKILL.md 超过 512KB/);
+  await assert.rejects(loader.readResource('valid', 'large.md'), /超过 256KB/);
+});
+
 test('indexes and searches local documents without a vector database', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'nano-rag-'));
   const docs = path.join(root, 'knowledge');
@@ -152,6 +632,20 @@ test('indexes and searches local documents without a vector database', async () 
   assert.deepEqual(await rag.index('knowledge'), { files: 1, chunks: 1, embeddings: false });
   assert.equal((await rag.search('TypeScript'))[0]?.source, 'knowledge/agent.md');
   assert.ok((await readFile(indexFile, 'utf8')).includes('NanoAgent'));
+});
+
+test('never indexes private session runtime data into shared RAG', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'nano-rag-private-'));
+  const runtime = path.join(root, '.nano-agent');
+  await mkdir(runtime, { recursive: true });
+  await writeFile(path.join(root, 'public.md'), 'PUBLIC_KNOWLEDGE_SENTINEL');
+  await writeFile(path.join(runtime, 'private.txt'), 'PRIVATE_SESSION_SENTINEL');
+  const rag = new RagStore(root, path.join(runtime, 'rag-index.json'), undefined, [runtime]);
+
+  await rag.index('.');
+  assert.equal((await rag.search('PUBLIC_KNOWLEDGE_SENTINEL'))[0]?.source, 'public.md');
+  assert.deepEqual(await rag.search('PRIVATE_SESSION_SENTINEL'), []);
+  await assert.rejects(rag.index('.nano-agent'), /私有运行数据/);
 });
 
 test('rebuilds RAG embeddings when the embedding model changes', async () => {
@@ -193,6 +687,7 @@ test('context keeps recent history and injects memory, RAG and plan', async () =
   assert.match(manager.summarizeHistory(history), /old/);
   const instructions = manager.buildInstructions({
     baseInstructions: 'base',
+    sessionState: 'Session：demo\nPlan：1/2 completed · 当前阶段：2 test',
     historySummary: 'older conversation',
     skillCatalog: '- review: code',
     memories: [{ id: 'm1', type: 'fact', content: 'uses TS', createdAt: '' }],
@@ -205,6 +700,9 @@ test('context keeps recent history and injects memory, RAG and plan', async () =
   assert.match(instructions, /doc\.md/);
   assert.match(instructions, /running/);
   assert.match(instructions, /ship/);
+  assert.match(instructions, /当前会话状态/);
+  assert.match(instructions, /Session：demo/);
+  assert.match(instructions, /Plan：1\/2 completed/);
 });
 
 test('context trimming keeps tool calls paired and never persists generated summaries', async () => {
@@ -253,6 +751,93 @@ test('caps dynamic instructions within their token budget', () => {
   assert.ok(estimateTokens(instructions) <= 2_000);
 });
 
+test('budgets the complete model request including input, instructions, tools and output reserve', () => {
+  const contextWindow = 4_000;
+  const outputReserveTokens = 600;
+  const manager = new ContextManager(100, contextWindow, 0.55, outputReserveTokens);
+  const tools = [{
+    type: 'function',
+    name: 'read_file',
+    description: 'Read part of a workspace file and return its contents.',
+    parameters: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Workspace-relative file path.' },
+        lineStart: { type: 'number' },
+        lineEnd: { type: 'number' },
+      },
+      required: ['path'],
+    },
+  }];
+  const budget = manager.requestBudget(tools);
+
+  assert.equal(budget.contextWindow, contextWindow);
+  assert.equal(budget.outputReserveTokens, outputReserveTokens);
+  assert.ok(budget.toolSchemaTokens >= estimateTokens(tools));
+  assert.equal(
+    budget.inputBudget,
+    contextWindow - outputReserveTokens - budget.toolSchemaTokens,
+  );
+
+  const instructionBudget = Math.min(800, budget.inputBudget);
+  const instructions = manager.buildInstructions({
+    baseInstructions: `base ${'规则'.repeat(2_000)}`,
+    historySummary: '',
+    skillCatalog: '',
+    memories: [],
+    documents: [],
+    plan: [],
+  }, instructionBudget);
+  const messageBudget = budget.inputBudget - estimateTokens(instructions);
+  const currentInput = `current-input-start ${'当前输入'.repeat(4_000)} current-input-end`;
+  const effective = manager.effectiveHistory(
+    [{ role: 'user', content: `old-history ${'历史'.repeat(1_000)}` } as AgentInputItem],
+    [{ role: 'user', content: currentInput } as AgentInputItem],
+    undefined,
+    messageBudget,
+  );
+  const serialized = JSON.stringify(effective);
+
+  assert.ok(estimateTokens(instructions) <= instructionBudget);
+  assert.ok(estimateTokens(effective) <= messageBudget);
+  assert.ok(
+    estimateTokens(instructions)
+      + estimateTokens(effective)
+      + budget.toolSchemaTokens
+      + budget.outputReserveTokens
+      <= contextWindow,
+  );
+  assert.match(serialized, /current-input-start/);
+  assert.doesNotMatch(serialized, /current-input-end/);
+});
+
+test('reports raw, effective and archived context with non-overlapping semantics', () => {
+  const manager = new ContextManager(100, 4_000, 0.5);
+  const history = [
+    { role: 'user', content: 'archived question' },
+    { role: 'assistant', content: 'archived answer' },
+    { role: 'user', content: 'visible question' },
+    { role: 'assistant', content: 'visible answer' },
+  ] as AgentInputItem[];
+  const archive = {
+    coveredItems: 2,
+    summary: 'summary of the archived turn',
+    strategy: 'collapse' as const,
+    originalTokens: estimateTokens(history.slice(0, 2)),
+    compactedTokens: estimateTokens('summary of the archived turn'),
+    updatedAt: new Date().toISOString(),
+  };
+  const input = [{ role: 'user', content: 'current question' } as AgentInputItem];
+  const effective = manager.effectiveHistory(history, input, archive);
+  const stats = manager.stats(history, effective, archive, input.length);
+
+  assert.equal(stats.rawTokens, estimateTokens(history));
+  assert.equal(stats.effectiveTokens, estimateTokens(effective));
+  assert.equal(stats.archiveTokens, archive.compactedTokens);
+  assert.equal(stats.coveredItems, archive.coveredItems);
+  assert.ok(stats.strategies.includes('context-collapse'));
+});
+
 test('drops an oversized tool-heavy turn instead of violating the token budget', async () => {
   const manager = new ContextManager(100, 4_000, 0.5);
   const history = [
@@ -266,6 +851,64 @@ test('drops an oversized tool-heavy turn instead of violating the token budget',
   ] as unknown as AgentInputItem[];
   const next = await manager.sessionInput(history, [{ role: 'user', content: 'new task' }]);
   assert.deepEqual(next, [{ role: 'user', content: 'new task' }]);
+});
+
+test('persists context collapse while keeping the raw transcript unchanged', async () => {
+  const manager = new ContextManager(4, 4_000, 0.5);
+  const history = Array.from({ length: 6 }, (_, index) => [
+    { type: 'message', role: 'user', content: `task-${index}` },
+    { type: 'function_call', name: 'read_file', callId: `call-${index}`, arguments: '{}' },
+    { type: 'function_call_result', name: 'read_file', callId: `call-${index}`, output: `result-${index} ${'内容'.repeat(600)}` },
+    { type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: `done-${index}` }] },
+  ]).flat() as unknown as AgentInputItem[];
+  const raw = JSON.stringify(history);
+
+  const archive = manager.compactArchive(history, undefined, 'collapse');
+  assert.ok(archive);
+  assert.ok((archive?.coveredItems ?? 0) > 0);
+  assert.match(archive?.summary ?? '', /task-/);
+  const effective = manager.effectiveHistory(history, [{ role: 'user', content: 'next' } as AgentInputItem], archive);
+  assert.equal(JSON.stringify(history), raw);
+  assert.match(JSON.stringify(effective), /next/);
+  assert.ok(estimateTokens(effective) < estimateTokens(history));
+
+  const stats = manager.stats(history, effective, archive, 1);
+  assert.ok(stats.strategies.includes('context-collapse'));
+  assert.ok(stats.coveredItems > 0);
+});
+
+test('full compact archives all but the latest two complete turns', () => {
+  const manager = new ContextManager(100, 128_000);
+  const history = Array.from({ length: 5 }, (_, index) => [
+    { role: 'user', content: `question-${index}` },
+    { role: 'assistant', content: `answer-${index}` },
+  ]).flat() as AgentInputItem[];
+
+  const archive = manager.compactArchive(history, undefined, 'full');
+  assert.equal(archive?.strategy, 'full');
+  assert.equal(archive?.coveredItems, 6);
+  assert.match(archive?.summary ?? '', /question-0/);
+  assert.doesNotMatch(archive?.summary ?? '', /question-4/);
+  const effective = manager.effectiveHistory(history, [], archive);
+  assert.match(JSON.stringify(effective), /question-3/);
+  assert.match(JSON.stringify(effective), /question-4/);
+});
+
+test('microcompacts only older tool results in the model-facing view', () => {
+  const manager = new ContextManager(100, 128_000);
+  const history = Array.from({ length: 4 }, (_, index) => [
+    { role: 'user', content: `question-${index}` },
+    { type: 'function_call', name: 'read_file', callId: `call-${index}`, arguments: '{}' },
+    { type: 'function_call_result', name: 'read_file', callId: `call-${index}`, output: `start-${index} ${'x'.repeat(1_000)} end-${index}` },
+    { role: 'assistant', content: `answer-${index}` },
+  ]).flat() as unknown as AgentInputItem[];
+
+  const effective = manager.effectiveHistory(history, []);
+  const serialized = JSON.stringify(effective);
+  assert.match(serialized, /较早工具结果已压缩/);
+  assert.doesNotMatch(serialized, /end-0/);
+  assert.match(serialized, /end-3/);
+  assert.equal(JSON.stringify(history).includes('较早工具结果已压缩'), false);
 });
 
 test('keeps plans isolated by session and writes JSONL traces', async () => {
@@ -292,11 +935,26 @@ test('keeps plans isolated by session and writes JSONL traces', async () => {
   const trace = await readFile(path.join(root, 'traces', 'first.jsonl'), 'utf8');
   assert.match(trace, /"type":"turn_end"/);
   assert.match(trace, /"answer":"done"/);
+  assert.equal((await stat(path.join(root, 'traces'))).mode & 0o777, 0o700);
+  assert.equal((await stat(path.join(root, 'traces', 'first.jsonl'))).mode & 0o777, 0o600);
 
   const rotating = new TraceStore(path.join(root, 'rotating'), 180);
   await rotating.record('demo', 'status', { detail: 'x'.repeat(120) });
   await rotating.record('demo', 'status', { detail: 'y'.repeat(120) });
   assert.match(await readFile(path.join(root, 'rotating', 'demo.1.jsonl'), 'utf8'), /xxxx/);
+});
+
+test('binds an in-flight plan read to the session that started it', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'nano-plan-read-isolation-'));
+  const plans = new PlanStore(path.join(root, 'plans.json'), 'first');
+  await plans.update([{ id: 'a', description: 'FIRST_ONLY', status: 'running' }]);
+  plans.useSession('second');
+  await plans.update([{ id: 'b', description: 'SECOND_ONLY', status: 'running' }]);
+  plans.useSession('first');
+
+  const firstRead = plans.get();
+  plans.useSession('second');
+  assert.equal((await firstRead)[0]?.description, 'FIRST_ONLY');
 });
 
 test('serializes concurrent plan and goal mutations', async () => {
@@ -312,11 +970,54 @@ test('serializes concurrent plan and goal mutations', async () => {
   assert.equal((await plans.getGoal())?.checkpoint, 'started');
 });
 
+test('emits plan snapshots after task updates', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'nano-plan-events-'));
+  const plans = new PlanStore(path.join(root, 'plans.json'), 'demo');
+  const snapshots: string[][] = [];
+  plans.onChange((sessionId, steps) => {
+    assert.equal(sessionId, 'demo');
+    snapshots.push(steps.map((step) => `${step.id}:${step.status}`));
+  });
+
+  await plans.update([
+    { id: 'inspect', description: '检查', status: 'completed' },
+    { id: 'build', description: '实现', status: 'running' },
+  ]);
+  assert.deepEqual(snapshots, [['inspect:completed', 'build:running']]);
+});
+
 test('migrates legacy MCP config and accepts Streamable HTTP config', () => {
   const legacy = parseMcpConfig({ servers: { fs: { command: 'npx', args: ['server'] } } });
   const modern = parseMcpConfig({ mcpServers: { remote: { type: 'http', url: 'https://example.com/mcp' } } });
   assert.equal('command' in legacy.fs!, true);
   assert.equal('url' in modern.remote!, true);
+});
+
+test('requires an explicit per-server allowlist for MCP environment expansion', () => {
+  const previous = process.env.MCP_TEST_TOKEN;
+  process.env.MCP_TEST_TOKEN = 'allowed-value';
+  try {
+    assert.equal(expandMcpEnvironment('Bearer ${MCP_TEST_TOKEN}', ['MCP_TEST_TOKEN']), 'Bearer allowed-value');
+    assert.throws(() => expandMcpEnvironment('${MCP_TEST_TOKEN}'), /allowedEnv/);
+  } finally {
+    if (previous === undefined) delete process.env.MCP_TEST_TOKEN;
+    else process.env.MCP_TEST_TOKEN = previous;
+  }
+});
+
+test('does not execute an untrusted workspace MCP configuration', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'nano-mcp-untrusted-'));
+  const marker = path.join(root, 'executed.txt');
+  const config = path.join(root, 'mcp.json');
+  await writeFile(config, JSON.stringify({ mcpServers: { untrusted: {
+    command: process.execPath,
+    args: ['-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'executed')`],
+  } } }));
+  const manager = new MCPManager(config, root, { enabled: false, disabledReason: 'workspace not trusted' });
+
+  assert.deepEqual(await manager.connect(), []);
+  await assert.rejects(access(marker), /ENOENT/);
+  assert.match(manager.statuses()[0]?.error ?? '', /not trusted/);
 });
 
 test('keeps valid MCP definitions when another config entry is invalid', async () => {
@@ -363,4 +1064,16 @@ test('emits lightweight runtime lifecycle hooks', async () => {
   bus.on((event) => { seen.push(event.type); });
   await bus.emit({ type: 'run_start', sessionId: 'demo', input: 'hello' });
   assert.deepEqual(seen, ['run_start']);
+});
+
+test('isolates hook failures from the Agent run lifecycle', async () => {
+  const bus = new HookBus();
+  const seen: string[] = [];
+  bus.on(() => { throw new Error('broken trace sink'); });
+  bus.on((event) => { seen.push(event.type); });
+
+  await bus.emit({ type: 'run_end', sessionId: 'demo', answer: 'done' });
+
+  assert.deepEqual(seen, ['run_end']);
+  assert.match(bus.diagnostics()[0]?.error ?? '', /broken trace sink/);
 });

@@ -1,6 +1,6 @@
 # NanoAgent Architecture
 
-NanoAgent 是轻量级通用 Agent：面向真实文件、命令、检索、知识与外部系统任务，同时保持单进程、本地优先和可直接阅读的运行内核。
+NanoAgent 同时是轻量级通用本地 Agent 产品和轻量多 Agent 编排框架：面向真实文件、命令、检索、知识与外部系统任务，同时保持单进程、本地优先和可直接阅读的运行内核。
 
 ## 设计原则
 
@@ -22,13 +22,19 @@ CLI
 ├── terminal.ts          事件渲染
 └── runtime/
     ├── nano-agent.ts    组合根与一轮运行
+    ├── components.ts    模型、状态存储和扩展初始化
+    ├── session-state.ts Session 摘要与 best-effort 恢复语义
     ├── model.ts         OpenAI / DeepSeek 模型工厂
     ├── instructions.ts  基础指令与模式
-    ├── tool-policy.ts   模式工具白名单
+    ├── tool-policy.ts   模式、角色与权限工具策略
+    ├── tool-ledger.ts   本地副作用执行账本包装
+    ├── run-outcome.ts   完成、取消与审批中断判定
     ├── control.ts       Agent 可调用的运行时控制与延迟 Effects
     └── hooks.ts         生命周期事件总线
         ├── core/
         │   ├── context.ts  Token Budget 与动态上下文
+        │   ├── state-file.ts 跨实例/进程原子 JSON 状态
+        │   ├── execution-ledger.ts Function Tool 副作用账本
         │   ├── guidance.ts 用户级/项目级 NANO.md
         │   ├── session.ts  Agents SDK Session
         │   ├── memory.ts   跨会话记忆
@@ -50,13 +56,13 @@ CLI
 
 ```text
 1. CLI 记录用户输入并创建 AbortSignal
-2. Session 修复中断留下的孤立 Tool Call
-3. NANO.md、Memory、RAG、Plan、Goal、Team task list、Session 并行读取
-4. ContextManager 按 Token Budget 选择近期完整轮次
-5. 持久指令、较早历史、Skill Catalog、Memory、RAG、Goal 被组装为动态 Instructions
+2. Session 写入 `running` checkpoint，并修复中断留下的孤立 Tool Call
+3. NANO.md、Memory、RAG、Plan、Goal、Team task list、Session 与 ContextArchive 并行读取
+4. ContextManager 执行 microcompact、context collapse 和完整轮次 Token Budget 选择
+5. 持久指令、ContextArchive、恢复检查点、Skill Catalog、Memory、RAG、Goal 被组装为动态 Instructions
 6. Tool policy 根据 General / Plan / Ultra 选择工具、MCP 和受控 SubAgent
 7. Runner 流式执行，TerminalRenderer 分级展示事件
-8. SDK 追加完整 Session，HookBus 记录生命周期 Trace
+8. SDK 追加完整 Session，Runtime 把 checkpoint 落为 completed / interrupted / failed，HookBus 记录生命周期 Trace
 9. 当前回答完成后应用模型请求的 Session、输出或退出 Effects
 ```
 
@@ -68,7 +74,27 @@ CLI
 user → function_call → function_call_result → assistant
 ```
 
-较早历史被提取为紧凑的用户、助手、工具调用和工具结果摘要，只进入本轮 Instructions；完整原始 Session 不会被覆盖，也不会持久化伪用户摘要。
+较早历史被提取为紧凑的用户、助手、工具调用和工具结果摘要，只进入本轮 Instructions；完整原始 Session 不会被覆盖，也不会持久化伪用户摘要。上下文策略按顺序为：旧 Tool Result microcompact → 持久 context collapse / `/compact` full compact → 完整轮次 PTL truncation。
+
+Context Window 由当前模型 Profile 提供，而不是按 Provider 使用同一个常量。Profile 同时定义输出预留；模型切换和 Session 恢复会原子更新 Model 与 ContextManager。每轮先扣除输出预留、已知 Function Tool Schema 和协议/MCP 安全余量，再在剩余输入预算内组装 Instructions、历史与当前输入；超长当前输入也必须截断，不能绕过总预算。SDK 返回 usage 时，状态栏优先展示最后一次真实请求的 input tokens，`/context` 另列整轮累计用量；Provider 未返回 usage 时明确保留为未知，不把本地估算冒充实际值。
+
+## Session 恢复与存档
+
+Session JSON 同时保存三类互不替代的数据：完整 SDK transcript、最近 `RunCheckpoint`、`ContextArchive`。原始 transcript 是审计存档；ContextArchive 只是模型有效视图；RunCheckpoint 只保存恢复所需的输入、阶段、最后工具事件和结果/错误摘要。
+
+```text
+running
+├── 正常完成 → completed
+├── Esc       → interrupted
+├── 异常      → failed
+└── 进程退出  → 下次打开时转换为 interrupted
+```
+
+Session 是完整运行状态边界。启动指定 Session、从历史列表切换和新建对话都经过同一条激活路径，同步恢复 transcript、mode、model、输出等级、Plan、Goal、Team、ContextArchive、checkpoint、输入历史与 `/retry` 状态。每轮执行捕获不可变作用域并生成 runId/owner；checkpoint、Trace、事件和延迟动作始终写回启动该轮的 Session，所有进展与终态更新都以 runId 做 CAS。其他 Session 的消息和局部运行状态不会进入当前模型上下文；唯一允许跨 Session 注入的对话信息是带 `confirmedAt` 的长期记忆。`/resume` 将未完成 checkpoint 与 Goal/Plan/Team 合并为新一轮输入，并要求先核对当前工作区；这是 best-effort 任务续跑，不是任意 SDK 指令点的精确恢复。没有未完成状态时拒绝空恢复。
+
+`AtomicJsonStore` 是 Memory、Plan、Team、RAG、ExecutionLedger 和 Session 的统一状态层：按绝对路径共享进程内队列，使用跨进程锁在锁内重读，写入 PID+UUID 临时文件后原子 rename，并通过 Zod 校验和损坏文件隔离处理异常。Session 与执行账本选择失败关闭；可重建的共享索引/偏好状态可以隔离损坏文件后从空状态继续。
+
+本地 Function Tool 的副作用以 `sessionId + runId + toolName + callId` 记入执行账本。相同成功调用返回已保存结果；`started` 或 `failed` 状态不会自动重试，以免重复写文件、命令或外部请求。这是 at-most-once 防护，不覆盖 Agents SDK 原生 MCP/Hosted Tools，也不宣称跨任意崩溃边界的 exactly-once。
 
 ## NANO.md 持久指令
 
@@ -147,23 +173,25 @@ SubAgent 使用 Agents SDK `Agent.asTool()`，而不是 Handoff：
 lead: set_team_tasks
   → TeamTaskStore 校验唯一 ID、依赖存在且无环
   → ready() 计算当前可执行波次
-  → run_team 校验 2～4 个任务与 builder 路径边界
+  → run_team 校验 1～4 个任务与 builder 路径边界
   → 最多 4 个独立 Runner 并行
   → completed / failed 结果分别持久化，failed 可显式 retry
   → lead 检查结果并调度下一波或修复
 ```
 
-角色工具按最小职责静态选择：explorer/architect 只读检索，builder 拥有文件与 Shell，tester/reviewer 可以读取并执行验证但不能修改文件。builder 没有声明 `paths` 时不能并行；两个 builder 的文件或目录边界相同、互为父子时会被拒绝。单个 worker 失败不会丢失其他结果，Esc 的 AbortSignal 会传入所有嵌套 Runner。Team 摘要加入动态上下文和 `/resume`，但原始 worker 对话不会挤占主 Session。
+角色工具按最小职责静态选择：explorer/architect 只读检索，builder 只能写入该 task 声明的 `paths`，tester/reviewer 保持只读，所有 worker 默认都没有 Shell。`claimMany` 在一次锁内 mutation 中验证并领取整波任务，重叠波次不会留下孤儿 running task；claimId 和租约阻止迟到 worker 覆盖新领取。单个 worker 失败不会丢失其他结果，Esc 的 AbortSignal 会传入所有嵌套 Runner。
 
 ## Runtime Control
 
 `runtime/control.ts` 把 CLI 中有实际运行时语义的操作暴露为 Function Tools。查询、模型切换和模式切换直接复用 `NanoAgent` 方法；Session 切换/清空、MCP reload、输出等级和退出先进入内存队列，等 SDK 完成当前 Session 写入与 `run_end` Hook 后再应用，并把 Effect 交给 CLI 刷新界面。这样 Agent 能代替用户操作，又不会在 Tool Call 尚未闭合时替换持久化目标或关闭当前 MCP 连接。
 
-文件与 Shell 工具同时接受工作区相对路径和绝对路径。`runtime_status` 暴露 `workspaceRoot` 与 `runtimeRoot`，使明确授权的自检查、自修改和自测试不需要新增一套代码编辑协议。
+主 Agent 的内置本地工具有三档权限：默认 `workspace` 只允许文件工具在工作区内读写并隐藏 Shell/写型 HTTP，`read-only` 再移除写工具，`trusted` 才开放绝对路径、Shell 与写型 HTTP。路径边界同时做词法与 realpath 检查，拒绝符号链接逃逸。MCP 是用户显式配置的外部能力，其权限不由本地工具档位代替。
 
 ## Memory 与 RAG
 
-Memory 保存少量跨会话偏好、事实、决策和待办，包含来源、重要度和更新时间。RAG 面向本地中小型 Markdown/Text 知识库：固定切片、按内容摘要与模型复用 Embedding、进程内索引缓存、向量与词法混合排序。每轮自动注入只做本地词法检索，显式 `search_knowledge` 才请求查询向量；Embedding 不可用时自动降级为纯词法检索。
+Memory 保存少量跨会话偏好、事实、决策和待办，包含来源 Session、确认时间、重要度和更新时间。`remember` 的写入能力绑定本轮原始用户输入；没有明确确认时存储层拒绝写入。RAG 面向本地中小型 Markdown/Text 知识库：固定切片、按内容摘要与模型复用 Embedding、每次读取最新原子状态、向量与词法混合排序。并发提交串行原子替换整份索引，不使用跨调用的易过期内存缓存；默认权限同时校验词法路径与 realpath，拒绝工作区外索引。取消信号贯穿扫描、读取、Embedding 和提交。
+
+文件、搜索和目录工具会拒绝 `.nano-agent` 运行数据与用户级配置目录，包括符号链接解析后的路径。macOS 上 Shell 工具运行在 Seatbelt profile 中，对这些目录同时禁止读写，防止命令绕过 Session API 直接读取其他 transcript、Plan、Team 或 Trace。
 
 ## Hooks 与 Trace
 

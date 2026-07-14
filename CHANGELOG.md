@@ -7,7 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.11.0] - 2026-07-14 18:16
+
+### Added
+
+- harden local agent runtime and orchestration (@Kickflip73)
+
 ## [0.10.1] - 2026-07-14
+
+### Added
+
+- add cross-process atomic JSON state, corruption quarantine, run ownership CAS, and an at-most-once ledger for local side-effect tools
+- add workspace/read-only/trusted local permission profiles with workspace-safe defaults and Team builder path confinement
+- add the conflict-free `nano-agent` executable, clean builds, direct OpenAI dependency, coverage command, and Node 22 CI
+- persist per-session run checkpoints so interrupted, failed, and process-exited tasks can resume from their latest recorded phase
+- add layered context management with tool-result microcompaction, persistent context collapse, `/compact`, and final complete-turn truncation
+- show recoverable sessions and detailed raw/effective/archive context usage in the CLI
+
+### Changed
+
+- position NanoAgent as both a lightweight general local Agent product and a reusable bounded multi-Agent orchestration framework
+- make `/resume` explicitly best-effort, split runtime component initialization and Session-state rendering, and prevent cancelled SDK streams from being marked completed
+- make Team waves atomically claim 1–4 ready tasks, require explicit retry after orphaned leases, and remove unsandboxed Shell from workers
+- make `/resume` combine automatic run progress with Goal, Plan, and Ultra Team state instead of requiring a Goal
+- preserve the full SDK transcript as the audit archive while compacting only the model-facing context view
+- start interactive `nano` sessions in a new conversation by default unless `AGENT_SESSION` is explicitly set
+- show up to five recent conversations in the startup selector for quick continuation
+- open the recent-conversation selector on startup so ↑↓ and Enter can continue a previous session immediately
+- persist mode, model and output level per session so switching conversations restores isolated runtime state
+- stream Ultra Team worker creation, task assignment, completion summaries and failures into the terminal event flow
+- show per-session long-running task plans and current progress directly above the interactive input
+- unify startup and conversation switching through one complete session-state restoration path
+- inject current session and plan progress into every model turn and require stage-by-stage task status updates
+- support multiline editing, safe bracketed paste, Shift+Enter newlines and Command+arrow line navigation
+- derive concise session titles from substantive conversation content and order history by latest activity
+- use `deepseek-v4-pro` as the default DeepSeek model and list both V4 Pro and V4 Flash in the model selector
+- repair duplicate tool results as well as dangling calls before resuming persisted sessions
+- bind every active run, event, checkpoint, plan/team store and deferred action to its starting session; gate cross-session listing and long-term-memory writes on explicit user intent
+- drive context windows and output reserves from per-model profiles, enforce a complete request budget, and report provider usage separately from local estimates
+- block file, shell and RAG access to private runtime data; stop automatic global RAG injection and quarantine unconfirmed legacy memories
+- isolate terminal input history and retry state per session, leaving explicit long-term memory as the only cross-session conversation channel
 
 ### Fixed
 

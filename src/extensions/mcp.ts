@@ -12,6 +12,7 @@ import { z } from 'zod';
 const common = {
   enabled: z.boolean().optional(),
   timeoutSeconds: z.number().positive().max(300).optional(),
+  allowedEnv: z.array(z.string().regex(/^[A-Z_][A-Z0-9_]*$/i)).max(50).optional(),
 };
 const stdioSchema = z.object({
   ...common,
@@ -43,8 +44,21 @@ export interface MCPConfigParseResult {
   invalid: MCPServerStatus[];
 }
 
-function expandEnvironment(value: string): string {
-  return value.replace(/\$\{([A-Z_][A-Z0-9_]*)\}/gi, (_, name: string) => process.env[name] ?? '');
+export function expandMcpEnvironment(value: string, allowedEnv: readonly string[] = []): string {
+  const allowed = new Set(allowedEnv);
+  return value.replace(/\$\{([A-Z_][A-Z0-9_]*)\}/gi, (_, name: string) => {
+    if (!allowed.has(name)) throw new Error(`MCP 环境变量 ${name} 未在 allowedEnv 中显式授权`);
+    return process.env[name] ?? '';
+  });
+}
+
+function safeProcessEnvironment(): Record<string, string> {
+  const names = process.platform === 'win32'
+    ? ['PATH', 'Path', 'SystemRoot', 'ComSpec', 'PATHEXT', 'TEMP', 'TMP', 'USERPROFILE']
+    : ['PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'TMPDIR', 'LANG', 'LC_ALL'];
+  return Object.fromEntries(names
+    .map((name) => [name, process.env[name]])
+    .filter((entry): entry is [string, string] => entry[1] !== undefined));
 }
 
 export function parseMcpConfig(value: unknown): Record<string, MCPServerConfig> {
@@ -82,22 +96,37 @@ function hasResources(server: MCPServer): server is MCPServerWithResources {
 export class MCPManager {
   readonly servers: MCPServer[] = [];
   private statusList: MCPServerStatus[] = [];
+  private lifecycle: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly configFile: string,
     private readonly workspaceRoot: string,
-  ) {}
+    private readonly options: { enabled?: boolean; disabledReason?: string } = {},
+  ) {
+    if (options.enabled === false) {
+      this.statusList = [{
+        name: 'workspace-mcp',
+        transport: 'stdio',
+        state: 'failed',
+        tools: 0,
+        error: options.disabledReason ?? 'MCP 配置未被信任，未连接',
+      }];
+    }
+  }
 
   async connect(): Promise<string[]> {
-    return this.replaceConnections(false);
+    return this.serialized(() => this.replaceConnections(false));
   }
 
   async reload(): Promise<MCPServerStatus[]> {
-    await this.replaceConnections(true);
-    return this.statuses();
+    return this.serialized(async () => {
+      await this.replaceConnections(true);
+      return this.statuses();
+    });
   }
 
   private async replaceConnections(preserveFailed: boolean): Promise<string[]> {
+    if (this.options.enabled === false) return [];
     const { definitions, invalid } = await this.load();
     const oldServers = [...this.servers];
     const oldByName = new Map(oldServers.map((server) => [server.name, server]));
@@ -105,8 +134,9 @@ export class MCPManager {
     const results = await Promise.all(Object.entries(definitions).map(async ([name, config]) => {
       if (config.enabled === false) return undefined;
       const transport = 'url' in config ? 'streamable-http' : 'stdio';
-      const server = this.createServer(name, config);
+      let server: MCPServer | undefined;
       try {
+        server = this.createServer(name, config);
         await server.connect();
         const tools = await server.listTools();
         return {
@@ -114,7 +144,7 @@ export class MCPManager {
           status: { name, transport, state: 'connected', tools: tools.length } satisfies MCPServerStatus,
         };
       } catch (error) {
-        await server.close().catch(() => undefined);
+        await server?.close().catch(() => undefined);
         const previous = preserveFailed ? oldByName.get(name) : undefined;
         if (previous) return {
           server: previous,
@@ -167,8 +197,16 @@ export class MCPManager {
   }
 
   async close(): Promise<void> {
-    await Promise.allSettled(this.servers.map((server) => server.close()));
-    this.servers.length = 0;
+    await this.serialized(async () => {
+      await Promise.allSettled(this.servers.map((server) => server.close()));
+      this.servers.length = 0;
+    });
+  }
+
+  private serialized<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.lifecycle.then(operation, operation);
+    this.lifecycle = result.then(() => undefined, () => undefined);
+    return result;
   }
 
   createTools() {
@@ -206,12 +244,13 @@ export class MCPManager {
 
   private createServer(name: string, config: MCPServerConfig): MCPServer {
     const timeout = (config.timeoutSeconds ?? 30) * 1_000;
+    const allowedEnv = config.allowedEnv ?? [];
     if ('url' in config) {
       return new MCPServerStreamableHttp({
         name,
-        url: expandEnvironment(config.url),
+        url: expandMcpEnvironment(config.url, allowedEnv),
         requestInit: config.headers
-          ? { headers: Object.fromEntries(Object.entries(config.headers).map(([key, value]) => [key, expandEnvironment(value)])) }
+          ? { headers: Object.fromEntries(Object.entries(config.headers).map(([key, value]) => [key, expandMcpEnvironment(value, allowedEnv)])) }
           : undefined,
         cacheToolsList: true,
         timeout,
@@ -220,12 +259,12 @@ export class MCPManager {
     }
     return new MCPServerStdio({
       name,
-      command: expandEnvironment(config.command),
-      args: (config.args ?? []).map(expandEnvironment),
+      command: expandMcpEnvironment(config.command, allowedEnv),
+      args: (config.args ?? []).map((value) => expandMcpEnvironment(value, allowedEnv)),
       cwd: path.resolve(this.workspaceRoot, config.cwd ?? '.'),
       env: {
-        ...Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined)),
-        ...Object.fromEntries(Object.entries(config.env ?? {}).map(([key, value]) => [key, expandEnvironment(value)])),
+        ...safeProcessEnvironment(),
+        ...Object.fromEntries(Object.entries(config.env ?? {}).map(([key, value]) => [key, expandMcpEnvironment(value, allowedEnv)])),
       },
       cacheToolsList: true,
       timeout,

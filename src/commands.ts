@@ -19,12 +19,13 @@ export const COMMANDS = [
   { value: '/tools', description: '列出可用工具' },
   { value: '/mcp', description: '查看 MCP 连接' },
   { value: '/context', description: '查看上下文用量' },
+  { value: '/compact', description: '压缩并归档较早上下文' },
   { value: '/instructions', description: '查看持久指令文件' },
   { value: '/memories', description: '列出长期记忆' },
   { value: '/plan', description: '查看任务计划' },
   { value: '/team', description: '查看 Ultra Team 任务板' },
   { value: '/goal', description: '查看或设置长期目标' },
-  { value: '/resume', description: '从 Goal 检查点继续' },
+  { value: '/resume', description: '依据持久任务状态继续' },
   { value: '/index', description: '索引本地知识库' },
   { value: '/retry', description: '重试上一条输入' },
   { value: '/help', description: '显示命令帮助' },
@@ -45,18 +46,19 @@ const HELP = `内置命令：
   /tools              列出当前可用工具
   /mcp [reload]       查看或重新连接 MCP Server
   /context            查看上下文、记忆和计划用量
+  /compact            归档较早历史，保留最近两轮
   /instructions       查看用户级与项目级 NANO.md
   /memories           列出长期记忆
   /plan               查看当前任务计划
   /team               查看 Ultra Team 子任务、依赖和结果
   /goal [objective]   查看或设置当前长期目标
-  /resume             从 Goal 检查点继续执行
+  /resume             依据 Checkpoint / Goal / Plan / Team 尽力续跑
   /index [path]       索引知识库，默认 knowledge
   /retry              重新执行上一条用户输入
   /help               显示帮助
   /exit               退出
 
-交互快捷键：Esc 停止当前任务 · 输入 / 查看命令 · ↑↓ 选择 · Tab 补全`;
+交互快捷键：Esc 停止当前任务 · Shift+Tab 切换模式 · Shift+Enter 换行 · Command+←/→ 跳到行首/行尾 · 输入 / 查看命令 · ↑↓ 选择 · Enter 执行 · Tab 补全`;
 
 export interface CommandUI {
   write?: (text: string) => void;
@@ -66,24 +68,24 @@ export interface CommandUI {
   selectModel?: (models: string[], current: string) => Promise<string | undefined>;
   selectMode?: (modes: ReturnType<NanoAgent['availableModes']>, current: string) => Promise<string | undefined>;
   getOutputLevel?: () => OutputLevel;
-  setOutputLevel?: (level: OutputLevel) => void;
+  setOutputLevel?: (level: OutputLevel) => void | Promise<void>;
   selectOutputLevel?: (current: OutputLevel) => Promise<string | undefined>;
 }
 
 export class CommandHandler {
-  private lastInput?: string;
+  private lastInputs = new Map<string, string>();
 
   constructor(
     private readonly agent: NanoAgent,
-    private readonly runTask: (input: string) => Promise<void>,
+    private readonly runTask: (input: string, signal?: AbortSignal) => Promise<void>,
     private readonly ui: CommandUI = {},
   ) {}
 
   remember(input: string): void {
-    this.lastInput = input;
+    this.lastInputs.set(this.agent.currentSessionId, input);
   }
 
-  async execute(input: string): Promise<CommandResult> {
+  async execute(input: string, signal?: AbortSignal): Promise<CommandResult> {
     if (!input.startsWith('/')) return 'pass';
     const [command, ...rest] = input.split(/\s+/);
     const argument = rest.join(' ').trim();
@@ -110,14 +112,14 @@ export class CommandHandler {
       const current = (await this.agent.runtimeInfo()).model;
       const selected = argument || await this.ui.selectModel?.(this.agent.availableModels(), current);
       if (!selected) return this.ui.selectModel ? 'handled' : this.handled(`当前模型：${current}`);
-      this.agent.switchModel(selected);
+      await this.agent.switchModel(selected);
       return this.handled(`已切换模型：${selected}`);
     }
     if (command === '/mode') {
       const current = (await this.agent.runtimeInfo()).mode;
       const selected = argument || await this.ui.selectMode?.(this.agent.availableModes(), current.id);
       if (!selected) return this.ui.selectMode ? 'handled' : this.handled(`当前模式：${current.label}`);
-      this.agent.switchMode(selected);
+      await this.agent.switchMode(selected);
       const mode = this.agent.availableModes().find((item) => item.id === selected);
       return this.handled(`已切换模式：${mode?.label ?? selected}`);
     }
@@ -127,7 +129,7 @@ export class CommandHandler {
       if (!selected) return this.ui.selectOutputLevel ? 'handled' : this.handled(`当前输出等级：${current}`);
       const level = OUTPUT_LEVELS.find((item) => item.id === selected);
       if (!level) throw new Error(`未知输出等级：${selected}`);
-      this.ui.setOutputLevel?.(level.id);
+      await this.ui.setOutputLevel?.(level.id);
       return this.handled(`已切换输出等级：${level.label}（${level.id}）`);
     }
     if (command === '/new') {
@@ -161,8 +163,9 @@ export class CommandHandler {
     }
     if (command === '/clear') {
       await this.agent.clearSession();
+      this.lastInputs.delete(this.agent.currentSessionId);
       await this.ui.resetScreen?.();
-      return this.handled('当前对话已清空。');
+      return this.handled('当前对话、Goal、Plan 与 Team 状态已清空。');
     }
     if (command === '/skills') {
       if (argument === 'reload') {
@@ -186,12 +189,28 @@ export class CommandHandler {
       const info = await this.agent.contextInfo();
       return this.handled([
         `历史条目  ${info.historyItems} / ${info.historyLimit}`,
-        `上下文    ~${info.estimatedTokens} / ${info.contextWindow} tokens`,
+        `原始历史  ~${info.rawTokens ?? info.estimatedTokens} tokens`,
+        `${info.estimateScope === 'last_request' ? '最近请求估算' : '当前历史估算'} ~${info.effectiveTokens ?? info.estimatedTokens} tokens`,
+        `上次请求实际 ${info.lastRequestInputTokens ? `${info.lastRequestInputTokens} input + ${info.lastRequestOutputTokens ?? 0} output` : 'Provider 未返回'}`,
+        `上轮累计用量 ${info.runTotalTokens ? `${info.runTotalTokens} tokens（input ${info.runInputTokens ?? 0} / output ${info.runOutputTokens ?? 0}）` : 'Provider 未返回'}`,
+        `模型窗口  ${info.contextWindow} · 输入上限 ${info.inputBudget} · 输出预留 ${info.outputReserve}`,
+        `压缩归档  ${info.archivedItems ?? 0} 条 · ~${info.archiveTokens ?? 0} tokens`,
+        `压缩策略  ${info.contextStrategies?.join(', ') || '未触发'}`,
+        `最近压缩  ${info.compactedAt ?? '无'}`,
+        `运行状态  ${info.runStatus ?? 'idle'}`,
         `长期记忆  ${info.memories}`,
         `计划步骤  ${info.planSteps}`,
         `长期目标  ${info.goal ?? '未设置'}`,
-        '更早历史会按 Token Budget 结构化压缩。',
+        '原始 Session 始终保留；压缩只改变发送给模型的有效视图。',
       ].join('\n'));
+    }
+    if (command === '/compact') {
+      const result = await this.agent.compactContext();
+      const archive = result.archive;
+      return this.handled([
+        result.message,
+        archive ? `归档范围：${archive.coveredItems} 条 · ${archive.originalTokens} → ${archive.compactedTokens} tokens` : '',
+      ].filter(Boolean).join('\n'));
     }
     if (command === '/instructions') {
       const guidance = await this.agent.guidanceInfo();
@@ -202,7 +221,9 @@ export class CommandHandler {
     }
     if (command === '/memories') {
       const memories = await this.agent.listMemories();
-      return this.handled(memories.map((memory) => `- ${memory.id} [${memory.type}] ${memory.content}`).join('\n') || '暂无长期记忆');
+      return this.handled(memories.map((memory) =>
+        `- ${memory.id} [${memory.type}${memory.confirmedAt ? '' : ' · 未确认，不会跨 Session 共享'}] ${memory.content}`,
+      ).join('\n') || '暂无长期记忆');
     }
     if (command === '/plan') {
       const plan = await this.agent.currentPlan();
@@ -228,19 +249,20 @@ export class CommandHandler {
     }
     if (command === '/resume') {
       const prompt = await this.agent.resumePrompt();
-      this.print('正在从 Goal 检查点继续...');
-      await this.runTask(prompt);
+      this.print('正在依据持久任务状态继续...');
+      await this.runTask(prompt, signal);
       return 'handled';
     }
     if (command === '/index') {
       this.print('正在构建知识库索引...');
-      const result = await this.agent.indexKnowledge(argument || 'knowledge');
+      const result = await this.agent.indexKnowledge(argument || 'knowledge', signal);
       return this.handled(JSON.stringify(result));
     }
     if (command === '/retry') {
-      if (!this.lastInput) return this.handled('没有可重试的用户输入。');
-      this.print(`重新执行：${this.lastInput}`);
-      await this.runTask(this.lastInput);
+      const lastInput = this.lastInputs.get(this.agent.currentSessionId);
+      if (!lastInput) return this.handled('当前对话没有可重试的用户输入。');
+      this.print(`重新执行：${lastInput}`);
+      await this.runTask(lastInput, signal);
       return 'handled';
     }
 

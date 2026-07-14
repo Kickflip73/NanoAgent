@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { AgentInputItem, RunStreamEvent } from '@openai/agents';
-import { parseRunEvent, renderBanner, renderMarkdownLine, renderSessionTranscript, TerminalRenderer, type OutputLevel } from '../src/terminal.js';
+import { parseRunEvent, renderBanner, renderMarkdownLine, renderRecoveryCheckpoint, renderSessionTranscript, TerminalRenderer, type OutputLevel } from '../src/terminal.js';
 
 class BufferWriter {
   isTTY = false;
@@ -80,7 +80,7 @@ test('collapses repeated blank lines in streamed terminal answers', () => {
   assert.doesNotMatch(answer.value, /第一段\n{3,}第二段/);
 });
 
-test('separates event blocks and uses subtle ANSI badges in a TTY', () => {
+test('separates event blocks and uses semantic ANSI event colors in a TTY', () => {
   const status = new BufferWriter();
   const answer = new BufferWriter();
   status.isTTY = true;
@@ -99,8 +99,8 @@ test('separates event blocks and uses subtle ANSI badges in a TTY', () => {
   } as RunStreamEvent);
   renderer.finish();
 
-  assert.match(status.value, /\x1b\[38;2;93;170;160m/);
-  assert.match(answer.value, /\x1b\[38;2;157;142;198m/);
+  assert.match(status.value, /\x1b\[96m● 工具\x1b\[0m  read_file/);
+  assert.match(answer.value, /\x1b\[95m◆ 回答\x1b\[0m/);
   assert.doesNotMatch(answer.value, /###|\*\*/);
   const plain = answer.value.replace(/\x1b\[[0-9;]*m/g, '');
   assert.match(plain, /结果\n\n•/);
@@ -141,6 +141,20 @@ test('renders a compact project banner without ANSI in plain output', () => {
   assert.doesNotMatch(banner, /\x1b/);
 });
 
+test('renders a recoverable session checkpoint', () => {
+  const checkpoint = renderRecoveryCheckpoint({
+    runId: 'run-1',
+    status: 'interrupted',
+    input: '继续开发',
+    phase: '正在执行 read_file',
+    lastEvent: 'src/core/context.ts',
+    startedAt: '',
+    updatedAt: '',
+  }, false);
+  assert.match(checkpoint, /^↻ 可恢复/);
+  assert.match(checkpoint, /read_file.*context\.ts.*\/resume 继续/);
+});
+
 test('replays persisted user and assistant messages in chronological order', () => {
   const transcript = renderSessionTranscript([
     { type: 'message', role: 'user', content: '第一条问题' },
@@ -161,17 +175,24 @@ test('replays persisted user and assistant messages in chronological order', () 
     },
   ] as AgentInputItem[], false);
 
-  assert.match(transcript, /^> 第一条问题/m);
+  assert.match(transcript, /^▸ 第一条问题/m);
   assert.match(transcript, /◆ 回答\n\s*第一条回答\n\n• 已完成/);
   assert.ok(transcript.indexOf('第一条问题') < transcript.indexOf('最新问题'));
   assert.ok(transcript.indexOf('最新问题') < transcript.indexOf('最新回答'));
   assert.doesNotMatch(transcript, /secret tool output|###/);
+
+  const styled = renderSessionTranscript([
+    { type: 'message', role: 'user', content: '带样式的历史输入' },
+  ] as AgentInputItem[], true);
+  assert.match(styled, /^\x1b\[96m▸\x1b\[0m\x1b\[100;97m 带样式的历史输入 \x1b\[0m$/);
 });
 
 test('filters execution events by output level', () => {
-  const render = (level: OutputLevel) => {
+  const render = (level: OutputLevel, tty = false) => {
     const status = new BufferWriter();
     const answer = new BufferWriter();
+    status.isTTY = tty;
+    answer.isTTY = tty;
     const renderer = new TerminalRenderer(status, answer, level);
     renderer.start('模型思考中', '读取 README.md 并总结');
     renderer.handle({
@@ -206,10 +227,57 @@ test('filters execution events by output level', () => {
 
   const tools = render('tools');
   assert.match(tools.status, /read_file/);
-  assert.doesNotMatch(tools.status, /README\.md|NanoAgent 文件正文/);
+  assert.match(tools.status, /● 工具  read_file  \{"path":"README\.md"\}/);
+  assert.match(tools.status, /└ 结果  read_file  NanoAgent 文件正文/);
 
   const trace = render('trace');
   assert.match(trace.status, /读取 README\.md 并总结/);
   assert.match(trace.status, /\{"path":"README\.md"\}/);
   assert.match(trace.status, /NanoAgent 文件正文/);
+
+  const colored = render('trace', true);
+  assert.match(colored.status, /\x1b\[90m◆ Agent\x1b\[0m/);
+  assert.match(colored.status, /\x1b\[94m✦ 思考\x1b\[0m/);
+  assert.match(colored.status, /\x1b\[96m● 工具\x1b\[0m/);
+  assert.match(colored.status, /\x1b\[92m└ 结果\x1b\[0m/);
+  assert.match(colored.answer, /\x1b\[95m◆ 回答\x1b\[0m/);
+  assert.match(colored.status, /\x1b\[92m✓ 完成\x1b\[0m/);
+});
+
+test('truncates long tool result summaries with three dots', () => {
+  const event = parseRunEvent({
+    type: 'run_item_stream_event',
+    name: 'tool_output',
+    item: { rawItem: { name: 'read_file' }, output: `文件开头-${'内容'.repeat(100)}-文件结尾` },
+  } as unknown as RunStreamEvent);
+
+  assert.equal(event?.kind, 'status');
+  if (event?.kind !== 'status') return;
+  assert.equal(event.detail?.length, 120);
+  assert.match(event.detail ?? '', /^文件开头-/);
+  assert.match(event.detail ?? '', /\.\.\.$/);
+  assert.doesNotMatch(event.detail ?? '', /文件结尾/);
+});
+
+test('renders Ultra Team worker assignments and results as lifecycle events', () => {
+  const status = new BufferWriter();
+  status.isTTY = true;
+  const renderer = new TerminalRenderer(status, new BufferWriter(), 'tools');
+  renderer.handleRuntimeEvent({
+    type: 'team_worker_event', sessionId: 'demo', taskId: 'inspect', role: 'explorer',
+    description: '检查会话状态隔离实现', eventType: 'start',
+  });
+  renderer.handleRuntimeEvent({
+    type: 'team_worker_event', sessionId: 'demo', taskId: 'inspect', role: 'explorer',
+    description: '检查会话状态隔离实现', result: '确认 mode、model 和输出等级均按会话恢复', eventType: 'end',
+  });
+  renderer.handleRuntimeEvent({
+    type: 'team_worker_event', sessionId: 'demo', taskId: 'test', role: 'tester',
+    description: '运行测试', result: 'npm test 失败', eventType: 'error',
+  });
+  renderer.stop();
+
+  assert.match(status.value, /\x1b\[90m◆ Agent\x1b\[0m  子代理 explorer · inspect  分配任务：检查会话状态隔离实现/);
+  assert.match(status.value, /\x1b\[92m└ 结果\x1b\[0m  子代理 explorer · inspect  完成：确认 mode、model 和输出等级均按会话恢复/);
+  assert.match(status.value, /\x1b\[91m× 失败\x1b\[0m  子代理 tester · test  失败：npm test 失败/);
 });

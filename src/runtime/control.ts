@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { tool, type AgentInputItem, type Tool } from '@openai/agents';
 import { z } from 'zod';
+import { sessionIdSchema } from '../core/session-id.js';
 
 export const RUNTIME_OUTPUT_LEVELS = ['answer', 'thinking', 'tools', 'trace'] as const;
 export type RuntimeOutputLevel = typeof RUNTIME_OUTPUT_LEVELS[number];
@@ -24,10 +25,12 @@ export interface RuntimeControls {
   status: () => unknown | Promise<unknown>;
   models: () => string[];
   modes: () => Array<{ id: string; label: string; description: string }>;
-  switchModel: (model: string) => void;
-  switchMode: (mode: string) => void;
+  switchModel: (model: string) => void | Promise<void>;
+  switchMode: (mode: string) => void | Promise<void>;
   listSessions: () => unknown | Promise<unknown>;
   history: (limit: number) => Promise<AgentInputItem[]>;
+  canAccessSessions?: () => boolean;
+  canClearSession?: () => boolean;
   schedule: (action: RuntimeAction) => void;
 }
 
@@ -44,7 +47,7 @@ export function createRuntimeControlTools(controls: RuntimeControls): Tool[] {
       description: '切换 NanoAgent 模型；当前任务继续使用原模型，新模型从下一轮对话生效。',
       parameters: z.object({ model: z.string().min(1) }),
       execute: async ({ model }) => {
-        controls.switchModel(model);
+        await controls.switchModel(model);
         return { model, effective: 'next_turn', available: controls.models() };
       },
     }),
@@ -53,7 +56,7 @@ export function createRuntimeControlTools(controls: RuntimeControls): Tool[] {
       description: '切换通用（general）、Plan（plan）或 Ultra Team（ultra）模式；从下一轮对话生效。',
       parameters: z.object({ mode: z.string().min(1) }),
       execute: async ({ mode }) => {
-        controls.switchMode(mode);
+        await controls.switchMode(mode);
         return { mode, effective: 'next_turn', available: controls.modes() };
       },
     }),
@@ -68,9 +71,12 @@ export function createRuntimeControlTools(controls: RuntimeControls): Tool[] {
     }),
     tool({
       name: 'list_sessions',
-      description: '列出 NanoAgent 最近的持久会话及内容摘要。',
+      description: '列出 NanoAgent 持久会话的 ID、时间、轮数和恢复状态；不会读取其他会话内容。',
       parameters: z.object({}),
-      execute: controls.listSessions,
+      execute: async () => {
+        if (controls.canAccessSessions && !controls.canAccessSessions()) throw new Error('本轮用户没有要求访问其他 Session');
+        return controls.listSessions();
+      },
     }),
     tool({
       name: 'get_session_history',
@@ -81,8 +87,9 @@ export function createRuntimeControlTools(controls: RuntimeControls): Tool[] {
     tool({
       name: 'switch_session',
       description: '切换到指定 Session；为保证当前工具调用完整，本轮回答结束后执行。',
-      parameters: z.object({ sessionId: z.string().regex(/^[a-zA-Z0-9_-]+$/) }),
+      parameters: z.object({ sessionId: sessionIdSchema }),
       execute: async ({ sessionId }) => {
+        if (controls.canAccessSessions && !controls.canAccessSessions()) throw new Error('本轮用户没有要求切换 Session');
         controls.schedule({ type: 'switch_session', sessionId });
         return { sessionId, effective: 'after_current_turn' };
       },
@@ -90,8 +97,9 @@ export function createRuntimeControlTools(controls: RuntimeControls): Tool[] {
     tool({
       name: 'new_session',
       description: '创建并切换到新 Session；本轮回答结束后执行。',
-      parameters: z.object({ sessionId: z.string().regex(/^[a-zA-Z0-9_-]+$/).optional() }),
+      parameters: z.object({ sessionId: sessionIdSchema.optional() }),
       execute: async ({ sessionId }) => {
+        if (controls.canAccessSessions && !controls.canAccessSessions()) throw new Error('本轮用户没有要求创建 Session');
         const id = sessionId ?? randomUUID().slice(0, 8);
         controls.schedule({ type: 'new_session', sessionId: id });
         return { sessionId: id, effective: 'after_current_turn' };
@@ -102,6 +110,9 @@ export function createRuntimeControlTools(controls: RuntimeControls): Tool[] {
       description: '清空当前 Session；本轮回答保存完成后执行。',
       parameters: z.object({}),
       execute: async () => {
+        if (controls.canClearSession && !controls.canClearSession()) {
+          throw new Error('本轮用户没有明确要求清空当前 Session');
+        }
         controls.schedule({ type: 'clear_session' });
         return { effective: 'after_current_turn' };
       },
