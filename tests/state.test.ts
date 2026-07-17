@@ -47,8 +47,8 @@ test('preserves concurrent memory writes across store instances', async () => {
   const second = new MemoryStore(file);
 
   await Promise.all([
-    first.remember('first', 'fact', { confirmed: true }),
-    second.remember('second', 'fact', { confirmed: true }),
+    first.remember('first', 'fact'),
+    second.remember('second', 'fact'),
   ]);
 
   assert.deepEqual((await first.list()).map((item) => item.content).sort(), ['first', 'second']);
@@ -60,7 +60,7 @@ test('preserves concurrent memory writes across processes', async () => {
   const moduleUrl = pathToFileURL(path.resolve('src/core/memory.ts')).href;
   const writeMemory = (content: string) => execFileAsync(process.execPath, [
     '--import', 'tsx', '--input-type=module', '--eval',
-    `import { MemoryStore } from ${JSON.stringify(moduleUrl)}; await new MemoryStore(${JSON.stringify(file)}).remember(${JSON.stringify(content)}, 'fact', { confirmed: true });`,
+    `import { MemoryStore } from ${JSON.stringify(moduleUrl)}; await new MemoryStore(${JSON.stringify(file)}).remember(${JSON.stringify(content)}, 'fact');`,
   ]);
 
   await Promise.all([writeMemory('process-one'), writeMemory('process-two')]);
@@ -138,6 +138,21 @@ test('uses runId CAS so late callbacks cannot overwrite a newer run', async () =
   assert.equal(checkpoint?.runId, runB.runId);
   assert.equal(checkpoint?.status, 'running');
   assert.equal(checkpoint?.phase, '准备上下文');
+});
+
+test('clears only the terminal checkpoint owned by the expected runId', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'nano-run-clear-cas-'));
+  const session = new FileSession(root, 'demo');
+  const runA = await session.beginRun('A', 'run-a', 'owner-a');
+  await session.failRun('A cancelled', true, runA.runId);
+
+  assert.equal(await session.clearRunCheckpoint(runA.runId), true);
+  assert.equal(await session.getCheckpoint(), undefined);
+
+  const runB = await session.beginRun('B', 'run-b', 'owner-b');
+  assert.equal(await session.clearRunCheckpoint(runA.runId), false);
+  assert.equal((await session.getCheckpoint())?.runId, runB.runId);
+  assert.equal((await session.getCheckpoint())?.status, 'running');
 });
 
 test('does not reopen a completed run when a late failure arrives', async () => {

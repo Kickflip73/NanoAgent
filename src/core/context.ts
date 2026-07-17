@@ -157,7 +157,12 @@ export class ContextManager {
     if (parts.historySummary) candidates.push(`较早会话的结构化摘要：\n${parts.historySummary}`);
     if (parts.memories.length) {
       candidates.push(
-        `与当前问题相关的长期记忆：\n${parts.memories.map((memory) => `- [${memory.type}:${memory.id}] ${memory.content}`).join('\n')}`,
+        `与当前问题相关的长期记忆：\n${parts.memories.map((memory) => [
+          `- [${memory.type}:${memory.id}`,
+          memory.personId ? ` · person=${memory.personName ?? memory.personId}` : '',
+          memory.sourceTrust ? ` · trust=${memory.sourceTrust}` : '',
+          `] ${memory.content}`,
+        ].join('')).join('\n')}`,
       );
     }
     if (parts.skillCatalog) candidates.push(`可用 Agent Skills（任务匹配时先调用 use_skill）：\n${parts.skillCatalog}`);

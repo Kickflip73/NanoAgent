@@ -9,7 +9,7 @@ interface EvalCase {
 
 async function main(): Promise<void> {
   const root = process.cwd();
-  const temporaryIndex = path.join(root, '.nano-agent', 'eval-rag-index.json');
+  const temporaryIndex = path.join(root, '.mimi-agent', 'eval-rag-index.json');
   const cases = JSON.parse(await readFile(path.join(root, 'evals', 'cases.json'), 'utf8')) as EvalCase[];
   const rag = new RagStore(root, temporaryIndex);
   await rag.index('knowledge');

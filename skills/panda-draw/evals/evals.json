@@ -1,0 +1,25 @@
+{
+  "skill_name": "panda-draw",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "画一张架构图说明 panda-mem 的目录边界",
+      "expected_output": "panda-draw 位图模式;Codex 内置 image_gen;落 tmp/panda-draw/<YYYYMMDD-HHMMSS>-<slug>/;**不读取 API key**。"
+    },
+    {
+      "id": 2,
+      "prompt": "给 03-outputs/articles/foo.md 配图",
+      "expected_output": "panda-draw 文章视觉模式;分析文章 → structured plan → 渲染 → sidecar 落原文同目录 .diagrams/(已 .gitignore)或 tmp/panda-draw/article/。"
+    },
+    {
+      "id": 3,
+      "prompt": "用 draw.io 画 panda-mem 架构,要可编辑源文件",
+      "expected_output": "panda-draw draw.io 模式(明确点名 draw.io);输出 tmp/panda-draw/drawio/<YYYYMMDD-HHMM>-<slug>.{plan.md,drawio,png};draw.io 桌面 app 打开。"
+    },
+    {
+      "id": 4,
+      "prompt": "把这份方案可视化",
+      "expected_output": "弱信号(没有指明文章源/公众号目标/draw.io 关键词)→ **先问用户**'是为某篇文章配图,还是单独生一张图?',不要默认走任何模式。"
+    }
+  ]
+}

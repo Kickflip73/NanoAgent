@@ -9,3 +9,10 @@ coverage/
 .idea/
 .vscode/
 .nano-agent/
+.mimi-agent/
+connectors.json
+debug_log.txt
+tmp/
+docs/sessions/
+hand_landmarker.task
+.package-smoke-*/

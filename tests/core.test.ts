@@ -2,8 +2,15 @@ import assert from 'node:assert/strict';
 import { access, mkdir, mkdtemp, readFile, stat, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import test from 'node:test';
-import { RunContext, type AgentInputItem } from '@openai/agents';
+import {
+  getAllMcpTools,
+  invalidateServerToolsCache,
+  RunContext,
+  type AgentInputItem,
+  type MCPServer,
+} from '@openai/agents';
 import { ContextManager, estimateTokens } from '../src/core/context.js';
 import { GuidanceLoader } from '../src/core/guidance.js';
 import { explicitlyRequestsMemory, MemoryStore } from '../src/core/memory.js';
@@ -12,11 +19,16 @@ import { FileSession, registerSessionRunOwner } from '../src/core/session.js';
 import { TeamTaskStore } from '../src/core/team.js';
 import { TraceStore } from '../src/core/trace.js';
 import { HookBus } from '../src/runtime/hooks.js';
-import { expandMcpEnvironment, MCPManager, parseMcpConfig } from '../src/extensions/mcp.js';
+import {
+  collectTrustedMcpEnvironment,
+  expandMcpEnvironment,
+  MCPManager,
+  parseMcpConfig,
+} from '../src/extensions/mcp.js';
 import { RagStore } from '../src/extensions/rag.js';
 import { SkillLoader } from '../src/extensions/skills.js';
 import { createSubAgentTools } from '../src/extensions/subagents.js';
-import { NanoAgent } from '../src/agent.js';
+import { MimiAgent } from '../src/agent.js';
 
 test('persists sessions and returns the latest items', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'nano-session-'));
@@ -33,7 +45,7 @@ test('persists sessions and returns the latest items', async () => {
 
 test('keeps runtime preferences isolated between sessions', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'nano-session-preferences-'));
-  const dataRoot = path.join(root, '.nano-agent');
+  const dataRoot = path.join(root, '.mimi-agent');
   const previous = {
     session: process.env.AGENT_SESSION,
     mode: process.env.AGENT_MODE,
@@ -44,7 +56,7 @@ test('keeps runtime preferences isolated between sessions', async () => {
   process.env.AGENT_MODE = 'general';
   process.env.OUTPUT_LEVEL = 'tools';
   process.env.OPENAI_MODEL = 'gpt-5.4-mini';
-  const agent = await NanoAgent.create({
+  const agent = await MimiAgent.create({
     provider: 'openai', workspaceRoot: root, dataRoot,
     skillsRoot: path.join(root, 'skills'), mcpConfig: path.join(root, 'mcp.json'),
     historyLimit: 40, contextWindow: 128_000, maxTurns: 20,
@@ -88,12 +100,53 @@ test('keeps runtime preferences isolated between sessions', async () => {
   }
 });
 
+test('reads a requested Session snapshot without changing the active Session', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-session-snapshot-'));
+  const dataRoot = path.join(root, '.mimi-agent');
+  const sessionsRoot = path.join(dataRoot, 'sessions');
+  const previousSession = process.env.AGENT_SESSION;
+  process.env.AGENT_SESSION = 'active';
+  const requested = new FileSession(sessionsRoot, 'requested');
+  const items = [
+    { role: 'user', content: 'REQUESTED_SESSION_INPUT' },
+    { type: 'function_call', callId: 'call-1', name: 'read_file', arguments: '{}' },
+    { type: 'function_call_result', callId: 'call-1', output: 'REQUESTED_TOOL_RESULT' },
+    { role: 'assistant', content: 'REQUESTED_SESSION_ANSWER' },
+  ] as AgentInputItem[];
+  await requested.addItems(items);
+  await requested.setPreferences({ mode: 'plan', model: 'gpt-5-mini', outputLevel: 'trace' });
+  const checkpoint = await requested.beginRun('REQUESTED_INTERRUPTED_INPUT', 'requested-run');
+  await requested.failRun('interrupted for snapshot', true, checkpoint.runId);
+
+  const agent = await MimiAgent.create({
+    provider: 'openai', workspaceRoot: root, dataRoot,
+    skillsRoot: path.join(root, 'skills'), mcpConfig: path.join(root, 'mcp.json'),
+    historyLimit: 40, contextWindow: 128_000, maxTurns: 20,
+  });
+  try {
+    const snapshot = await agent.sessionSnapshot('requested');
+    assert.equal(snapshot.sessionId, 'requested');
+    assert.deepEqual(snapshot.items, items);
+    assert.equal(snapshot.recovery?.status, 'interrupted');
+    assert.equal(snapshot.runtime.mode.id, 'plan');
+    assert.equal(snapshot.runtime.model, 'gpt-5-mini');
+    assert.equal(snapshot.runtime.outputLevel, 'trace');
+    assert.ok(snapshot.context.estimatedTokens > 0);
+    assert.equal(snapshot.context.contextWindow, 128_000);
+    assert.equal(agent.currentSessionId, 'active');
+  } finally {
+    await agent.close();
+    if (previousSession === undefined) delete process.env.AGENT_SESSION;
+    else process.env.AGENT_SESSION = previousSession;
+  }
+});
+
 test('releases an active run owner when stream setup fails', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'nano-stream-setup-failure-'));
-  const dataRoot = path.join(root, '.nano-agent');
+  const dataRoot = path.join(root, '.mimi-agent');
   const previousSession = process.env.AGENT_SESSION;
   process.env.AGENT_SESSION = 'blocked';
-  const agent = await NanoAgent.create({
+  const agent = await MimiAgent.create({
     provider: 'openai', workspaceRoot: root, dataRoot,
     skillsRoot: path.join(root, 'skills'), mcpConfig: path.join(root, 'mcp.json'),
     historyLimit: 40, maxTurns: 20,
@@ -115,8 +168,8 @@ test('releases an active run owner when stream setup fails', async () => {
 
 test('releases the active run when asynchronous Runner setup rejects', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'nano-runner-rejection-'));
-  const dataRoot = path.join(root, '.nano-agent');
-  const agent = await NanoAgent.create({
+  const dataRoot = path.join(root, '.mimi-agent');
+  const agent = await MimiAgent.create({
     provider: 'openai', workspaceRoot: root, dataRoot,
     skillsRoot: path.join(root, 'skills'), mcpConfig: path.join(root, 'mcp.json'),
     historyLimit: 40, maxTurns: 20,
@@ -133,8 +186,8 @@ test('releases the active run when asynchronous Runner setup rejects', async () 
 
 test('does not clear durable Session state while its Run is active', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'nano-active-clear-'));
-  const dataRoot = path.join(root, '.nano-agent');
-  const agent = await NanoAgent.create({
+  const dataRoot = path.join(root, '.mimi-agent');
+  const agent = await MimiAgent.create({
     provider: 'openai', workspaceRoot: root, dataRoot,
     skillsRoot: path.join(root, 'skills'), mcpConfig: path.join(root, 'mcp.json'),
     historyLimit: 40, maxTurns: 20,
@@ -150,9 +203,9 @@ test('does not clear durable Session state while its Run is active', async () =>
   }
 });
 
-test('isolates transcript and context archives while sharing only explicit long-term memory', async () => {
+test('isolates transcript and context archives while sharing only usable long-term memory', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'nano-session-context-isolation-'));
-  const dataRoot = path.join(root, '.nano-agent');
+  const dataRoot = path.join(root, '.mimi-agent');
   const sessionsRoot = path.join(dataRoot, 'sessions');
   const first = new FileSession(sessionsRoot, 'first');
   const second = new FileSession(sessionsRoot, 'second');
@@ -168,12 +221,12 @@ test('isolates transcript and context archives while sharing only explicit long-
   await new MemoryStore(path.join(dataRoot, 'memories.json')).remember(
     'SHARED_CONFIRMED_MEMORY',
     'fact',
-    { source: 'user', confirmed: true, sourceSessionId: 'first' },
+    { source: 'user', sourceSessionId: 'first' },
   );
 
   const previousSession = process.env.AGENT_SESSION;
   process.env.AGENT_SESSION = 'first';
-  const agent = await NanoAgent.create({
+  const agent = await MimiAgent.create({
     provider: 'openai', workspaceRoot: root, dataRoot,
     skillsRoot: path.join(root, 'skills'), mcpConfig: path.join(root, 'mcp.json'),
     historyLimit: 4, contextWindow: 4_000, maxTurns: 20,
@@ -233,8 +286,8 @@ test('uses DeepSeek V4 Pro by default and lists both V4 models', async () => {
   process.env.AGENT_SESSION = 'deepseek-default';
   delete process.env.DEEPSEEK_MODEL;
   process.env.DEEPSEEK_API_KEY = 'test-key';
-  const agent = await NanoAgent.create({
-    provider: 'deepseek', workspaceRoot: root, dataRoot: path.join(root, '.nano-agent'),
+  const agent = await MimiAgent.create({
+    provider: 'deepseek', workspaceRoot: root, dataRoot: path.join(root, '.mimi-agent'),
     skillsRoot: path.join(root, 'skills'), mcpConfig: path.join(root, 'mcp.json'),
     historyLimit: 40, maxTurns: 20,
   });
@@ -261,7 +314,7 @@ test('uses DeepSeek V4 Pro by default and lists both V4 models', async () => {
 
 test('restores the complete session state after a process restart', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'nano-session-restart-'));
-  const dataRoot = path.join(root, '.nano-agent');
+  const dataRoot = path.join(root, '.mimi-agent');
   const sessions = path.join(dataRoot, 'sessions');
   const previous = {
     session: process.env.AGENT_SESSION,
@@ -278,10 +331,10 @@ test('restores the complete session state after a process restart', async () => 
     skillsRoot: path.join(root, 'skills'), mcpConfig: path.join(root, 'mcp.json'),
     historyLimit: 40, contextWindow: 128_000, maxTurns: 20,
   };
-  let first: NanoAgent | undefined;
-  let reopened: NanoAgent | undefined;
+  let first: MimiAgent | undefined;
+  let reopened: MimiAgent | undefined;
   try {
-    first = await NanoAgent.create(config);
+    first = await MimiAgent.create(config);
     await first.switchMode('ultra');
     await first.switchModel('gpt-5.4');
     await first.setOutputLevel('trace');
@@ -297,7 +350,7 @@ test('restores the complete session state after a process restart', async () => 
     await first.close();
     first = undefined;
 
-    reopened = await NanoAgent.create(config);
+    reopened = await MimiAgent.create(config);
     const info = await reopened.runtimeInfo();
     assert.equal(info.sessionId, 'durable');
     assert.equal(info.mode.id, 'ultra');
@@ -322,12 +375,12 @@ test('restores the complete session state after a process restart', async () => 
   }
 });
 
-test('loads user and project NANO.md on every turn with project precedence', async () => {
+test('loads canonical MIMI.md guidance and keeps project precedence', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'nano-guidance-'));
-  const userFile = path.join(root, 'home', 'NANO.md');
+  const userFile = path.join(root, 'home', 'MIMI.md');
   await mkdir(path.dirname(userFile), { recursive: true });
   await writeFile(userFile, 'Use tabs.');
-  await writeFile(path.join(root, 'NANO.md'), 'Use two spaces.');
+  await writeFile(path.join(root, 'MIMI.md'), 'Use two spaces.');
   const loader = new GuidanceLoader(root, userFile);
 
   const first = await loader.load();
@@ -335,14 +388,23 @@ test('loads user and project NANO.md on every turn with project precedence', asy
   assert.match(first.instructions, /项目级指令优先于用户级指令/);
   assert.ok(first.instructions.indexOf('Use two spaces.') < first.instructions.indexOf('Use tabs.'));
 
-  await writeFile(path.join(root, 'NANO.md'), 'Run npm test.');
+  await writeFile(path.join(root, 'home', 'MIMI.md'), 'Use updated user guidance.');
+  await writeFile(path.join(root, 'MIMI.md'), 'Run the current test suite.');
+  const modern = await loader.load();
+  assert.deepEqual(modern.files.map((file) => path.basename(file.path)), ['MIMI.md', 'MIMI.md']);
+  assert.match(modern.instructions, /Run the current test suite/);
+  assert.match(modern.instructions, /Use updated user guidance/);
+  assert.doesNotMatch(modern.instructions, /Use two spaces|Use tabs/);
+  assert.ok(modern.instructions.indexOf('Run the current test suite.') < modern.instructions.indexOf('Use updated user guidance.'));
+
+  await writeFile(path.join(root, 'MIMI.md'), 'Run npm test.');
   assert.match((await loader.load()).instructions, /Run npm test/);
 });
 
 test('reads only the bounded prefix of oversized persistent guidance', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'nano-guidance-limit-'));
-  await writeFile(path.join(root, 'NANO.md'), `PREFIX-${'x'.repeat(100_000)}-TAIL`);
-  const snapshot = await new GuidanceLoader(root, path.join(root, 'missing.md'), 20).load();
+  await writeFile(path.join(root, 'MIMI.md'), `PREFIX-${'x'.repeat(100_000)}-TAIL`);
+  const snapshot = await new GuidanceLoader(root, path.join(root, 'MIMI.md'), 20).load();
   assert.equal(snapshot.files[0]?.truncated, true);
   assert.match(snapshot.instructions, /PREFIX/);
   assert.doesNotMatch(snapshot.instructions, /TAIL/);
@@ -363,13 +425,13 @@ test('summarizes and sorts sessions from recent conversation content', async () 
   const session = new FileSession(root, 'opaque-id');
   await session.addItems([
     { role: 'user', content: '你好' },
-    { role: 'user', content: '帮我优化 NanoAgent 的终端交互体验' },
+    { role: 'user', content: '帮我优化 MimiAgent 的终端交互体验' },
     { role: 'user', content: '还要支持任务排队' },
   ] as AgentInputItem[]);
 
   const [summary] = await FileSession.listSummaries(root);
   assert.equal(summary?.id, 'opaque-id');
-  assert.equal(summary?.title, '优化 NanoAgent 的终端交互体验');
+  assert.equal(summary?.title, '优化 MimiAgent 的终端交互体验');
   assert.equal(summary?.preview, '还要支持任务排队');
   assert.equal(summary?.turns, 3);
   assert.equal(summary?.recoverable, false);
@@ -423,14 +485,14 @@ test('keeps completed and failed run outcomes in session metadata', async () => 
 
 test('resumes an interrupted ordinary task without requiring a Goal', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'nano-runtime-resume-'));
-  const dataRoot = path.join(root, '.nano-agent');
+  const dataRoot = path.join(root, '.mimi-agent');
   const sessionId = 'resume-test';
   const session = new FileSession(path.join(dataRoot, 'sessions'), sessionId);
   await session.beginRun('实现任务恢复能力');
   await session.updateRunProgress('正在执行测试', 'npm test · 42 passed');
   const previousSession = process.env.AGENT_SESSION;
   process.env.AGENT_SESSION = sessionId;
-  const agent = await NanoAgent.create({
+  const agent = await MimiAgent.create({
     provider: 'openai',
     workspaceRoot: root,
     dataRoot,
@@ -462,7 +524,7 @@ test('resumes an interrupted ordinary task without requiring a Goal', async () =
 
 test('manually compacts a session without deleting its archived transcript', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'nano-runtime-compact-'));
-  const dataRoot = path.join(root, '.nano-agent');
+  const dataRoot = path.join(root, '.mimi-agent');
   const sessionId = 'compact-test';
   const session = new FileSession(path.join(dataRoot, 'sessions'), sessionId);
   const items = Array.from({ length: 5 }, (_, index) => [
@@ -472,7 +534,7 @@ test('manually compacts a session without deleting its archived transcript', asy
   await session.addItems(items);
   const previousSession = process.env.AGENT_SESSION;
   process.env.AGENT_SESSION = sessionId;
-  const agent = await NanoAgent.create({
+  const agent = await MimiAgent.create({
     provider: 'openai', workspaceRoot: root, dataRoot,
     skillsRoot: path.join(root, 'skills'), mcpConfig: path.join(root, 'mcp.json'),
     historyLimit: 40, contextWindow: 128_000, maxTurns: 20,
@@ -523,7 +585,7 @@ test('repairs dangling tool calls left by an interrupted task', async () => {
 test('stores, retrieves and forgets long-term memories', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'nano-memory-'));
   const store = new MemoryStore(path.join(root, 'memories.json'));
-  const memory = await store.remember('用户偏好 TypeScript', 'preference', { confirmed: true });
+  const memory = await store.remember('用户偏好 TypeScript', 'preference');
 
   assert.equal((await store.search('TypeScript 偏好'))[0]?.id, memory.id);
   assert.deepEqual(await store.search('完全无关'), []);
@@ -531,31 +593,72 @@ test('stores, retrieves and forgets long-term memories', async () => {
   assert.deepEqual(await store.list(), []);
 });
 
-test('requires an explicit user confirmation before a memory tool can share across sessions', async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'nano-memory-confirmation-'));
+test('lets the Agent record durable memory without per-write confirmation and preserves provenance', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'nano-memory-autonomous-'));
   const store = new MemoryStore(path.join(root, 'memories.json'));
-  let input = '我的编辑器是 Vim';
-  const [remember] = store.createTools(() => ({ input, sessionId: 'private-a' }));
+  const [remember] = store.createTools(() => ({
+    input: '我的编辑器是 Vim',
+    sessionId: 'private-a',
+    eventId: 'event-1',
+    eventSource: 'messages',
+    trust: 'owner',
+    actor: '+15550001111',
+    conversation: 'messages-thread',
+    personId: 'alice',
+    personName: 'Alice Chen',
+  }));
   assert.ok(remember && 'invoke' in remember);
-  const invoke = () => remember!.invoke(new RunContext({}), JSON.stringify({
+  await remember!.invoke(new RunContext({}), JSON.stringify({
     content: '用户使用 Vim', type: 'preference', importance: 3,
   }));
-
-  assert.match(String(await invoke()), /没有明确确认/);
-  assert.deepEqual(await store.list(), []);
-
-  input = '请记住：我的编辑器是 Vim，作为长期记忆';
-  await invoke();
   const [saved] = await store.list();
   assert.equal(saved?.sourceSessionId, 'private-a');
-  assert.ok(saved?.confirmedAt);
+  assert.equal(saved?.source, 'agent');
+  assert.equal(saved?.sourceEventId, 'event-1');
+  assert.equal(saved?.sourceEventSource, 'messages');
+  assert.equal(saved?.sourceTrust, 'owner');
+  assert.equal(saved?.sourceActor, '+15550001111');
+  assert.equal(saved?.sourceConversation, 'messages-thread');
+  assert.equal(saved?.personId, 'alice');
+  assert.equal(saved?.personName, 'Alice Chen');
+  assert.ok(saved?.recordedAt);
+  assert.deepEqual((await store.search('alice mail:inbox')).map((item) => item.id), [saved?.id]);
 });
 
-test('does not treat memory questions or negated requests as write consent', () => {
+test('recognizes explicit memory requests without requiring them for autonomous writes', () => {
   assert.equal(explicitlyRequestsMemory('请记住我喜欢简洁输出'), true);
   assert.equal(explicitlyRequestsMemory('不要记住我的密码'), false);
   assert.equal(explicitlyRequestsMemory('你还记住我什么？'), false);
   assert.equal(explicitlyRequestsMemory('please do not remember this password'), false);
+});
+
+test('honors an explicit request not to retain memory', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'nano-memory-denied-'));
+  const store = new MemoryStore(path.join(root, 'memories.json'));
+  const [remember] = store.createTools(() => ({ input: '不要记住我的门禁密码', sessionId: 'private-a' }));
+  assert.ok(remember && 'invoke' in remember);
+  assert.match(String(await remember!.invoke(new RunContext({}), JSON.stringify({
+    content: '用户门禁密码是 1234', type: 'fact', importance: 5,
+  }))), /明确要求不要保存/);
+  assert.deepEqual(await store.list(), []);
+});
+
+test('bounds autonomous memory content and usable entry growth', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'nano-memory-bounds-'));
+  const file = path.join(root, 'memories.json');
+  const timestamp = new Date().toISOString();
+  await writeFile(file, JSON.stringify(Array.from({ length: 1_000 }, (_, index) => ({
+    id: `memory-${index}`,
+    type: 'fact',
+    content: `fact-${index}`,
+    createdAt: timestamp,
+    recordedAt: timestamp,
+  }))));
+  const store = new MemoryStore(file);
+
+  await assert.rejects(() => store.remember('x'.repeat(2_001), 'fact'), /2000/);
+  await assert.rejects(() => store.remember('one-more', 'fact'), /1000/);
+  assert.equal((await store.remember('fact-0', 'fact', { importance: 5 })).importance, 5);
 });
 
 test('does not inject legacy or unconfirmed memory across sessions', async () => {
@@ -569,7 +672,7 @@ test('does not inject legacy or unconfirmed memory across sessions', async () =>
 
   assert.deepEqual((await store.search('PRIVATE_LEGACY_SENTINEL')).map((item) => item.id), []);
   assert.deepEqual((await store.search('SHARED_CONFIRMED_SENTINEL')).map((item) => item.id), ['confirmed']);
-  assert.deepEqual((await store.listConfirmed()).map((item) => item.id), ['confirmed']);
+  assert.deepEqual((await store.listUsable()).map((item) => item.id), ['confirmed']);
 });
 
 test('loads skill metadata and content on demand', async () => {
@@ -625,18 +728,18 @@ test('indexes and searches local documents without a vector database', async () 
   const root = await mkdtemp(path.join(os.tmpdir(), 'nano-rag-'));
   const docs = path.join(root, 'knowledge');
   await import('node:fs/promises').then(({ mkdir }) => mkdir(docs, { recursive: true }));
-  await writeFile(path.join(docs, 'agent.md'), 'NanoAgent 使用 TypeScript 构建。');
+  await writeFile(path.join(docs, 'agent.md'), 'MimiAgent 使用 TypeScript 构建。');
   const indexFile = path.join(root, 'index.json');
   const rag = new RagStore(root, indexFile);
 
   assert.deepEqual(await rag.index('knowledge'), { files: 1, chunks: 1, embeddings: false });
   assert.equal((await rag.search('TypeScript'))[0]?.source, 'knowledge/agent.md');
-  assert.ok((await readFile(indexFile, 'utf8')).includes('NanoAgent'));
+  assert.ok((await readFile(indexFile, 'utf8')).includes('MimiAgent'));
 });
 
 test('never indexes private session runtime data into shared RAG', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'nano-rag-private-'));
-  const runtime = path.join(root, '.nano-agent');
+  const runtime = path.join(root, '.mimi-agent');
   await mkdir(runtime, { recursive: true });
   await writeFile(path.join(root, 'public.md'), 'PUBLIC_KNOWLEDGE_SENTINEL');
   await writeFile(path.join(runtime, 'private.txt'), 'PRIVATE_SESSION_SENTINEL');
@@ -645,14 +748,14 @@ test('never indexes private session runtime data into shared RAG', async () => {
   await rag.index('.');
   assert.equal((await rag.search('PUBLIC_KNOWLEDGE_SENTINEL'))[0]?.source, 'public.md');
   assert.deepEqual(await rag.search('PRIVATE_SESSION_SENTINEL'), []);
-  await assert.rejects(rag.index('.nano-agent'), /私有运行数据/);
+  await assert.rejects(rag.index('.mimi-agent'), /MimiAgent 私有运行数据/);
 });
 
 test('rebuilds RAG embeddings when the embedding model changes', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'nano-rag-model-'));
   const docs = path.join(root, 'knowledge');
   await mkdir(docs, { recursive: true });
-  await writeFile(path.join(docs, 'agent.md'), 'NanoAgent context management.');
+  await writeFile(path.join(docs, 'agent.md'), 'MimiAgent context management.');
   const indexFile = path.join(root, 'index.json');
   const previous = process.env.EMBEDDING_MODEL;
   let oldCalls = 0;
@@ -690,12 +793,17 @@ test('context keeps recent history and injects memory, RAG and plan', async () =
     sessionState: 'Session：demo\nPlan：1/2 completed · 当前阶段：2 test',
     historySummary: 'older conversation',
     skillCatalog: '- review: code',
-    memories: [{ id: 'm1', type: 'fact', content: 'uses TS', createdAt: '' }],
+    memories: [{
+      id: 'm1', type: 'fact', content: 'uses TS', createdAt: '',
+      personId: 'alice', personName: 'Alice Chen', sourceTrust: 'external',
+    }],
     documents: [{ source: 'doc.md', content: 'hello', score: 1 }],
     plan: [{ id: '1', description: 'test', status: 'running' }],
     goal: { objective: 'ship', status: 'active', createdAt: '', updatedAt: '' },
   });
   assert.match(instructions, /uses TS/);
+  assert.match(instructions, /person=Alice Chen/);
+  assert.match(instructions, /trust=external/);
   assert.match(instructions, /older conversation/);
   assert.match(instructions, /doc\.md/);
   assert.match(instructions, /running/);
@@ -919,7 +1027,7 @@ test('keeps plans isolated by session and writes JSONL traces', async () => {
   assert.deepEqual(await plans.get(), []);
   plans.useSession('first');
   assert.equal((await plans.get())[0]?.description, 'build');
-  const goal = await plans.setGoal('ship NanoAgent');
+  const goal = await plans.setGoal('ship MimiAgent');
   assert.equal(goal.status, 'active');
   await plans.checkpoint({ checkpoint: 'tests pass', nextAction: 'publish' });
   assert.match(await plans.resumePrompt(), /tests pass/);
@@ -1005,6 +1113,66 @@ test('requires an explicit per-server allowlist for MCP environment expansion', 
   }
 });
 
+test('passes an explicit resolver only to a trusted MCP without exposing its secret as ambient env', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-mcp-explicit-env-'));
+  const config = path.join(root, 'mcp.json');
+  const marker = path.join(root, 'mcp-environment.json');
+  const fixture = new URL('./fixtures/mcp-environment-fixture.mjs', import.meta.url);
+  const secret = 'task-mcp-explicit-secret';
+  await writeFile(config, JSON.stringify({ mcpServers: { explicit: {
+    command: process.execPath,
+    args: [fileURLToPath(fixture), marker],
+    allowedEnv: ['MCP_TASK_SECRET'],
+    env: { INJECTED_MCP_TOKEN: '${MCP_TASK_SECRET}' },
+  } } }));
+  const previous = process.env.MCP_TASK_SECRET;
+  delete process.env.MCP_TASK_SECRET;
+  const manager = new MCPManager(config, root, {
+    resolveEnvironment: (name) => name === 'MCP_TASK_SECRET' ? secret : undefined,
+  });
+  try {
+    assert.deepEqual(await manager.connect(), ['explicit']);
+    assert.deepEqual(JSON.parse(await readFile(marker, 'utf8')), {
+      injected: secret,
+    });
+    assert.equal(process.env.MCP_TASK_SECRET, undefined);
+  } finally {
+    await manager.close();
+    if (previous === undefined) delete process.env.MCP_TASK_SECRET;
+    else process.env.MCP_TASK_SECRET = previous;
+  }
+});
+
+test('collects allowedEnv only from a trusted MCP configuration and redacts connection errors', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-mcp-bundle-'));
+  const config = path.join(root, 'mcp.json');
+  const secret = 'mcp-error-secret-value';
+  await writeFile(config, JSON.stringify({ mcpServers: { explicit: {
+    command: '${MCP_TASK_SECRET}',
+    allowedEnv: ['MCP_TASK_SECRET'],
+  } } }));
+  const environment: NodeJS.ProcessEnv = { MCP_TASK_SECRET: secret };
+  assert.deepEqual(await collectTrustedMcpEnvironment(config, root, undefined, environment), {});
+  assert.deepEqual(await collectTrustedMcpEnvironment(config, root, root, environment), {
+    MCP_TASK_SECRET: secret,
+  });
+
+  const manager = new MCPManager(config, root, {
+    resolveEnvironment: (name) => environment[name],
+    redactError: (message) => message.split(secret).join('[REDACTED]'),
+  });
+  const originalError = console.error;
+  console.error = () => undefined;
+  try {
+    await manager.connect();
+    assert.doesNotMatch(JSON.stringify(manager.statuses()), new RegExp(secret));
+    assert.match(manager.statuses()[0]?.error ?? '', /REDACTED/);
+  } finally {
+    console.error = originalError;
+    await manager.close();
+  }
+});
+
 test('does not execute an untrusted workspace MCP configuration', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'nano-mcp-untrusted-'));
   const marker = path.join(root, 'executed.txt');
@@ -1018,6 +1186,21 @@ test('does not execute an untrusted workspace MCP configuration', async () => {
   assert.deepEqual(await manager.connect(), []);
   await assert.rejects(access(marker), /ENOENT/);
   assert.match(manager.statuses()[0]?.error ?? '', /not trusted/);
+});
+
+test('does not spawn stdio MCP when its configuration is not authorized', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-mcp-no-stdio-'));
+  const marker = path.join(root, 'executed.txt');
+  const config = path.join(root, 'mcp.json');
+  await writeFile(config, JSON.stringify({ mcpServers: { local: {
+    command: process.execPath,
+    args: ['-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'executed')`],
+  } } }));
+  const manager = new MCPManager(config, root, { allowStdio: false });
+
+  assert.deepEqual(await manager.connect(), []);
+  await assert.rejects(access(marker), /ENOENT/);
+  assert.match(manager.statuses()[0]?.error ?? '', /未被本机授权/);
 });
 
 test('keeps valid MCP definitions when another config entry is invalid', async () => {
@@ -1038,7 +1221,7 @@ test('keeps valid MCP definitions when another config entry is invalid', async (
 test('isolates an MCP connection failure instead of blocking startup', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'nano-mcp-'));
   const config = path.join(root, 'mcp.json');
-  await writeFile(config, JSON.stringify({ mcpServers: { broken: { command: 'nano-agent-command-that-does-not-exist' } } }));
+  await writeFile(config, JSON.stringify({ mcpServers: { broken: { command: 'mimi-agent-command-that-does-not-exist' } } }));
   const manager = new MCPManager(config, root);
   const originalError = console.error;
   console.error = () => undefined;
@@ -1048,6 +1231,54 @@ test('isolates an MCP connection failure instead of blocking startup', async () 
     await manager.close();
   } finally {
     console.error = originalError;
+  }
+});
+
+test('invalidates replaced MCP tool caches before closing the old server', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-mcp-reload-cache-'));
+  const config = path.join(root, 'mcp.json');
+  const serverName = `reload-cache-${path.basename(root)}`;
+  await writeFile(config, JSON.stringify({ mcpServers: {
+    [serverName]: { type: 'http', url: 'https://example.com/mcp' },
+  } }));
+  const calls: string[] = [];
+  const fakeServer = (label: 'old' | 'new', rejectInvalidation = false) => ({
+    cacheToolsList: true,
+    name: serverName,
+    connect: async () => { calls.push(`${label}:connect`); },
+    close: async () => { calls.push(`${label}:close`); },
+    listTools: async () => [{
+      name: `${label}_tool`,
+      description: `${label} tool`,
+      inputSchema: { type: 'object' as const, properties: {}, required: [], additionalProperties: false },
+    }],
+    callTool: async () => [],
+    invalidateToolsCache: async () => {
+      calls.push(`${label}:invalidate`);
+      await invalidateServerToolsCache(serverName);
+      if (rejectInvalidation) throw new Error('simulated invalidation failure');
+    },
+  }) as unknown as MCPServer;
+  const oldServer = fakeServer('old', true);
+  const newServer = fakeServer('new');
+  const manager = new MCPManager(config, root);
+  let factoryCalls = 0;
+  (manager as unknown as { createServer: () => MCPServer }).createServer = () => (
+    factoryCalls++ === 0 ? oldServer : newServer
+  );
+
+  try {
+    await manager.connect();
+    assert.deepEqual((await getAllMcpTools(manager.servers)).map((tool) => tool.name), ['old_tool']);
+
+    await manager.reload();
+
+    assert.ok(calls.indexOf('old:invalidate') < calls.indexOf('old:close'));
+    assert.ok(calls.includes('old:close'), 'close must run even when cache invalidation rejects');
+    assert.deepEqual((await getAllMcpTools(manager.servers)).map((tool) => tool.name), ['new_tool']);
+  } finally {
+    await manager.close();
+    await invalidateServerToolsCache(serverName);
   }
 });
 

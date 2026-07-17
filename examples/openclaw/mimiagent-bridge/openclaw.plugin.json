@@ -1,0 +1,34 @@
+{
+  "id": "mimiagent-bridge",
+  "name": "MimiAgent Bridge",
+  "description": "Routes Weixin inbound messages to the local MimiAgent daemon",
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "accountId": {
+        "type": "string",
+        "description": "Fallback channel account ID for OpenClaw releases that omit accountId from inbound_claim context.",
+        "minLength": 1,
+        "maxLength": 200
+      },
+      "socketPath": {
+        "type": "string"
+      },
+      "ownerSenders": {
+        "type": "array",
+        "description": "Exact owner sender IDs. Use sender or account:sender; unmatched senders remain external.",
+        "maxItems": 100,
+        "uniqueItems": true,
+        "items": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 701
+        }
+      }
+    }
+  }
+}

@@ -67,8 +67,8 @@ export function renderBanner(info: BannerInfo, tty = true): string {
   const muted = (text: string) => tty ? `${ansi.gray}${text}${ansi.reset}` : text;
   const strong = (text: string) => tty ? `${ansi.bold}${text}${ansi.reset}` : text;
   return [
-    `${strong('NanoAgent')} ${muted(`v${info.version}`)}`,
-    '轻量级 Agent 助手',
+    `${strong('MimiAgent')} ${muted(`v${info.version}`)}`,
+    '全天候个人 Agent',
     `模型    ${info.provider} · ${info.model}`,
     `对话    ${info.sessionTitle}`,
     `扩展    Skills ${info.skillCount} · MCP ${info.mcpServers.length || '未连接'}`,
@@ -116,11 +116,16 @@ export function renderSessionTranscript(items: AgentInputItem[], tty = true): st
       blocks.push(renderUserInput(text, tty));
       continue;
     }
-    const state = { code: false };
-    const answer = text.split(/\r?\n/).map((line) => renderMarkdownLine(line, tty, state)).join('\n');
-    blocks.push(`${badge('answer', tty)}\n${answer}`);
+    blocks.push(renderAssistantAnswer(text, tty));
   }
   return blocks.join('\n\n');
+}
+
+export function renderAssistantAnswer(value: string, tty = true): string {
+  const state = { code: false };
+  const answer = value.replace(/\x1b/g, '').trim().split(/\r?\n/)
+    .map((line) => renderMarkdownLine(line, tty, state)).join('\n');
+  return `${badge('answer', tty)}\n${answer}`;
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {
@@ -404,7 +409,10 @@ export class TerminalRenderer {
   handle(event: RunStreamEvent): void {
     const display = parseRunEvent(event);
     if (!display) return;
+    this.handleDisplay(display);
+  }
 
+  handleDisplay(display: DisplayEvent): void {
     if (display.kind === 'reasoning' && this.levelRank < 1) return;
     if (display.kind === 'status') {
       if (display.tone === 'agent' && this.levelRank < 3) return;

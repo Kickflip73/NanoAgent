@@ -18,6 +18,10 @@ export function explicitlyRequestsMemory(input: string): boolean {
   return /^(?:(?:好的?[,，。]?|请(?:你)?|请帮我|帮我|麻烦(?:你)?|我想(?:让你)?|我希望你)\s*)?(?:记住|保存.{0,10}(?:为|到)?(?:长期)?记忆|下次.{0,10}(?:记得|提醒))|^(?:please\s+)?(?:remember\b|save\b.{0,20}(?:memory|for later))|^i\s+(?:want|would like)\s+you\s+to\s+(?:remember|save)\b/iu.test(value);
 }
 
+export function explicitlyForbidsMemory(input: string): boolean {
+  return hasNegatedAction(normalize(input), '记住|保存|长期记忆|remember|save');
+}
+
 export function explicitlyRequestsSessionAccess(input: string): boolean {
   const value = normalize(input);
   const actions = '列出|查看|选择|切换|恢复|继续|打开|新建|创建|list|show|switch|resume|open|new|create';

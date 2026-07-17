@@ -1,0 +1,1915 @@
+{
+  "generatedAt": "2026-02-07T13:03:47.848Z",
+  "sourceDocId": "2747132688",
+  "sourceCommand": "uv run km edit schema --doc-id 2747132688 --nodes <from inspect.schemaNodes>",
+  "editorKey": "editorInst",
+  "requested": [
+    "emoji",
+    "doc",
+    "text",
+    "paragraph",
+    "heading",
+    "hard_break",
+    "mention",
+    "task_list",
+    "task_item",
+    "ordered_list",
+    "bullet_list",
+    "list_item",
+    "link",
+    "horizontal_rule",
+    "latex_inline",
+    "latex_block",
+    "status",
+    "image",
+    "audio",
+    "video",
+    "attachment",
+    "code_block",
+    "collapse",
+    "collapse_title",
+    "collapse_content",
+    "time",
+    "catalog",
+    "note",
+    "note_title",
+    "note_content",
+    "blockquote",
+    "spaceupdate",
+    "page_tree",
+    "table",
+    "table_row",
+    "table_cell",
+    "table_header",
+    "markdown",
+    "html",
+    "gantt",
+    "plantuml",
+    "drawio",
+    "minder",
+    "xtable",
+    "title",
+    "footnote",
+    "footnote_list",
+    "footnote_list_item",
+    "data2chart",
+    "calendar",
+    "appendix",
+    "dx_task",
+    "doc_list_view",
+    "control",
+    "open_iframe",
+    "open_link",
+    "open_card"
+  ],
+  "schema": {
+    "emoji": {
+      "exists": true,
+      "content": null,
+      "group": "inline",
+      "marks": null,
+      "inline": true,
+      "atom": true,
+      "code": false,
+      "selectable": null,
+      "draggable": true,
+      "isolating": false,
+      "defining": false,
+      "attrs": {
+        "name": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "width": {
+          "hasDefault": true,
+          "default": 24
+        },
+        "height": {
+          "hasDefault": true,
+          "default": 24
+        }
+      }
+    },
+    "doc": {
+      "exists": true,
+      "content": "title (block | xtable)+ appendix? (block | xtable)* footnote_list?",
+      "group": null,
+      "marks": null,
+      "inline": false,
+      "atom": false,
+      "code": false,
+      "selectable": null,
+      "draggable": null,
+      "isolating": false,
+      "defining": false,
+      "attrs": {}
+    },
+    "text": {
+      "exists": true,
+      "content": null,
+      "group": "inline",
+      "marks": null,
+      "inline": false,
+      "atom": false,
+      "code": false,
+      "selectable": null,
+      "draggable": null,
+      "isolating": false,
+      "defining": false,
+      "attrs": {}
+    },
+    "paragraph": {
+      "exists": true,
+      "content": "inline*",
+      "group": "block",
+      "marks": null,
+      "inline": false,
+      "atom": false,
+      "code": false,
+      "selectable": null,
+      "draggable": null,
+      "isolating": false,
+      "defining": false,
+      "attrs": {
+        "indent": {
+          "hasDefault": true,
+          "default": 0
+        },
+        "align": {
+          "hasDefault": true,
+          "default": "left"
+        },
+        "dataDiffId": {
+          "hasDefault": true,
+          "default": null
+        },
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "heading": {
+      "exists": true,
+      "content": "inline*",
+      "group": "block",
+      "marks": null,
+      "inline": false,
+      "atom": false,
+      "code": false,
+      "selectable": null,
+      "draggable": null,
+      "isolating": false,
+      "defining": true,
+      "attrs": {
+        "id": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "level": {
+          "hasDefault": true,
+          "default": 1
+        },
+        "indent": {
+          "hasDefault": true,
+          "default": 0
+        },
+        "align": {
+          "hasDefault": true,
+          "default": "left"
+        },
+        "dataDiffId": {
+          "hasDefault": true,
+          "default": null
+        },
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "hard_break": {
+      "exists": true,
+      "content": null,
+      "group": "inline",
+      "marks": null,
+      "inline": true,
+      "atom": false,
+      "code": false,
+      "selectable": false,
+      "draggable": null,
+      "isolating": false,
+      "defining": false,
+      "attrs": {}
+    },
+    "mention": {
+      "exists": true,
+      "content": null,
+      "group": "inline",
+      "marks": null,
+      "inline": true,
+      "atom": true,
+      "code": false,
+      "selectable": null,
+      "draggable": true,
+      "isolating": false,
+      "defining": false,
+      "attrs": {
+        "name": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "uid": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "anchor": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "empId": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "shouldInform": {
+          "hasDefault": true,
+          "default": false
+        },
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "task_list": {
+      "exists": true,
+      "content": "(task_item | list_item)+",
+      "group": "block",
+      "marks": null,
+      "inline": false,
+      "atom": false,
+      "code": false,
+      "selectable": null,
+      "draggable": null,
+      "isolating": false,
+      "defining": true,
+      "attrs": {
+        "indent": {
+          "hasDefault": true,
+          "default": 0
+        },
+        "dataDiffId": {
+          "hasDefault": true,
+          "default": null
+        },
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "task_item": {
+      "exists": true,
+      "content": "(paragraph | block)+",
+      "group": null,
+      "marks": "",
+      "inline": false,
+      "atom": false,
+      "code": false,
+      "selectable": null,
+      "draggable": null,
+      "isolating": false,
+      "defining": true,
+      "attrs": {
+        "checked": {
+          "hasDefault": true,
+          "default": false
+        },
+        "level": {
+          "hasDefault": true,
+          "default": 0
+        },
+        "dataListItemDiffId": {
+          "hasDefault": true,
+          "default": null
+        },
+        "fontSize": {
+          "hasDefault": true,
+          "default": null
+        },
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "ordered_list": {
+      "exists": true,
+      "content": "(list_item | task_item)+",
+      "group": "block",
+      "marks": null,
+      "inline": false,
+      "atom": false,
+      "code": false,
+      "selectable": null,
+      "draggable": null,
+      "isolating": false,
+      "defining": true,
+      "attrs": {
+        "indent": {
+          "hasDefault": true,
+          "default": 0
+        },
+        "dataDiffId": {
+          "hasDefault": true,
+          "default": null
+        },
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "bullet_list": {
+      "exists": true,
+      "content": "(list_item | task_item)+",
+      "group": "block",
+      "marks": null,
+      "inline": false,
+      "atom": false,
+      "code": false,
+      "selectable": null,
+      "draggable": null,
+      "isolating": false,
+      "defining": true,
+      "attrs": {
+        "indent": {
+          "hasDefault": true,
+          "default": 0
+        },
+        "dataDiffId": {
+          "hasDefault": true,
+          "default": null
+        },
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "list_item": {
+      "exists": true,
+      "content": "(paragraph | block)+",
+      "group": null,
+      "marks": null,
+      "inline": false,
+      "atom": false,
+      "code": false,
+      "selectable": null,
+      "draggable": null,
+      "isolating": false,
+      "defining": true,
+      "attrs": {
+        "level": {
+          "hasDefault": true,
+          "default": 0
+        },
+        "hidden": {
+          "hasDefault": true,
+          "default": false
+        },
+        "dataListItemDiffId": {
+          "hasDefault": true,
+          "default": null
+        },
+        "fontSize": {
+          "hasDefault": true,
+          "default": null
+        },
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "link": {
+      "exists": true,
+      "content": "text*",
+      "group": "inline",
+      "marks": null,
+      "inline": true,
+      "atom": false,
+      "code": false,
+      "selectable": null,
+      "draggable": null,
+      "isolating": false,
+      "defining": true,
+      "attrs": {
+        "id": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "href": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "title": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "autoUpdate": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "horizontal_rule": {
+      "exists": true,
+      "content": null,
+      "group": "block",
+      "marks": null,
+      "inline": false,
+      "atom": false,
+      "code": false,
+      "selectable": null,
+      "draggable": null,
+      "isolating": false,
+      "defining": false,
+      "attrs": {
+        "dataDiffId": {
+          "hasDefault": true,
+          "default": null
+        },
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "latex_inline": {
+      "exists": true,
+      "content": "text*",
+      "group": "inline",
+      "marks": null,
+      "inline": true,
+      "atom": true,
+      "code": false,
+      "selectable": null,
+      "draggable": null,
+      "isolating": false,
+      "defining": false,
+      "attrs": {
+        "content": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "dataDiffId": {
+          "hasDefault": true,
+          "default": null
+        },
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "latex_block": {
+      "exists": true,
+      "content": "inline*",
+      "group": "block",
+      "marks": null,
+      "inline": false,
+      "atom": true,
+      "code": false,
+      "selectable": null,
+      "draggable": true,
+      "isolating": false,
+      "defining": false,
+      "attrs": {
+        "content": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "dataDiffId": {
+          "hasDefault": true,
+          "default": null
+        },
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "status": {
+      "exists": true,
+      "content": "text*",
+      "group": "inline",
+      "marks": null,
+      "inline": true,
+      "atom": false,
+      "code": false,
+      "selectable": null,
+      "draggable": null,
+      "isolating": false,
+      "defining": true,
+      "attrs": {
+        "pattern": {
+          "hasDefault": true,
+          "default": "fill"
+        },
+        "color": {
+          "hasDefault": true,
+          "default": "#ccc"
+        },
+        "expand": {
+          "hasDefault": true,
+          "default": false
+        },
+        "input": {
+          "hasDefault": true,
+          "default": false
+        },
+        "selectedkey": {
+          "hasDefault": true,
+          "default": null
+        },
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "image": {
+      "exists": true,
+      "content": null,
+      "group": "inline",
+      "marks": null,
+      "inline": true,
+      "atom": true,
+      "code": false,
+      "selectable": null,
+      "draggable": true,
+      "isolating": false,
+      "defining": false,
+      "attrs": {
+        "src": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "small": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "origin": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "mss": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "name": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "width": {
+          "hasDefault": true,
+          "default": 0
+        },
+        "height": {
+          "hasDefault": true,
+          "default": 0
+        },
+        "link": {
+          "hasDefault": true,
+          "default": null
+        },
+        "border": {
+          "hasDefault": true,
+          "default": false
+        },
+        "isFullWidth": {
+          "hasDefault": true,
+          "default": false
+        },
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "audio": {
+      "exists": true,
+      "content": null,
+      "group": "block",
+      "marks": null,
+      "inline": false,
+      "atom": true,
+      "code": false,
+      "selectable": null,
+      "draggable": true,
+      "isolating": false,
+      "defining": false,
+      "attrs": {
+        "url": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "size": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "name": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "align": {
+          "hasDefault": true,
+          "default": "left"
+        },
+        "dataDiffId": {
+          "hasDefault": true,
+          "default": null
+        },
+        "coverImageUrl": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "video": {
+      "exists": true,
+      "content": null,
+      "group": "block",
+      "marks": null,
+      "inline": false,
+      "atom": true,
+      "code": false,
+      "selectable": null,
+      "draggable": true,
+      "isolating": false,
+      "defining": false,
+      "attrs": {
+        "url": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "size": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "name": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "width": {
+          "hasDefault": true,
+          "default": 0
+        },
+        "height": {
+          "hasDefault": true,
+          "default": 0
+        },
+        "align": {
+          "hasDefault": true,
+          "default": "left"
+        },
+        "dataDiffId": {
+          "hasDefault": true,
+          "default": null
+        },
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "attachment": {
+      "exists": true,
+      "content": null,
+      "group": "block",
+      "marks": null,
+      "inline": false,
+      "atom": true,
+      "code": false,
+      "selectable": null,
+      "draggable": true,
+      "isolating": false,
+      "defining": false,
+      "attrs": {
+        "src": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "size": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "name": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "align": {
+          "hasDefault": true,
+          "default": "left"
+        },
+        "dataDiffId": {
+          "hasDefault": true,
+          "default": null
+        },
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "code_block": {
+      "exists": true,
+      "content": "text*",
+      "group": "block",
+      "marks": "",
+      "inline": false,
+      "atom": false,
+      "code": false,
+      "selectable": null,
+      "draggable": null,
+      "isolating": false,
+      "defining": false,
+      "attrs": {
+        "language": {
+          "hasDefault": true,
+          "default": "Plain Text"
+        },
+        "theme": {
+          "hasDefault": true,
+          "default": "xq-light"
+        },
+        "title": {
+          "hasDefault": true,
+          "default": "代码块"
+        },
+        "isExpand": {
+          "hasDefault": true,
+          "default": true
+        },
+        "isCreate": {
+          "hasDefault": true,
+          "default": false
+        },
+        "dataDiffId": {
+          "hasDefault": true,
+          "default": null
+        },
+        "id": {
+          "hasDefault": true,
+          "default": null
+        },
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "collapse": {
+      "exists": true,
+      "content": "collapse_title collapse_content",
+      "group": "block",
+      "marks": null,
+      "inline": false,
+      "atom": false,
+      "code": false,
+      "selectable": null,
+      "draggable": null,
+      "isolating": true,
+      "defining": false,
+      "attrs": {
+        "active": {
+          "hasDefault": true,
+          "default": true
+        },
+        "dataDiffId": {
+          "hasDefault": true,
+          "default": null
+        },
+        "id": {
+          "hasDefault": true,
+          "default": null
+        },
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "collapse_title": {
+      "exists": true,
+      "content": "text*",
+      "group": null,
+      "marks": null,
+      "inline": false,
+      "atom": false,
+      "code": false,
+      "selectable": null,
+      "draggable": false,
+      "isolating": true,
+      "defining": false,
+      "attrs": {
+        "align": {
+          "hasDefault": true,
+          "default": "left"
+        },
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "collapse_content": {
+      "exists": true,
+      "content": "(block | xtable)+",
+      "group": null,
+      "marks": null,
+      "inline": false,
+      "atom": false,
+      "code": false,
+      "selectable": null,
+      "draggable": null,
+      "isolating": true,
+      "defining": false,
+      "attrs": {
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "time": {
+      "exists": true,
+      "content": "inline*",
+      "group": "inline",
+      "marks": null,
+      "inline": true,
+      "atom": true,
+      "code": false,
+      "selectable": null,
+      "draggable": true,
+      "isolating": false,
+      "defining": false,
+      "attrs": {
+        "isShowTime": {
+          "hasDefault": true,
+          "default": false
+        },
+        "date": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "selectKey": {
+          "hasDefault": true,
+          "default": null
+        },
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "catalog": {
+      "exists": true,
+      "content": null,
+      "group": "block",
+      "marks": null,
+      "inline": false,
+      "atom": true,
+      "code": false,
+      "selectable": null,
+      "draggable": null,
+      "isolating": false,
+      "defining": false,
+      "attrs": {
+        "style": {
+          "hasDefault": true,
+          "default": "none"
+        },
+        "dataDiffId": {
+          "hasDefault": true,
+          "default": null
+        },
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "note": {
+      "exists": true,
+      "content": "note_title note_content",
+      "group": "block",
+      "marks": null,
+      "inline": false,
+      "atom": false,
+      "code": false,
+      "selectable": null,
+      "draggable": null,
+      "isolating": true,
+      "defining": false,
+      "attrs": {
+        "type": {
+          "hasDefault": true,
+          "default": "note"
+        },
+        "hiddenTitle": {
+          "hasDefault": true,
+          "default": true
+        },
+        "dataDiffId": {
+          "hasDefault": true,
+          "default": null
+        },
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "note_title": {
+      "exists": true,
+      "content": "text*",
+      "group": null,
+      "marks": null,
+      "inline": false,
+      "atom": false,
+      "code": false,
+      "selectable": null,
+      "draggable": null,
+      "isolating": false,
+      "defining": false,
+      "attrs": {
+        "align": {
+          "hasDefault": true,
+          "default": "left"
+        },
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "note_content": {
+      "exists": true,
+      "content": "(block | xtable)+",
+      "group": null,
+      "marks": null,
+      "inline": false,
+      "atom": false,
+      "code": false,
+      "selectable": null,
+      "draggable": null,
+      "isolating": false,
+      "defining": false,
+      "attrs": {
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "blockquote": {
+      "exists": true,
+      "content": "block+",
+      "group": "block",
+      "marks": null,
+      "inline": false,
+      "atom": false,
+      "code": false,
+      "selectable": null,
+      "draggable": null,
+      "isolating": false,
+      "defining": true,
+      "attrs": {
+        "dataDiffId": {
+          "hasDefault": true,
+          "default": null
+        },
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "spaceupdate": {
+      "exists": true,
+      "content": "text*",
+      "group": "block",
+      "marks": null,
+      "inline": false,
+      "atom": true,
+      "code": false,
+      "selectable": null,
+      "draggable": true,
+      "isolating": false,
+      "defining": false,
+      "attrs": {
+        "spaceId": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "page_tree": {
+      "exists": true,
+      "content": "text*",
+      "group": "block",
+      "marks": null,
+      "inline": false,
+      "atom": true,
+      "code": false,
+      "selectable": null,
+      "draggable": true,
+      "isolating": false,
+      "defining": false,
+      "attrs": {
+        "spaceId": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "pageId": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "maxDepth": {
+          "hasDefault": true,
+          "default": 0
+        },
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "table": {
+      "exists": true,
+      "content": "table_row+",
+      "group": "block",
+      "marks": null,
+      "inline": false,
+      "atom": false,
+      "code": false,
+      "selectable": null,
+      "draggable": null,
+      "isolating": true,
+      "defining": false,
+      "attrs": {
+        "indent": {
+          "hasDefault": true,
+          "default": 0
+        },
+        "responsive": {
+          "hasDefault": true,
+          "default": false
+        },
+        "borderStyle": {
+          "hasDefault": true,
+          "default": "solid"
+        },
+        "borderWidth": {
+          "hasDefault": true,
+          "default": 1
+        },
+        "borderColor": {
+          "hasDefault": true,
+          "default": "#dddddd"
+        },
+        "dataDiffId": {
+          "hasDefault": true,
+          "default": null
+        },
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "table_row": {
+      "exists": true,
+      "content": "(table_cell | table_header)*",
+      "group": null,
+      "marks": null,
+      "inline": false,
+      "atom": false,
+      "code": false,
+      "selectable": null,
+      "draggable": null,
+      "isolating": false,
+      "defining": false,
+      "attrs": {
+        "dataRowDiffId": {
+          "hasDefault": true,
+          "default": null
+        },
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "table_cell": {
+      "exists": true,
+      "content": "(block | xtable)+",
+      "group": null,
+      "marks": null,
+      "inline": false,
+      "atom": false,
+      "code": false,
+      "selectable": null,
+      "draggable": null,
+      "isolating": true,
+      "defining": false,
+      "attrs": {
+        "colspan": {
+          "hasDefault": true,
+          "default": 1
+        },
+        "rowspan": {
+          "hasDefault": true,
+          "default": 1
+        },
+        "colwidth": {
+          "hasDefault": true,
+          "default": [
+            68
+          ]
+        },
+        "textAlign": {
+          "hasDefault": true,
+          "default": null
+        },
+        "verticalAlign": {
+          "hasDefault": true,
+          "default": null
+        },
+        "bgColor": {
+          "hasDefault": true,
+          "default": null
+        },
+        "color": {
+          "hasDefault": true,
+          "default": null
+        },
+        "numCell": {
+          "hasDefault": true,
+          "default": null
+        },
+        "dataCellDiffId": {
+          "hasDefault": true,
+          "default": null
+        },
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "table_header": {
+      "exists": true,
+      "content": "block+",
+      "group": null,
+      "marks": null,
+      "inline": false,
+      "atom": false,
+      "code": false,
+      "selectable": null,
+      "draggable": null,
+      "isolating": true,
+      "defining": false,
+      "attrs": {
+        "colspan": {
+          "hasDefault": true,
+          "default": 1
+        },
+        "rowspan": {
+          "hasDefault": true,
+          "default": 1
+        },
+        "colwidth": {
+          "hasDefault": true,
+          "default": [
+            68
+          ]
+        },
+        "textAlign": {
+          "hasDefault": true,
+          "default": null
+        },
+        "verticalAlign": {
+          "hasDefault": true,
+          "default": null
+        },
+        "bgColor": {
+          "hasDefault": true,
+          "default": null
+        },
+        "color": {
+          "hasDefault": true,
+          "default": null
+        },
+        "numCell": {
+          "hasDefault": true,
+          "default": null
+        },
+        "dataCellDiffId": {
+          "hasDefault": true,
+          "default": null
+        },
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "markdown": {
+      "exists": true,
+      "content": "inline*",
+      "group": "block",
+      "marks": null,
+      "inline": false,
+      "atom": true,
+      "code": false,
+      "selectable": null,
+      "draggable": true,
+      "isolating": false,
+      "defining": false,
+      "attrs": {
+        "content": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "source": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "dataDiffId": {
+          "hasDefault": true,
+          "default": null
+        },
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "html": {
+      "exists": true,
+      "content": "inline*",
+      "group": "block",
+      "marks": null,
+      "inline": false,
+      "atom": true,
+      "code": false,
+      "selectable": null,
+      "draggable": true,
+      "isolating": false,
+      "defining": false,
+      "attrs": {
+        "content": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "source": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "dataDiffId": {
+          "hasDefault": true,
+          "default": null
+        },
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "gantt": {
+      "exists": true,
+      "content": "inline*",
+      "group": "block",
+      "marks": null,
+      "inline": false,
+      "atom": true,
+      "code": false,
+      "selectable": null,
+      "draggable": null,
+      "isolating": false,
+      "defining": false,
+      "attrs": {
+        "id": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "height": {
+          "hasDefault": true,
+          "default": "0"
+        },
+        "version": {
+          "hasDefault": true,
+          "default": "0"
+        },
+        "dataDiffId": {
+          "hasDefault": true,
+          "default": null
+        },
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "plantuml": {
+      "exists": true,
+      "content": null,
+      "group": "inline",
+      "marks": null,
+      "inline": true,
+      "atom": true,
+      "code": false,
+      "selectable": null,
+      "draggable": true,
+      "isolating": false,
+      "defining": false,
+      "attrs": {
+        "content": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "width": {
+          "hasDefault": true,
+          "default": 64
+        },
+        "height": {
+          "hasDefault": true,
+          "default": 64
+        },
+        "border": {
+          "hasDefault": true,
+          "default": false
+        },
+        "resize": {
+          "hasDefault": true,
+          "default": true
+        },
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "drawio": {
+      "exists": true,
+      "content": null,
+      "group": "inline",
+      "marks": null,
+      "inline": true,
+      "atom": true,
+      "code": false,
+      "selectable": null,
+      "draggable": true,
+      "isolating": false,
+      "defining": false,
+      "attrs": {
+        "src": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "xml": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "mss": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "mssXml": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "width": {
+          "hasDefault": true,
+          "default": 0
+        },
+        "height": {
+          "hasDefault": true,
+          "default": 0
+        },
+        "border": {
+          "hasDefault": true,
+          "default": true
+        },
+        "hadResize": {
+          "hasDefault": true,
+          "default": false
+        },
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "minder": {
+      "exists": true,
+      "content": null,
+      "group": "inline",
+      "marks": null,
+      "inline": true,
+      "atom": true,
+      "code": false,
+      "selectable": null,
+      "draggable": true,
+      "isolating": false,
+      "defining": false,
+      "attrs": {
+        "src": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "width": {
+          "hasDefault": true,
+          "default": 0
+        },
+        "height": {
+          "hasDefault": true,
+          "default": 0
+        },
+        "border": {
+          "hasDefault": true,
+          "default": true
+        },
+        "hadResize": {
+          "hasDefault": true,
+          "default": false
+        },
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "xtable": {
+      "exists": true,
+      "content": null,
+      "group": null,
+      "marks": null,
+      "inline": false,
+      "atom": false,
+      "code": false,
+      "selectable": null,
+      "draggable": false,
+      "isolating": false,
+      "defining": false,
+      "attrs": {
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        },
+        "xtableId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "title": {
+      "exists": true,
+      "content": "text*",
+      "group": null,
+      "marks": "quote",
+      "inline": false,
+      "atom": false,
+      "code": false,
+      "selectable": null,
+      "draggable": null,
+      "isolating": false,
+      "defining": false,
+      "attrs": {
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "footnote": {
+      "exists": true,
+      "content": null,
+      "group": "inline",
+      "marks": null,
+      "inline": true,
+      "atom": false,
+      "code": false,
+      "selectable": null,
+      "draggable": true,
+      "isolating": false,
+      "defining": false,
+      "attrs": {
+        "annotate": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "id": {
+          "hasDefault": true,
+          "default": null
+        },
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "footnote_list": {
+      "exists": true,
+      "content": "footnote_list_item*",
+      "group": null,
+      "marks": null,
+      "inline": false,
+      "atom": false,
+      "code": false,
+      "selectable": false,
+      "draggable": false,
+      "isolating": false,
+      "defining": false,
+      "attrs": {
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "footnote_list_item": {
+      "exists": true,
+      "content": "paragraph+",
+      "group": null,
+      "marks": null,
+      "inline": false,
+      "atom": false,
+      "code": false,
+      "selectable": false,
+      "draggable": false,
+      "isolating": false,
+      "defining": false,
+      "attrs": {
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        },
+        "footnoteNodeId": {
+          "hasDefault": true,
+          "default": ""
+        }
+      }
+    },
+    "data2chart": {
+      "exists": true,
+      "content": null,
+      "group": "inline",
+      "marks": null,
+      "inline": true,
+      "atom": true,
+      "code": false,
+      "selectable": null,
+      "draggable": null,
+      "isolating": false,
+      "defining": false,
+      "attrs": {
+        "id": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "config": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "chartData": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "pageId": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "chartId": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "height": {
+          "hasDefault": true,
+          "default": 400
+        },
+        "width": {
+          "hasDefault": true,
+          "default": 600
+        },
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "calendar": {
+      "exists": true,
+      "content": null,
+      "group": "block",
+      "marks": null,
+      "inline": false,
+      "atom": true,
+      "code": false,
+      "selectable": true,
+      "draggable": false,
+      "isolating": false,
+      "defining": false,
+      "attrs": {
+        "id": {
+          "hasDefault": true,
+          "default": 0
+        },
+        "view": {
+          "hasDefault": true,
+          "default": "month"
+        },
+        "docId": {
+          "hasDefault": true,
+          "default": 0
+        },
+        "paste": {
+          "hasDefault": true,
+          "default": 0
+        },
+        "dataDiffId": {
+          "hasDefault": true,
+          "default": null
+        },
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "appendix": {
+      "exists": true,
+      "content": null,
+      "group": null,
+      "marks": null,
+      "inline": false,
+      "atom": false,
+      "code": false,
+      "selectable": null,
+      "draggable": null,
+      "isolating": true,
+      "defining": false,
+      "attrs": {
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "dx_task": {
+      "exists": true,
+      "content": null,
+      "group": "block",
+      "marks": null,
+      "inline": false,
+      "atom": false,
+      "code": false,
+      "selectable": null,
+      "draggable": null,
+      "isolating": false,
+      "defining": false,
+      "attrs": {
+        "nodeId": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "refId": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "indent": {
+          "hasDefault": true,
+          "default": 0
+        }
+      }
+    },
+    "doc_list_view": {
+      "exists": true,
+      "content": null,
+      "group": "block",
+      "marks": null,
+      "inline": false,
+      "atom": true,
+      "code": false,
+      "selectable": null,
+      "draggable": true,
+      "isolating": false,
+      "defining": false,
+      "attrs": {
+        "parentDocType": {
+          "hasDefault": true,
+          "default": "current"
+        },
+        "spaceId": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "pageId": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "displayType": {
+          "hasDefault": true,
+          "default": "catalog"
+        },
+        "order": {
+          "hasDefault": true,
+          "default": "asc"
+        },
+        "displayCount": {
+          "hasDefault": true,
+          "default": 14
+        },
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "control": {
+      "exists": true,
+      "content": null,
+      "group": "block",
+      "marks": null,
+      "inline": false,
+      "atom": true,
+      "code": false,
+      "selectable": null,
+      "draggable": true,
+      "isolating": false,
+      "defining": false,
+      "attrs": {
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        },
+        "type": {
+          "hasDefault": true,
+          "default": null
+        },
+        "name": {
+          "hasDefault": true,
+          "default": null
+        },
+        "mode": {
+          "hasDefault": true,
+          "default": null
+        },
+        "key": {
+          "hasDefault": true,
+          "default": null
+        },
+        "value": {
+          "hasDefault": true,
+          "default": null
+        },
+        "align": {
+          "hasDefault": true,
+          "default": "left"
+        }
+      }
+    },
+    "open_iframe": {
+      "exists": true,
+      "content": null,
+      "group": "block",
+      "marks": null,
+      "inline": false,
+      "atom": false,
+      "code": false,
+      "selectable": null,
+      "draggable": null,
+      "isolating": false,
+      "defining": false,
+      "attrs": {
+        "src": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "width": {
+          "hasDefault": true,
+          "default": null
+        },
+        "height": {
+          "hasDefault": true,
+          "default": null
+        },
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        },
+        "type": {
+          "hasDefault": true,
+          "default": null
+        },
+        "align": {
+          "hasDefault": true,
+          "default": "left"
+        },
+        "attachmentId": {
+          "hasDefault": true,
+          "default": null
+        },
+        "bindParams": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "open_link": {
+      "exists": true,
+      "content": null,
+      "group": "inline",
+      "marks": null,
+      "inline": true,
+      "atom": false,
+      "code": false,
+      "selectable": null,
+      "draggable": null,
+      "isolating": false,
+      "defining": false,
+      "attrs": {
+        "href": {
+          "hasDefault": true,
+          "default": null
+        },
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        },
+        "type": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    },
+    "open_card": {
+      "exists": true,
+      "content": null,
+      "group": "block",
+      "marks": null,
+      "inline": false,
+      "atom": false,
+      "code": false,
+      "selectable": null,
+      "draggable": null,
+      "isolating": false,
+      "defining": false,
+      "attrs": {
+        "url": {
+          "hasDefault": true,
+          "default": ""
+        },
+        "width": {
+          "hasDefault": true,
+          "default": null
+        },
+        "height": {
+          "hasDefault": true,
+          "default": null
+        },
+        "nodeId": {
+          "hasDefault": true,
+          "default": null
+        },
+        "type": {
+          "hasDefault": true,
+          "default": null
+        },
+        "align": {
+          "hasDefault": true,
+          "default": "left"
+        },
+        "refId": {
+          "hasDefault": true,
+          "default": null
+        }
+      }
+    }
+  }
+}

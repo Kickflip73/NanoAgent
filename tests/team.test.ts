@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, symlink } from 'node:fs/promises';
+import { mkdir, mkdtemp, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -12,7 +12,7 @@ import {
   toolsForMode,
   toolsForPermission,
 } from '../src/runtime/tool-policy.js';
-import { AGENT_MODES } from '../src/runtime/instructions.js';
+import { AGENT_MODES, BASE_INSTRUCTIONS } from '../src/runtime/instructions.js';
 import { createTeamWorkerTools } from '../src/runtime/team-worker-tools.js';
 
 async function store(name = 'demo') {
@@ -184,6 +184,7 @@ test('runs an Ultra Team wave concurrently with bounded independent workers', as
 
 test('runs one ready Team task so dependency pipelines can advance', async () => {
   const team = await store();
+  let prompt = '';
   await team.set([
     { id: 'inspect', description: 'inspect', role: 'explorer', dependencies: [], paths: [] },
     { id: 'review', description: 'review', role: 'reviewer', dependencies: ['inspect'], paths: [] },
@@ -193,7 +194,10 @@ test('runs one ready Team task so dependency pipelines can advance', async () =>
     model: 'gpt-5-mini',
     tools: [],
     workspaceRoot: '/tmp',
-    runWorker: async () => 'done',
+    runWorker: async (_task, workerPrompt) => {
+      prompt = workerPrompt;
+      return 'done';
+    },
   });
   const runTeam = tools.find((item) => item.name === 'run_team');
   assert.ok(runTeam && 'invoke' in runTeam);
@@ -202,6 +206,7 @@ test('runs one ready Team task so dependency pipelines can advance', async () =>
 
   assert.equal((await team.list()).find((task) => task.id === 'inspect')?.status, 'completed');
   assert.deepEqual((await team.ready()).map((task) => task.id), ['review']);
+  assert.match(prompt, /MimiAgent Ultra Team/);
 });
 
 test('contains a stale worker result after its claim has already been ended', async () => {
@@ -302,6 +307,7 @@ test('rejects overlapping builder ownership and Plan hides mutating tools', () =
   assert.ok(!teamRoleToolNames('explorer').includes('http_request'));
   assert.ok(!teamRoleToolNames('builder').includes('run_shell'));
   assert.deepEqual(AGENT_MODES.map((item) => item.id), ['general', 'plan', 'ultra']);
+  assert.match(BASE_INSTRUCTIONS, /MimiAgent/);
 });
 
 test('does not let read-only Ultra builders regain mutation tools', () => {
@@ -312,15 +318,40 @@ test('does not let read-only Ultra builders regain mutation tools', () => {
   };
   const root = path.resolve('/tmp/nano-read-only-worker');
   const readOnly = createTeamWorkerTools({
-    workspaceRoot: root, dataRoot: path.join(root, '.nano-agent'), permissionMode: 'read-only', task,
+    workspaceRoot: root, dataRoot: path.join(root, '.mimi-agent'), permissionMode: 'read-only', task,
   }).map((tool) => tool.name);
   const workspace = createTeamWorkerTools({
-    workspaceRoot: root, dataRoot: path.join(root, '.nano-agent'), permissionMode: 'workspace', task,
+    workspaceRoot: root, dataRoot: path.join(root, '.mimi-agent'), permissionMode: 'workspace', task,
   }).map((tool) => tool.name);
   assert.ok(!readOnly.includes('write_file'));
   assert.ok(!readOnly.includes('edit_file'));
   assert.ok(!readOnly.includes('move_file'));
   assert.ok(workspace.includes('write_file'));
+});
+
+test('protects both MimiAgent and legacy MimiAgent state from Team workers', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-team-private-'));
+  const task = {
+    id: 'inspect', description: 'inspect', role: 'explorer' as const, status: 'pending' as const,
+    dependencies: [], paths: [], createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+  };
+  for (const directory of ['.mimi-agent', '.mimi-agent']) {
+    await mkdir(path.join(root, directory), { recursive: true });
+    await writeFile(path.join(root, directory, 'private.txt'), `${directory}-private`);
+  }
+  const tools = createTeamWorkerTools({
+    workspaceRoot: root, dataRoot: path.join(root, 'custom-state'), permissionMode: 'workspace', task,
+  });
+  const read = tools.find((tool) => tool.name === 'read_file');
+  assert.ok(read && 'invoke' in read);
+
+  for (const directory of ['.mimi-agent', '.mimi-agent']) {
+    const result = String(await read.invoke(
+      new RunContext({}),
+      JSON.stringify({ path: path.join(directory, 'private.txt') }),
+    ));
+    assert.match(result, /私有运行数据|拒绝|禁止/);
+  }
 });
 
 test('treats symlink aliases as overlapping builder ownership', async () => {

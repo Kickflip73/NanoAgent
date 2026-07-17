@@ -1,10 +1,10 @@
 [
   {
-    "query": "NanoAgent 使用什么语言和 SDK？",
-    "expectedSource": "knowledge/nano-agent.md"
+    "query": "MimiAgent 使用什么语言和 SDK？",
+    "expectedSource": "knowledge/mimi-agent.md"
   },
   {
-    "query": "NanoAgent 的运行数据保存在哪里？",
-    "expectedSource": "knowledge/nano-agent.md"
+    "query": "MimiAgent 的运行数据保存在哪里？",
+    "expectedSource": "knowledge/mimi-agent.md"
   }
 ]

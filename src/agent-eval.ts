@@ -15,17 +15,17 @@ const cases = JSON.parse(await readFile(path.join(root, 'evals', 'agent-cases.js
 let passed = 0;
 
 for (const item of cases) {
-  const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'nano-agent-eval-'));
+  const dataRoot = await mkdtemp(path.join(os.tmpdir(), 'mimi-agent-eval-'));
   try {
     const output = await new Promise<string>((resolve, reject) => {
       const child = spawn(process.execPath, ['--import', 'tsx', 'src/index.ts', item.input], {
         cwd: root,
         env: {
           ...process.env,
-          AGENT_DATA_DIR: dataRoot,
-          AGENT_SESSION: 'eval',
-          MAX_TURNS: '12',
-          OUTPUT_LEVEL: 'trace',
+          MIMI_DATA_DIR: dataRoot,
+          MIMI_SESSION: 'eval',
+          MIMI_MAX_TURNS: '12',
+          MIMI_OUTPUT_LEVEL: 'trace',
           ...item.env,
         },
         stdio: ['ignore', 'pipe', 'pipe'],

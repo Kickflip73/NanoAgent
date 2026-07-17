@@ -28,6 +28,6 @@
 ## 设计取舍
 
 - 不引入 LangGraph、数据库、外部队列、tmux、worktree 或 P2P mailbox；保持单进程、一个 lead、一层 worker。
-- 文件 paths 是调度冲突门禁与 worker 责任边界，不是操作系统沙箱；NanoAgent 仍使用当前用户权限。
+- 文件 paths 是调度冲突门禁与 worker 责任边界，不是操作系统沙箱；MimiAgent 仍使用当前用户权限。
 - Team task list 保存结构化结果摘要，不把 worker 完整上下文写进主 Session，控制上下文与成本。
 - 失败任务必须显式 retry，避免恢复时无意重复 completed 工作。

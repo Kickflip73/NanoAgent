@@ -7,12 +7,25 @@ export interface ExecutionCall {
   runId: string;
   toolName: string;
   callId: string;
+  modelCallId?: string;
   argumentsJson: string;
 }
 
-type ExecutionStatus = 'started' | 'succeeded' | 'failed';
+export interface SucceededExecutionCall extends ExecutionCall {
+  output: unknown;
+}
+
+export interface ExecutionCallRecord extends ExecutionCall {
+  modelCallIds?: string[];
+  status: ExecutionStatus;
+  output?: unknown;
+  error?: string;
+}
+
+export type ExecutionStatus = 'started' | 'succeeded' | 'failed' | 'uncertain';
 
 interface ExecutionEntry extends ExecutionCall {
+  modelCallIds?: string[];
   key: string;
   argumentsHash: string;
   status: ExecutionStatus;
@@ -33,9 +46,11 @@ const entrySchema = z.object({
   runId: z.string(),
   toolName: z.string(),
   callId: z.string(),
+  modelCallId: z.string().optional(),
+  modelCallIds: z.array(z.string()).optional(),
   argumentsJson: z.string(),
   argumentsHash: z.string(),
-  status: z.enum(['started', 'succeeded', 'failed']),
+  status: z.enum(['started', 'succeeded', 'failed', 'uncertain']),
   outputJson: z.string().optional(),
   error: z.string().optional(),
   startedAt: z.string(),
@@ -51,6 +66,16 @@ function executionKey(call: ExecutionCall): string {
   return digest([call.sessionId, call.runId, call.toolName, call.callId].join('\0'));
 }
 
+function receiptCall(sessionId: string, runId: string): ExecutionCall {
+  return {
+    sessionId,
+    runId,
+    toolName: '__mimi_execution_receipt__',
+    callId: 'completed',
+    argumentsJson: '{}',
+  };
+}
+
 function serializeOutput(value: unknown, maxBytes: number): string {
   const output = JSON.stringify([value]);
   if (output === undefined) throw new Error('工具输出无法序列化，不能提交执行账本');
@@ -59,7 +84,9 @@ function serializeOutput(value: unknown, maxBytes: number): string {
 }
 
 function deserializeOutput<T>(value: string): T {
-  return (JSON.parse(value) as [T])[0];
+  const parsed = JSON.parse(value) as unknown;
+  if (!Array.isArray(parsed) || parsed.length !== 1) throw new Error('执行账本输出格式无效');
+  return parsed[0] as T;
 }
 
 export class ExecutionLedger {
@@ -104,11 +131,89 @@ export class ExecutionLedger {
     return execution;
   }
 
+  commitReceipt<T>(sessionId: string, runId: string, receipt: T): Promise<T> {
+    return this.executeOnce(receiptCall(sessionId, runId), async () => receipt);
+  }
+
+  async getReceipt<T>(sessionId: string, runId: string): Promise<T | undefined> {
+    const call = receiptCall(sessionId, runId);
+    const entry = (await this.state.read()).entries[executionKey(call)];
+    if (!entry) return undefined;
+    if (entry.argumentsHash !== digest(call.argumentsJson)) {
+      throw new Error(`Execution ${runId} 的完成回执参数冲突`);
+    }
+    if (entry.status !== 'succeeded' || entry.outputJson === undefined) {
+      throw new Error(`Execution ${runId} 的完成回执处于 ${entry.status} 状态，拒绝自动重跑`);
+    }
+    return deserializeOutput<T>(entry.outputJson);
+  }
+
+  async clearReceipt(sessionId: string, runId: string): Promise<void> {
+    const key = executionKey(receiptCall(sessionId, runId));
+    await this.state.updateWhen((ledger) => {
+      if (!ledger.entries[key]) return { result: undefined, changed: false };
+      delete ledger.entries[key];
+      return { result: undefined, changed: true };
+    });
+  }
+
   async clearSession(sessionId: string): Promise<void> {
     await this.state.updateWhen((ledger) => {
       let changed = false;
       for (const [key, entry] of Object.entries(ledger.entries)) {
         if (entry.sessionId === sessionId) {
+          delete ledger.entries[key];
+          changed = true;
+        }
+      }
+      return { result: undefined, changed };
+    });
+  }
+
+  async listSucceededCalls(sessionId: string, runId: string): Promise<SucceededExecutionCall[]> {
+    const entries = Object.values((await this.state.read()).entries)
+      .filter((entry) => entry.sessionId === sessionId && entry.runId === runId && entry.status === 'succeeded')
+      .sort((left, right) => left.startedAt.localeCompare(right.startedAt) || left.key.localeCompare(right.key));
+    return entries.map((entry) => {
+      if (entry.outputJson === undefined) throw new Error(`工具调用 ${entry.callId} 缺少成功输出`);
+      return {
+        sessionId: entry.sessionId,
+        runId: entry.runId,
+        toolName: entry.toolName,
+        callId: entry.callId,
+        ...(entry.modelCallId ? { modelCallId: entry.modelCallId } : {}),
+        argumentsJson: entry.argumentsJson,
+        output: deserializeOutput<unknown>(entry.outputJson),
+      };
+    });
+  }
+
+  async listCalls(sessionId: string, runId: string): Promise<ExecutionCallRecord[]> {
+    const entries = Object.values((await this.state.read()).entries)
+      .filter((entry) => entry.sessionId === sessionId
+        && (entry.runId === runId || entry.runId.startsWith(`${runId}:`))
+        && entry.toolName !== '__mimi_execution_receipt__')
+      .sort((left, right) => left.startedAt.localeCompare(right.startedAt) || left.key.localeCompare(right.key));
+    return entries.map((entry) => ({
+      sessionId: entry.sessionId,
+      runId: entry.runId,
+      toolName: entry.toolName,
+      callId: entry.callId,
+      ...(entry.modelCallId ? { modelCallId: entry.modelCallId } : {}),
+      ...(entry.modelCallIds?.length ? { modelCallIds: entry.modelCallIds } : {}),
+      argumentsJson: entry.argumentsJson,
+      status: entry.status,
+      ...(entry.outputJson === undefined ? {} : { output: deserializeOutput<unknown>(entry.outputJson) }),
+      ...(entry.error === undefined ? {} : { error: entry.error }),
+    }));
+  }
+
+  async clearSessionExcept(sessionId: string, retainedRunId: string): Promise<void> {
+    await this.state.updateWhen((ledger) => {
+      let changed = false;
+      for (const [key, entry] of Object.entries(ledger.entries)) {
+        const retained = entry.runId === retainedRunId || entry.runId.startsWith(`${retainedRunId}:`);
+        if (entry.sessionId === sessionId && !retained) {
           delete ledger.entries[key];
           changed = true;
         }
@@ -141,7 +246,11 @@ export class ExecutionLedger {
       if (existing) {
         if (existing.argumentsHash !== argumentsHash) throw new Error(`工具调用 ${call.callId} 参数冲突，拒绝执行`);
         if (existing.status === 'succeeded' && existing.outputJson !== undefined) {
-          return { result: { outputJson: existing.outputJson }, changed: false };
+          const aliases = new Set(existing.modelCallIds ?? (existing.modelCallId ? [existing.modelCallId] : []));
+          const before = aliases.size;
+          if (call.modelCallId) aliases.add(call.modelCallId);
+          existing.modelCallIds = [...aliases];
+          return { result: { outputJson: existing.outputJson }, changed: aliases.size !== before };
         }
         throw new Error(`工具调用 ${call.callId} 之前处于 ${existing.status} 状态，为避免重复副作用不会自动重试`);
       }
@@ -152,6 +261,7 @@ export class ExecutionLedger {
       const now = new Date().toISOString();
       ledger.entries[key] = {
         ...call,
+        ...(call.modelCallId ? { modelCallIds: [call.modelCallId] } : {}),
         key,
         argumentsHash,
         status: 'started',
@@ -179,7 +289,9 @@ export class ExecutionLedger {
       await this.state.update((ledger) => {
         const entry = ledger.entries[key];
         if (entry?.status === 'started' && entry.argumentsHash === argumentsHash) {
-          entry.status = 'failed';
+          const uncertain = error instanceof Error
+            && (error.name.includes('Uncertain') || /结果不确定|outcome uncertain/i.test(error.message));
+          entry.status = uncertain ? 'uncertain' : 'failed';
           entry.error = error instanceof Error ? error.message.slice(0, 4_000) : String(error).slice(0, 4_000);
           entry.updatedAt = new Date().toISOString();
         }

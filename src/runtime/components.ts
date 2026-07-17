@@ -1,7 +1,6 @@
-import os from 'node:os';
 import path from 'node:path';
 import OpenAI from 'openai';
-import type { AppConfig } from '../config.js';
+import { preferredEnvironmentValue, privateRuntimePaths, type AppConfig } from '../config.js';
 import { ContextManager } from '../core/context.js';
 import { ExecutionLedger } from '../core/execution-ledger.js';
 import { GuidanceLoader } from '../core/guidance.js';
@@ -9,34 +8,10 @@ import { MemoryStore } from '../core/memory.js';
 import { PlanStore } from '../core/plan.js';
 import { TeamTaskStore } from '../core/team.js';
 import { TraceStore } from '../core/trace.js';
-import { MCPManager } from '../extensions/mcp.js';
+import { isMcpConfigurationTrusted, MCPManager } from '../extensions/mcp.js';
 import { RagStore } from '../extensions/rag.js';
 import { SkillLoader } from '../extensions/skills.js';
 import { createModel, type ModelRuntime } from './model.js';
-
-async function isWorkspaceConfig(configFile: string, workspaceRoot: string): Promise<boolean> {
-  const root = path.resolve(workspaceRoot);
-  const target = path.resolve(configFile);
-  const lexical = path.relative(root, target);
-  if (lexical === '' || (!lexical.startsWith('..') && !path.isAbsolute(lexical))) return true;
-  try {
-    const { realpath } = await import('node:fs/promises');
-    const [canonicalRoot, canonicalTarget] = await Promise.all([realpath(root), realpath(target)]);
-    const relative = path.relative(canonicalRoot, canonicalTarget);
-    return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
-  } catch {
-    return false;
-  }
-}
-
-async function canonicalPath(value: string): Promise<string> {
-  try {
-    const { realpath } = await import('node:fs/promises');
-    return await realpath(value);
-  } catch {
-    return path.resolve(value);
-  }
-}
 
 export interface RuntimeComponents {
   modelRuntime: ModelRuntime;
@@ -53,22 +28,51 @@ export interface RuntimeComponents {
   sessionId: string;
 }
 
-export async function createRuntimeComponents(config: AppConfig): Promise<RuntimeComponents> {
+export async function createRuntimeComponents(
+  config: AppConfig,
+  requestedSessionId?: string,
+  options: {
+    mcpEnvironment?: Readonly<Record<string, string>>;
+    enableMcp?: boolean;
+    releaseMcpEnvironmentAfterConnect?: boolean;
+  } = {},
+): Promise<RuntimeComponents> {
   const modelRuntime = createModel(config);
   const embeddingClient = process.env.OPENAI_API_KEY
     ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY, fetch: globalThis.fetch })
     : undefined;
-  const sessionId = process.env.AGENT_SESSION ?? 'default';
-  const protectedPaths = [config.dataRoot, path.join(os.homedir(), '.nano-agent')];
+  const sessionId = requestedSessionId
+    ?? preferredEnvironmentValue('MIMI_SESSION', 'AGENT_SESSION')
+    ?? 'default';
+  const protectedPaths = privateRuntimePaths(config);
   const skills = new SkillLoader(config.skillsRoot);
-  const workspaceMcp = await isWorkspaceConfig(config.mcpConfig, config.workspaceRoot);
-  const workspaceTrusted = config.trustedWorkspaceMcp !== undefined
-    && await canonicalPath(config.trustedWorkspaceMcp) === await canonicalPath(config.workspaceRoot);
+  const mcpTrusted = await isMcpConfigurationTrusted(
+    config.mcpConfig,
+    config.workspaceRoot,
+    config.trustedWorkspaceMcp,
+  );
+  const mcpEnabled = options.enableMcp !== false && mcpTrusted;
+  const mcpSecrets = Object.values(options.mcpEnvironment ?? {}).filter(Boolean);
   const mcp = new MCPManager(config.mcpConfig, config.workspaceRoot, {
-    enabled: !workspaceMcp || workspaceTrusted,
-    disabledReason: '项目 MCP 默认不执行；确认仓库可信后把 TRUST_WORKSPACE_MCP 设为该工作区绝对路径',
+    enabled: mcpEnabled,
+    disabledReason: options.enableMcp === false
+      ? '当前 Task 不允许 MCP'
+      : '项目 MCP 默认不执行；确认仓库可信后把 MIMI_TRUST_WORKSPACE_MCP 设为该工作区绝对路径',
+    // Trusting a workspace MCP configuration authorizes its declared transports.
+    // Local file/Shell permission modes remain a separate boundary for built-in tools.
+    allowStdio: mcpEnabled,
+    resolveEnvironment: options.mcpEnvironment
+      ? (name) => options.mcpEnvironment?.[name]
+      : undefined,
+    redactError: mcpSecrets.length > 0
+      ? (message) => mcpSecrets.reduce(
+          (redacted, secret) => redacted.split(secret).join('[REDACTED]'),
+          message,
+        )
+      : undefined,
   });
   await Promise.all([skills.load(), mcp.connect()]);
+  if (options.releaseMcpEnvironmentAfterConnect) mcpSecrets.length = 0;
   return {
     modelRuntime,
     context: new ContextManager(

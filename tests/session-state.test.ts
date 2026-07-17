@@ -15,7 +15,7 @@ test('builds an honest best-effort resume prompt from all durable task state', (
       lastEvent: '已完成状态文件', nextAction: '运行测试', startedAt: now, updatedAt: now,
     },
     goal: {
-      objective: '完善 NanoAgent', status: 'active', checkpoint: '状态层完成',
+      objective: '完善 MimiAgent', status: 'active', checkpoint: '状态层完成',
       nextAction: '收尾', createdAt: now, updatedAt: now,
     },
     steps: [{ id: 'test', description: '运行全量测试', status: 'pending' }],
@@ -27,7 +27,7 @@ test('builds an honest best-effort resume prompt from all durable task state', (
   });
 
   assert.match(prompt, /修复状态层/);
-  assert.match(prompt, /完善 NanoAgent/);
+  assert.match(prompt, /完善 MimiAgent/);
   assert.match(prompt, /运行全量测试/);
   assert.match(prompt, /review/);
   assert.match(prompt, /best-effort/);

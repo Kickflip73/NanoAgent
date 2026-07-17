@@ -1,4 +1,4 @@
-import { OpenAIChatCompletionsModel, type Model } from '@openai/agents';
+import { OpenAIChatCompletionsModel, type AgentInputItem, type Model } from '@openai/agents';
 import OpenAI from 'openai';
 import type { AppConfig } from '../config.js';
 
@@ -13,6 +13,21 @@ export interface ModelRuntime {
 export interface ModelProfile {
   contextWindow: number;
   outputReserve: number;
+}
+
+export function normalizeModelInput(
+  provider: AppConfig['provider'],
+  items: AgentInputItem[],
+): AgentInputItem[] {
+  if (provider !== 'openai') return items;
+  return items.map((item) => {
+    const value = item as unknown as Record<string, unknown>;
+    if (value.type !== 'message' || typeof value.id !== 'string' || value.id.startsWith('msg')) {
+      return item;
+    }
+    const { id: _providerSpecificId, ...portable } = value;
+    return portable as unknown as AgentInputItem;
+  });
 }
 
 const MODEL_PROFILES: Record<string, ModelProfile> = {

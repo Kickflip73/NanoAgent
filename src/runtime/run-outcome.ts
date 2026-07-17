@@ -5,6 +5,14 @@ export class RunInterruptedError extends Error {
   }
 }
 
+/** An owner decision that must not be resumed automatically. */
+export class TerminalRunInterruptedError extends RunInterruptedError {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = 'TerminalRunInterruptedError';
+  }
+}
+
 export function assertRunCanComplete(
   result: { cancelled?: boolean; interruptions?: readonly unknown[] },
   signal?: AbortSignal,
@@ -22,4 +30,15 @@ export function assertRunCanComplete(
 
 export function isRunInterrupted(error: unknown, signal?: AbortSignal): boolean {
   return error instanceof RunInterruptedError || signal?.aborted === true;
+}
+
+export function isTerminalRunInterruption(error: unknown): boolean {
+  const seen = new Set<unknown>();
+  let current = error;
+  while (current instanceof Error && !seen.has(current)) {
+    if (current instanceof TerminalRunInterruptedError) return true;
+    seen.add(current);
+    current = current.cause;
+  }
+  return false;
 }

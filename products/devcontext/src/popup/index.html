@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DevContext</title>
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <header>
+    <h1>🧠 DevContext</h1>
+    <p class="subtitle">Copy code with context for AI</p>
+  </header>
+
+  <main>
+    <section class="stats" id="stats">
+      <div class="stat-card">
+        <span class="stat-value" id="copyCount">0</span>
+        <span class="stat-label">copies today</span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-value" id="totalCount">0</span>
+        <span class="stat-label">total copies</span>
+      </div>
+    </section>
+
+    <section class="history" id="history">
+      <h2>Recent Copies</h2>
+      <div id="historyList" class="history-list">
+        <p class="empty">No copies yet. Right-click code → "Copy with DevContext"</p>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <a href="#" id="clearBtn">Clear history</a>
+    <span class="version">v0.1.0</span>
+  </footer>
+
+  <script src="./index.ts" type="module"></script>
+</body>
+</html>

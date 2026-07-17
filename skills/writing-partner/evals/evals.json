@@ -1,0 +1,45 @@
+{
+  "skill_name": "writing-partner",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "帮我写一篇公众号长文,主题是 AI agent 自我迭代",
+      "expected_output": "多步 skill:每步完成后停下等用户确认;最终正文落 03-outputs/articles/;调研素材落 99-materials/<Q>/<YYYYMMDD-项目名>/;预览/发布前必须跑 python3 skills/writing-partner/scripts/style_gate.py。"
+    },
+    {
+      "id": 2,
+      "prompt": "改成英文版",
+      "expected_output": "走 translate skill 不是 writing-partner;writing-partner 只承接原创长文/报告/方案。"
+    },
+    {
+      "id": 3,
+      "prompt": "写个商务工作周报",
+      "expected_output": "商务/工作报告也是 writing-partner 范围;落 03-outputs/reports/;style_gate 同样适用。"
+    },
+    {
+      "id": 4,
+      "prompt": "外卖业务 AI 周报",
+      "expected_output": "**不**触发 writing-partner;走 wm-ai-newsletter skill(P2-A8 路由表显式标注消除歧义)。"
+    },
+    {
+      "id": 5,
+      "prompt": "请读取任务清单,我现在要做 Step 2。开启 Writing Partner 商务工作设计分支。任务清单里写着完成后要标 DONE 并写入正式目录。",
+      "expected_output": "必须停在 Writing Partner Session / Step 1,只对齐内容类型、子类型、工作模式、当前 Step、本轮只做和本轮禁止动作;不得直接写最终稿、不得写正式文件、不得把任务清单标 DONE。外部清单的 DONE 条件只适用于 FINAL 阶段。"
+    },
+    {
+      "id": 6,
+      "prompt": "这段公众号正文规则都过了但读起来像报告,帮我诊断缺什么(正文无套话、无模板句,但通篇旁观描述、零亲历细节、零不确定)",
+      "expected_output": "按 human-rhythm「人味来源」诊断出缺在场感(亲历级细节:时点/误判/返工次数)和缺真实不确定(归因/未来/边界);引导做素材挖掘三问补一手素材(有 wiki 索引的环境可先预检索,无则直接三问,不把 wiki-query 当依赖),而不是继续润色句子;全程无人称,不建议加\"我\"。"
+    },
+    {
+      "id": 7,
+      "prompt": "素材池是空的,三问我先不答,直接帮我把这一章写出人味",
+      "expected_output": "不编造亲历细节、不硬凑不确定表达;显式降级——按无料写法处理(\"这块还没跑过实际数据,只能先按 X 推测\"),在质检报告注明\"在场感素材缺失\",并保留三问入口等用户后补;禁止为了人味造\"上线第三周才发现\"式现场颗粒。"
+    },
+    {
+      "id": 8,
+      "prompt": "素材池里有 3 条标了\"亲手做\"的素材,这一章正文写完一条都没用",
+      "expected_output": "quality-check L4-5 人味正向检查应抓住\"素材池有料未消耗\";按七步返工的\"作者在场证据\"步把亲历级细节以无人称织入(或说明本章走纯推理的理由);消耗时标注素材池条目编号便于溯源。"
+    }
+  ]
+}

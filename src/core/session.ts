@@ -2,6 +2,12 @@ import { readdir } from 'node:fs/promises';
 import path from 'node:path';
 import type { AgentInputItem, Session } from '@openai/agents';
 import { z } from 'zod';
+import {
+  completionContractSchema,
+  completionReportSchema,
+  type CompletionContract,
+  type CompletionReport,
+} from './completion.js';
 import { assertSessionId } from './session-id.js';
 import { AtomicJsonStore, StateFileCorruptError } from './state-file.js';
 
@@ -16,6 +22,13 @@ export interface RunCheckpoint {
   answer?: string;
   error?: string;
   nextAction?: string;
+  completionContract?: CompletionContract;
+  completionReport?: CompletionReport;
+  completionGate?: {
+    decision: 'pass' | 'continue' | 'blocked' | 'uncertain';
+    reason: string;
+    unmetCriteria: string[];
+  };
   ownerId?: string;
   ownerPid?: number;
   startedAt: string;
@@ -61,6 +74,13 @@ const sessionFileSchema = z.object({
     answer: z.string().optional(),
     error: z.string().optional(),
     nextAction: z.string().optional(),
+    completionContract: completionContractSchema.optional(),
+    completionReport: completionReportSchema.optional(),
+    completionGate: z.object({
+      decision: z.enum(['pass', 'continue', 'blocked', 'uncertain']),
+      reason: z.string(),
+      unmetCriteria: z.array(z.string()),
+    }).strict().optional(),
     ownerId: z.string().optional(),
     ownerPid: z.number().int().positive().optional(),
     startedAt: z.string(),
@@ -258,6 +278,38 @@ export class FileSession implements Session {
     });
   }
 
+  async updateRunCompletion(
+    update: Pick<RunCheckpoint, 'completionContract' | 'completionReport' | 'completionGate'>,
+    expectedRunId?: string,
+  ): Promise<RunCheckpoint | undefined> {
+    return this.mutateWhen((session) => {
+      if (!session.checkpoint
+        || session.checkpoint.status !== 'running'
+        || (expectedRunId && session.checkpoint.runId !== expectedRunId)) {
+        return { result: session.checkpoint ? { ...session.checkpoint } : undefined, changed: false };
+      }
+      session.checkpoint = {
+        ...session.checkpoint,
+        ...update,
+        phase: update.completionGate ? '验收检查' : session.checkpoint.phase,
+        updatedAt: new Date().toISOString(),
+      };
+      session.updatedAt = session.checkpoint.updatedAt;
+      return { result: { ...session.checkpoint }, changed: true };
+    });
+  }
+
+  async deferRunForCompletion(
+    reason: string,
+    expectedRunId?: string,
+  ): Promise<RunCheckpoint | undefined> {
+    return this.finishRun('interrupted', {
+      error: reason.trim().slice(0, 2_000),
+      phase: '验收未通过',
+      nextAction: '根据未满足的验收条件继续执行，禁止重复不确定的副作用',
+    }, expectedRunId);
+  }
+
   async completeRun(answer: string, expectedRunId?: string): Promise<RunCheckpoint | undefined> {
     return this.finishRun(
       'completed',
@@ -266,12 +318,48 @@ export class FileSession implements Session {
     );
   }
 
+  async reconcileCompletedRun(answer: string, expectedRunId: string): Promise<RunCheckpoint | undefined> {
+    return this.mutateWhen((session) => {
+      if (!session.checkpoint || session.checkpoint.runId !== expectedRunId) {
+        return { result: session.checkpoint ? { ...session.checkpoint } : undefined, changed: false };
+      }
+      if (session.checkpoint.status === 'completed') {
+        return { result: { ...session.checkpoint }, changed: false };
+      }
+      const now = new Date().toISOString();
+      session.checkpoint = {
+        ...session.checkpoint,
+        status: 'completed',
+        answer: answer.trim().slice(0, 8_000),
+        error: undefined,
+        phase: '已完成',
+        nextAction: undefined,
+        ownerId: undefined,
+        ownerPid: undefined,
+        updatedAt: now,
+      };
+      session.updatedAt = now;
+      return { result: { ...session.checkpoint }, changed: true };
+    });
+  }
+
   async failRun(error: string, interrupted = false, expectedRunId?: string): Promise<RunCheckpoint | undefined> {
     return this.finishRun(interrupted ? 'interrupted' : 'failed', {
       error: error.trim().slice(0, 2_000),
       phase: interrupted ? '已中断' : '执行失败',
       nextAction: '检查最后进展并继续未完成任务',
     }, expectedRunId);
+  }
+
+  async clearRunCheckpoint(expectedRunId: string): Promise<boolean> {
+    return this.mutateWhen((session) => {
+      if (!session.checkpoint || session.checkpoint.runId !== expectedRunId) {
+        return { result: false, changed: false };
+      }
+      session.checkpoint = undefined;
+      session.updatedAt = new Date().toISOString();
+      return { result: true, changed: true };
+    });
   }
 
   async recoverInterruptedRun(expectedRunId?: string): Promise<RunCheckpoint | undefined> {

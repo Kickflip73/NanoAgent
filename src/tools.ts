@@ -4,12 +4,15 @@ import { lstat, mkdir, open, readFile, readdir, realpath, rename, stat, writeFil
 import path from 'node:path';
 import { codeInterpreterTool, tool, webSearchTool } from '@openai/agents';
 import { z } from 'zod';
+import { PRE_MIMI_DATA_DIRECTORY } from './core/mimi-legacy.js';
 import { withExclusiveFileLock } from './core/state-file.js';
 
 const MAX_TEXT_BYTES = 200_000;
 const MAX_SHELL_OUTPUT = 100_000;
 const MAX_HTTP_BYTES = 200_000;
-const SKIPPED_DIRECTORIES = new Set(['.git', '.nano-agent', 'node_modules', 'dist']);
+const SKIPPED_DIRECTORIES = new Set([
+  '.git', '.mimi-agent', PRE_MIMI_DATA_DIRECTORY, 'node_modules', 'dist',
+]);
 
 function resolvePath(workspaceRoot: string, requestedPath: string): string {
   return path.isAbsolute(requestedPath)
@@ -38,7 +41,7 @@ async function assertPathAllowed(target: string, protectedPaths: string[]): Prom
     await canonicalPotentialPath(protectedPath),
   ]))).flat();
   if (protectedCandidates.some((protectedPath) => candidates.some((candidate) => containsPath(protectedPath, candidate)))) {
-    throw new Error('该路径属于 NanoAgent 私有运行数据，当前 Session 无权通过文件工具访问');
+    throw new Error('该路径属于 MimiAgent 私有运行数据（含旧目录），当前 Session 无权通过文件工具访问');
   }
 }
 
@@ -64,6 +67,8 @@ export interface ToolAccessPolicy {
   allowWrite?: boolean;
   allowShell?: boolean;
   allowProtectedPathShellAccess?: boolean;
+  shellEnvironment?: NodeJS.ProcessEnv;
+  shellDetachedProcessGroup?: boolean;
 }
 
 async function assertScopedPath(
@@ -382,7 +387,18 @@ export async function runShellCommand(
   timeoutSeconds: number,
   signal?: AbortSignal,
   protectedPaths: string[] = [],
+  environment: NodeJS.ProcessEnv = process.env,
+  detachedProcessGroup = process.platform !== 'win32',
 ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+  if (/(?:^|[;&|()\s])(?:nohup|disown|setsid)(?:$|[;&|()\s])/u.test(command)
+    || /(^|[^&])&(?!&)(?:\s*(?:#.*)?)$/u.test(command)
+    || /(^|[^&])&(?!&)[\s;]+disown(?:\s|;|$)/u.test(command)) {
+    return {
+      exitCode: 1,
+      stdout: '',
+      stderr: 'run_shell 不允许创建脱离 MimiAgent 管理的后台进程；请使用 delegate_background_task 提交可跟踪的后台任务',
+    };
+  }
   if (protectedPaths.length && process.platform !== 'darwin') {
     return { exitCode: 1, stdout: '', stderr: '当前平台缺少私有目录沙箱，已禁用 Shell 工具以保护 Session 隔离' };
   }
@@ -422,8 +438,8 @@ export async function runShellCommand(
     let hardKillTimer: NodeJS.Timeout | undefined;
     const child = spawn(executable, args, {
       cwd: workspaceRoot,
-      detached: process.platform !== 'win32',
-      env: process.env,
+      detached: process.platform !== 'win32' && detachedProcessGroup,
+      env: environment,
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
     });
@@ -446,7 +462,7 @@ export async function runShellCommand(
       if (!child.pid) return;
       const signalName = force ? 'SIGKILL' : 'SIGTERM';
       try {
-        if (process.platform === 'win32') child.kill(signalName);
+        if (process.platform === 'win32' || !detachedProcessGroup) child.kill(signalName);
         else process.kill(-child.pid, signalName);
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'ESRCH') child.kill(signalName);
@@ -644,6 +660,8 @@ export function createTools(
         timeoutSeconds,
         details?.signal,
         access.allowProtectedPathShellAccess ? [] : protectedPaths,
+        access.shellEnvironment,
+        access.shellDetachedProcessGroup,
       ),
   });
 
@@ -667,30 +685,49 @@ export function createTools(
     },
   });
 
+  const httpHeaders = z.array(z.object({
+    name: z.string().min(1),
+    value: z.string(),
+  })).max(50).default([]);
+
   const httpRequest = tool({
     name: 'http_request',
-    description: '发送 HTTP/HTTPS 请求并返回状态、响应头和正文，适合调用 JSON API 或读取网页。',
+    description: '发送 HTTP/HTTPS 请求并返回状态、响应头和正文；headers 使用 name/value 数组。',
     parameters: z.object({
-      url: z.url(),
+      url: z.string().min(1),
       method: z.enum(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD']).default('GET'),
-      headers: z.record(z.string(), z.string()).default({}),
-      body: z.string().optional(),
+      headers: httpHeaders,
+      body: z.string().nullable().default(null),
       timeoutSeconds: z.number().int().min(1).max(120).default(30),
     }),
     execute: async ({ url, method, headers, body, timeoutSeconds }, _context, details) =>
-      requestUrl(url, method, headers, body, timeoutSeconds, details?.signal),
+      requestUrl(
+        url,
+        method,
+        Object.fromEntries(headers.map((header) => [header.name, header.value])),
+        body ?? undefined,
+        timeoutSeconds,
+        details?.signal,
+      ),
   });
 
   const httpGet = tool({
     name: 'http_get',
-    description: '以只读 GET 请求读取 HTTP/HTTPS 资源；不能发送请求正文或使用写入方法。',
+    description: '以只读 GET 请求读取 HTTP/HTTPS 资源；headers 使用 name/value 数组。',
     parameters: z.object({
-      url: z.url(),
-      headers: z.record(z.string(), z.string()).default({}),
+      url: z.string().min(1),
+      headers: httpHeaders,
       timeoutSeconds: z.number().int().min(1).max(120).default(30),
     }),
     execute: async ({ url, headers, timeoutSeconds }, _context, details) =>
-      requestUrl(url, 'GET', headers, undefined, timeoutSeconds, details?.signal),
+      requestUrl(
+        url,
+        'GET',
+        Object.fromEntries(headers.map((header) => [header.name, header.value])),
+        undefined,
+        timeoutSeconds,
+        details?.signal,
+      ),
   });
 
   const webSearch = tool({

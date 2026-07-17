@@ -119,7 +119,7 @@ export class RagStore {
     if (!this.allowOutsideWorkspace && !await this.isWithinWorkspace(root)) {
       throw new Error('知识索引路径不能超出当前工作区');
     }
-    if (await this.isProtected(root)) throw new Error('不能把 NanoAgent 私有运行数据加入共享知识索引');
+    if (await this.isProtected(root)) throw new Error('不能把 MimiAgent 私有运行数据加入共享知识索引');
     const files = await this.textFiles(root, signal);
     const previous = await this.load();
     const previousEmbeddings = new Map((previous.embeddingModel === this.embeddingModel ? previous.chunks : [])
