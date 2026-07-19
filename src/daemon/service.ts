@@ -594,6 +594,15 @@ function connectorScriptPath(connector: ConnectorFileConfig['connectors'][string
   return undefined;
 }
 
+const LEGACY_IM_CONNECTORS = [
+  { legacy: 'qq-applescript', preferred: 'qq', script: 'qq-applescript-connector.mjs' },
+  { legacy: 'wechat-applescript', preferred: 'openclaw-weixin', script: 'wechat-applescript-connector.mjs' },
+] as const;
+
+const REQUIRED_CONNECTOR_ENV: Readonly<Record<string, readonly string[]>> = {
+  'openclaw-weixin': ['MIMI_DAEMON_SOCKET'],
+};
+
 interface ConnectorScriptIdentity {
   canonicalPath: string;
   device?: bigint;
@@ -638,6 +647,14 @@ async function mergeTemplateActions(
   let updatedActions = 0;
   let changed = false;
   const connectors = { ...current.connectors };
+  for (const migration of LEGACY_IM_CONNECTORS) {
+    const legacy = connectors[migration.legacy];
+    if (!legacy?.enabled || !connectors[migration.preferred]?.enabled) continue;
+    const script = connectorScriptPath(legacy);
+    if (!script || path.basename(script) !== migration.script) continue;
+    connectors[migration.legacy] = { ...legacy, enabled: false };
+    changed = true;
+  }
   for (const [id, connector] of Object.entries(template.connectors)) {
     if (!connectors[id] && connector.enabled) {
       connectors[id] = connector;
@@ -658,10 +675,14 @@ async function mergeTemplateActions(
     const missing = connector.syncTemplateActions
       ? Object.entries(packaged.actions).filter(([name]) => !Object.hasOwn(connector.actions, name))
       : [];
+    const missingEnv = (REQUIRED_CONNECTOR_ENV[id] ?? []).filter((name) => (
+      packaged.envAllowlist.includes(name) && !connector.envAllowlist.includes(name)
+    ));
     if (
       !migrateSystemProvenance
       && !migrateNodeCommand
       && !missing.length
+      && !missingEnv.length
     ) continue;
     updatedActions += missing.length;
     changed = true;
@@ -669,6 +690,7 @@ async function mergeTemplateActions(
       ...connector,
       ...(migrateNodeCommand ? { command: packaged.command } : {}),
       ...(migrateSystemProvenance ? { source: packaged.source, trust: packaged.trust } : {}),
+      envAllowlist: [...connector.envAllowlist, ...missingEnv],
       actions: { ...Object.fromEntries(missing), ...connector.actions },
     };
   }

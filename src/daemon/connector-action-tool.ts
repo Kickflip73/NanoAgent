@@ -7,6 +7,7 @@ const identifier = z.string().regex(/^[a-zA-Z0-9._-]+$/);
 const MAX_CONNECTORS = 50;
 const MAX_ACTIONS = 100;
 const MAX_DESCRIPTION_CHARS = 300;
+const MAX_ACTION_RESULT_BYTES = 32_000;
 
 export interface ConnectorCapabilitySnapshot {
   configFile: string;
@@ -47,6 +48,26 @@ export interface ConnectorTaskRuntime {
 
 type InspectCapabilities = ConnectorTaskRuntime['inspectCapabilities'];
 type ExecuteConnectorAction = ConnectorTaskRuntime['executeAction'];
+type ConnectorActionReceipt = Record<string, unknown> & {
+  tool: 'connector_action';
+  connector: string;
+  action: string;
+  target: string;
+  outcome: 'confirmed' | 'accepted';
+};
+type OnConnectorAction = (request: ConnectorActionRequest, receipt: ConnectorActionReceipt) => void;
+
+function boundedActionResult(result: unknown): unknown {
+  const serialized = JSON.stringify(result);
+  if (serialized === undefined) return result;
+  const bytes = Buffer.from(serialized);
+  if (bytes.byteLength <= MAX_ACTION_RESULT_BYTES) return result;
+  return {
+    truncated: true,
+    originalBytes: bytes.byteLength,
+    preview: bytes.subarray(0, MAX_ACTION_RESULT_BYTES).toString('utf8'),
+  };
+}
 
 export function connectorCapabilitySnapshot(
   connectors: ConnectorManager,
@@ -138,12 +159,15 @@ export function createConnectorEnabledTool(connectors: ConnectorManager): Tool {
   });
 }
 
-export function createConnectorHostTools(connectors: ConnectorManager): Tool[] {
+export function createConnectorHostTools(
+  connectors: ConnectorManager,
+  onAction?: OnConnectorAction,
+): Tool[] {
   return [
     createConnectorCapabilityTool(connectors),
     createConnectorEnabledTool(connectors),
     createConnectorReloadTool(connectors),
-    createConnectorActionTool(connectors),
+    createConnectorActionTool(connectors, onAction),
   ];
 }
 
@@ -155,11 +179,17 @@ export function createConnectorTaskHostTools(runtime: ConnectorTaskRuntime): Too
   ];
 }
 
-export function createConnectorActionTool(connectors: ConnectorManager): Tool {
-  return createConnectorActionRuntimeTool((request) => connectors.executeAction(request));
+export function createConnectorActionTool(
+  connectors: ConnectorManager,
+  onAction?: OnConnectorAction,
+): Tool {
+  return createConnectorActionRuntimeTool((request) => connectors.executeAction(request), onAction);
 }
 
-function createConnectorActionRuntimeTool(executeAction: ExecuteConnectorAction): Tool {
+function createConnectorActionRuntimeTool(
+  executeAction: ExecuteConnectorAction,
+  onAction?: OnConnectorAction,
+): Tool {
   return tool({
     name: 'connector_action',
     description: '通过隔离的 Connector 执行外部副作用，如发送 IM、创建日程或发送邮件。调用前先用 inspect_mimi_capabilities 获取当前 connector/action、target 格式和 readiness：已知 ID 时传 connector 精确过滤，不确定微信等渠道 ID 时传 query 关键词搜索，避免加载完整目录。不要猜测能力名。只能使用目录中已声明的能力；payloadJson 必须是严格 JSON。结果超时或不确定时不要自动重试，避免重复事务。',
@@ -177,8 +207,9 @@ function createConnectorActionRuntimeTool(executeAction: ExecuteConnectorAction)
         throw new Error('payloadJson 不是有效 JSON');
       }
       const result = await executeAction({ connector, action, target, payload }, details?.signal);
-      const value = result !== null && typeof result === 'object' && !Array.isArray(result)
-        ? result as Record<string, unknown>
+      const boundedResult = boundedActionResult(result);
+      const value = boundedResult !== null && typeof boundedResult === 'object' && !Array.isArray(boundedResult)
+        ? boundedResult as Record<string, unknown>
         : undefined;
       const declaredOutcome = value?.outcome;
       const outcome = declaredOutcome === 'confirmed' || declaredOutcome === 'accepted'
@@ -188,7 +219,7 @@ function createConnectorActionRuntimeTool(executeAction: ExecuteConnectorAction)
           || typeof value?.requestId === 'string'
           ? 'confirmed'
           : 'accepted';
-      return {
+      const receipt: ConnectorActionReceipt = {
         ...(value ?? {}),
         operationId: typeof value?.operationId === 'string'
           ? value.operationId
@@ -199,9 +230,11 @@ function createConnectorActionRuntimeTool(executeAction: ExecuteConnectorAction)
         action,
         target,
         outcome,
-        evidence: result,
+        ...(value ? {} : { evidence: boundedResult }),
         occurredAt: new Date().toISOString(),
       };
+      onAction?.({ connector, action, target, payload }, receipt);
+      return receipt;
     },
   });
 }

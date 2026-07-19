@@ -27,6 +27,7 @@ interface ProtocolMessage {
   type?: string;
   id?: string;
   ok?: boolean;
+  uncertain?: boolean;
   inbound?: string;
   outbound?: string;
   result?: Record<string, unknown>;
@@ -261,6 +262,7 @@ const args = process.argv.slice(2);
 appendFileSync(process.env.FAKE_LOG, JSON.stringify(args) + '\\n');
 if (args[0] === 'channels') console.log(JSON.stringify({ channelAccounts: { 'openclaw-weixin': [{ enabled: true, configured: true, running: true, lastError: null }] } }));
 else if (args[0] === 'plugins') console.log(JSON.stringify({ plugin: { status: 'loaded', activated: true } }));
+else if (args[0] === 'message' && args.includes('UNCERTAIN_SEND')) console.log('not-json');
 else if (args[0] === 'message') console.log(JSON.stringify({ messageId: 'remote-message-1', dryRun: false }));
 else process.exit(2);
 `);
@@ -304,6 +306,17 @@ else process.exit(2);
     assert.ok(send.includes('bot-account'));
     assert.ok(send.includes('owner@im.wechat'));
     assert.ok(send.includes('MimiAgent reply'));
+
+    child.stdin.write(`${JSON.stringify({
+      type: 'action', id: 'uncertain-send', action: 'send_message',
+      target: bridgeTarget('bot-account', 'owner@im.wechat'), payload: { text: 'UNCERTAIN_SEND' },
+    })}\n`);
+    const uncertain = await waitFor(
+      messages,
+      (message) => message.type === 'action_result' && message.id === 'uncertain-send',
+    );
+    assert.equal(uncertain.ok, false);
+    assert.equal(uncertain.uncertain, true);
 
     await server.close();
     serverStarted = false;

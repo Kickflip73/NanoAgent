@@ -5,7 +5,11 @@ import { MimiHost } from '../runtime/mimi-host.js';
 import type { RuntimeEvent } from '../runtime/hooks.js';
 import { TerminalRunInterruptedError } from '../runtime/run-outcome.js';
 import { CompletionGateError } from '../core/completion.js';
-import { isUncertainDeliveryError, NotifierRegistry } from './notifier.js';
+import {
+  isPermanentDeliveryError,
+  isUncertainDeliveryError,
+  NotifierRegistry,
+} from './notifier.js';
 import type { ConnectorTaskRuntime } from './connector-action-tool.js';
 import type { ConnectorManager } from './connectors.js';
 import type { MimiDeliveryControl } from './delivery-tools.js';
@@ -270,13 +274,22 @@ export class MimiDispatcher {
   private async deliverClaimed(outgoing: OutboxMessage): Promise<void> {
     try {
       await this.notifier.deliver(outgoing);
-      this.store.completeOutbox(outgoing.id, this.workerId);
     } catch (error) {
       this.store.failOutbox(
         outgoing.id,
         this.workerId,
         error,
-        isUncertainDeliveryError(error) ? 1 : 8,
+        isUncertainDeliveryError(error) || isPermanentDeliveryError(error) ? 1 : 8,
+      );
+      return;
+    }
+    try {
+      this.store.completeOutbox(outgoing.id, this.workerId);
+    } catch (error) {
+      // The external sink already confirmed success. Leaving the message in its
+      // sending lease makes recovery dead-letter it instead of redelivering it.
+      process.stderr.write(
+        `[MimiAgent] outbox ${outgoing.id} 已送达但本地确认失败，将停止自动重发：${error instanceof Error ? error.message : String(error)}\n`,
       );
     }
   }

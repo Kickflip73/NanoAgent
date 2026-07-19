@@ -65,6 +65,14 @@ function emit(value) {
   process.stdout.write(`${JSON.stringify(value)}\n`);
 }
 
+class UncertainSendError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'UncertainSendError';
+    this.uncertain = true;
+  }
+}
+
 let inboundReadiness = 'unavailable';
 let outboundReadiness = 'unknown';
 let lastStatusKey = '';
@@ -79,12 +87,15 @@ function emitStatus(inbound = inboundReadiness, outbound = outboundReadiness, fo
   emit(status);
 }
 
-function actionResult(id, ok, result, error) {
-  emit({ type: 'action_result', id, ok, ...(ok ? { result } : {}), ...(error ? { error } : {}) });
+function actionResult(id, ok, result, error, uncertain = false) {
+  emit({
+    type: 'action_result', id, ok, ...(ok ? { result } : {}),
+    ...(error ? { error } : {}), ...(uncertain ? { uncertain: true } : {}),
+  });
 }
 
-function deliveryAck(id, ok, error) {
-  emit({ type: 'delivery_ack', id, ok, ...(error ? { error } : {}) });
+function deliveryAck(id, ok, error, uncertain = false) {
+  emit({ type: 'delivery_ack', id, ok, ...(error ? { error } : {}), ...(uncertain ? { uncertain: true } : {}) });
 }
 
 async function napcatApi(action, params) {
@@ -252,10 +263,17 @@ async function deliver(message) {
   if (typeof message.id !== 'string') throw new Error('deliver requires id');
   const { type, id } = parseConversationTarget(message.target);
   const text = textPayload(message.payload);
-  const data = await napcatApi(type === 'private' ? 'send_private_msg' : 'send_group_msg', {
-    [type === 'private' ? 'user_id' : 'group_id']: id,
-    message: text,
-  });
+  let data;
+  try {
+    data = await napcatApi(type === 'private' ? 'send_private_msg' : 'send_group_msg', {
+      [type === 'private' ? 'user_id' : 'group_id']: id,
+      message: text,
+    });
+  } catch (error) {
+    throw new UncertainSendError(
+      `NapCat 发送请求已提交但未获得可靠确认：${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
   return { sent: true, messageId: boundedString(String(data?.message_id ?? ''), 128) || undefined };
 }
 
@@ -474,8 +492,9 @@ process.stdin.on('data', (chunk) => {
         actionResult(message.id, true, await executeAction(message));
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
-        if (message?.type === 'action') actionResult(message?.id ?? 'invalid', false, undefined, reason);
-        else deliveryAck(message?.id ?? 'invalid', false, reason);
+        const uncertain = error?.uncertain === true;
+        if (message?.type === 'action') actionResult(message?.id ?? 'invalid', false, undefined, reason, uncertain);
+        else deliveryAck(message?.id ?? 'invalid', false, reason, uncertain);
       }
     }).catch((error) => {
       process.stderr.write(`[qq] input queue failed: ${error instanceof Error ? error.message : String(error)}\n`);

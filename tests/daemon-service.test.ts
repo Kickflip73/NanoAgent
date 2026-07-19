@@ -558,6 +558,41 @@ test('initializes absolute macOS connectors once without overwriting owner chang
   }
 });
 
+test('initialization disables known QQ and WeChat UI fallbacks when protocol bridges are enabled', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-legacy-im-migration-'));
+  const runtimeRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const config = testConfig(root);
+  const initialized = await initializeMimi(config, { platform: 'darwin', runtimeRoot });
+  const current = JSON.parse(await readFile(initialized.connectors.file, 'utf8')) as {
+    connectors: Record<string, Record<string, unknown>>;
+  };
+  current.connectors.qq!.enabled = true;
+  current.connectors['openclaw-weixin']!.enabled = true;
+  current.connectors['openclaw-weixin']!.envAllowlist = ['OPENCLAW_BIN'];
+  current.connectors['qq-applescript'] = {
+    enabled: true, command: process.execPath,
+    args: [path.join(runtimeRoot, 'examples/connectors/qq-applescript-connector.mjs')],
+    source: 'qq', actions: {},
+  };
+  current.connectors['wechat-applescript'] = {
+    enabled: true, command: process.execPath,
+    args: [path.join(runtimeRoot, 'examples/connectors/wechat-applescript-connector.mjs')],
+    source: 'wechat', actions: {},
+  };
+  await writeFile(initialized.connectors.file, `${JSON.stringify(current, null, 2)}\n`);
+
+  await initializeMimi(config, { platform: 'darwin', runtimeRoot });
+  const migrated = JSON.parse(await readFile(initialized.connectors.file, 'utf8')) as typeof current;
+  assert.equal(migrated.connectors['qq-applescript']?.enabled, false);
+  assert.equal(migrated.connectors['wechat-applescript']?.enabled, false);
+  assert.equal(migrated.connectors.qq?.enabled, true);
+  assert.equal(migrated.connectors['openclaw-weixin']?.enabled, true);
+  assert.deepEqual(
+    migrated.connectors['openclaw-weixin']?.envAllowlist,
+    ['OPENCLAW_BIN', 'MIMI_DAEMON_SOCKET'],
+  );
+});
+
 test('upgrades an existing macOS connector file with missing default connectors only', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-connector-upgrade-'));
   const runtimeRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');

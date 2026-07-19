@@ -94,6 +94,7 @@ interface ActiveRun {
   completionReport?: CompletionReport;
   goalCreatedAt?: string;
   requireDurableBlocker: boolean;
+  recoveryRunId?: string;
 }
 
 export interface ContextUsageSnapshot {
@@ -431,7 +432,13 @@ export class MimiAgent {
     ), runPolicy);
     const currentMode = AGENT_MODES.find((item) => item.id === mode)!;
     const recovery = canReadSessionContext ? await run.session.getCheckpoint() : undefined;
-    await run.session.beginRun(input, run.runId, run.ownerId);
+    run.recoveryRunId = recovery?.runId;
+    await run.session.beginRun(
+      input,
+      run.runId,
+      run.ownerId,
+      options?.retainExecutionLedger === true,
+    );
     began = true;
     const resumesCheckpoint = recovery !== undefined
       && recovery.status !== 'completed'
@@ -577,15 +584,6 @@ export class MimiAgent {
         sessionId: this.activeRun.sessionId,
         runId: this.activeRun.options?.executionKey ?? this.activeRun.runId,
         semanticCallIds: Boolean(this.activeRun.options?.executionKey),
-        authorizeTool: async (toolName) => {
-          const active = this.activeRun;
-          if (!active) throw new Error('当前 Run 已失效');
-          if (active.completionRequired
-            && !active.completionContract
-            && toolName !== 'prepare_task') {
-            throw new Error(`执行 ${toolName} 前必须先调用 prepare_task 建立完整验收标准`);
-          }
-        },
         authorizeSideEffect: async (toolName, argumentsJson) => {
           const active = this.activeRun;
           if (!active) throw new Error('当前 Run 已失效');
@@ -689,6 +687,9 @@ export class MimiAgent {
       if (began) {
         const interrupted = signal?.aborted === true;
         const message = error instanceof Error ? error.message : String(error);
+        if (run.options?.retainExecutionLedger) {
+          await run.session.rollbackRunItems(run.runId).catch(() => undefined);
+        }
         if (interrupted
           && (isTerminalRunInterruption(error) || isTerminalRunInterruption(signal?.reason))) {
           await run.session.clearRunCheckpoint(run.runId).catch(() => undefined);
@@ -1140,6 +1141,9 @@ export class MimiAgent {
     this.activeRun = undefined;
     run.releaseOwner();
     this.lastUsage = this.validUsage(usage);
+    if (run.options?.retainExecutionLedger) {
+      await run.session.rollbackRunItems(run.runId).catch(() => undefined);
+    }
     await run.session.deferRunForCompletion(error.message, run.runId);
     await this.hooks.emit({
       type: 'run_error',
@@ -1157,11 +1161,8 @@ export class MimiAgent {
     ]);
     // When this run has no tool calls (e.g. resumed after Completion Gate rejection),
     // include calls from the previous run so the gate can find evidence.
-    if (calls.length === 0) {
-      const checkpoint = await run.session.getCheckpoint();
-      if (checkpoint && checkpoint.runId !== run.runId) {
-        calls = await this.ledger.listCalls(run.sessionId, checkpoint.runId);
-      }
+    if (calls.length === 0 && run.recoveryRunId && run.recoveryRunId !== run.runId) {
+      calls = await this.ledger.listCalls(run.sessionId, run.recoveryRunId);
     }
     return evaluateCompletion(
       run.completionContract,
@@ -1186,6 +1187,9 @@ export class MimiAgent {
     this.activeRun = undefined;
     run.releaseOwner();
     this.lastUsage = this.validUsage(usage);
+    if (run.options?.retainExecutionLedger) {
+      await run.session.rollbackRunItems(run.runId).catch(() => undefined);
+    }
     if (interrupted && isTerminalRunInterruption(error)) {
       await run.session.clearRunCheckpoint(run.runId);
     } else {

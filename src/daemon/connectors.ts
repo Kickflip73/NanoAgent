@@ -4,7 +4,12 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import path from 'node:path';
 import { z } from 'zod';
 import { derivedSessionId } from './policy.js';
-import { UncertainDeliveryError, type NotificationSink, type NotifierRegistry } from './notifier.js';
+import {
+  PermanentDeliveryError,
+  UncertainDeliveryError,
+  type NotificationSink,
+  type NotifierRegistry,
+} from './notifier.js';
 import { MimiStore } from './store.js';
 import type { EventActor, EventConversation, EventKind, EventTrust, OutboxMessage } from './types.js';
 
@@ -276,7 +281,9 @@ class ConnectorProcess implements NotificationSink {
       const timer = setTimeout(() => {
         this.pendingActions.delete(id);
         this.terminateTimedOutChild();
-        reject(new Error(`Connector ${this.id} action ${action} 执行超时；为避免重复副作用不会自动重放`));
+        reject(new UncertainDeliveryError(
+          `Connector ${this.id} action ${action} 执行超时；为避免重复副作用不会自动重放`,
+        ));
       }, this.config.actionTimeoutMs);
       this.pendingActions.set(id, { resolve, reject, timer });
       const line = `${JSON.stringify({
@@ -289,7 +296,9 @@ class ConnectorProcess implements NotificationSink {
         if (!pending) return;
         clearTimeout(pending.timer);
         this.pendingActions.delete(id);
-        reject(error);
+        reject(new UncertainDeliveryError(
+          `Connector ${this.id} action ${action} 写入失败，结果不确定：${error.message}`,
+        ));
       });
     });
   }
@@ -415,7 +424,7 @@ class ConnectorProcess implements NotificationSink {
     if (message.ok) pending.resolve();
     else if (message.uncertain) {
       pending.reject(new UncertainDeliveryError(message.error ?? `Connector ${this.id} 投递结果不确定`));
-    } else pending.reject(new Error(message.error ?? `Connector ${this.id} 拒绝投递`));
+    } else pending.reject(new PermanentDeliveryError(message.error ?? `Connector ${this.id} 拒绝投递`));
   }
 
   private handleActionResult(message: ActionResultMessage): void {

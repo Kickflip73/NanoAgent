@@ -18,6 +18,7 @@ const COMMAND_TIMEOUT_MS = Math.min(
   120_000,
   Math.max(10_000, Number.parseInt(process.env.OPENCLAW_COMMAND_TIMEOUT_MS || '60000', 10) || 60_000),
 );
+const activeChildren = new Set();
 
 function emit(value) {
   process.stdout.write(`${JSON.stringify(value)}\n`);
@@ -25,6 +26,14 @@ function emit(value) {
 
 function errorText(error) {
   return (error instanceof Error ? error.message : String(error)).slice(0, 500);
+}
+
+class UncertainSendError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'UncertainSendError';
+    this.uncertain = true;
+  }
 }
 
 function payloadText(payload) {
@@ -152,34 +161,44 @@ async function resolveOpenClaw() {
   return 'openclaw';
 }
 
-function run(command, args) {
+function terminateChild(child) {
+  if (child.exitCode !== null) return;
+  if (process.platform !== 'win32' && child.pid) {
+    try { process.kill(-child.pid, 'SIGKILL'); } catch {}
+  } else child.kill('SIGKILL');
+}
+
+function run(command, args, timeoutMs = COMMAND_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
     const detached = process.platform !== 'win32';
     const child = spawn(command, args, { detached, stdio: ['ignore', 'pipe', 'pipe'] });
+    activeChildren.add(child);
     let stdout = '';
     let stderr = '';
     const timer = setTimeout(() => {
       if (detached && child.pid) {
         try { process.kill(-child.pid, 'SIGKILL'); } catch {}
       } else child.kill('SIGKILL');
-    }, COMMAND_TIMEOUT_MS);
+    }, timeoutMs);
     child.stdout.setEncoding('utf8');
     child.stderr.setEncoding('utf8');
     child.stdout.on('data', (chunk) => { stdout = (stdout + chunk).slice(-1024 * 1024); });
     child.stderr.on('data', (chunk) => { stderr = (stderr + chunk).slice(-8_000); });
     child.once('error', (error) => {
       clearTimeout(timer);
+      activeChildren.delete(child);
       reject(error);
     });
     child.once('exit', (code, signal) => {
       clearTimeout(timer);
+      activeChildren.delete(child);
       if (code === 0) resolve(stdout);
       else reject(new Error(`openclaw exited ${code ?? signal ?? 'unknown'}: ${stderr.trim()}`));
     });
   });
 }
 
-async function readiness(openclaw, pluginVerified) {
+async function readiness(openclaw) {
   const statusOutput = await run(process.execPath, [
     openclaw, 'channels', 'status', '--probe', '--timeout', '15000', '--json',
   ]);
@@ -190,17 +209,14 @@ async function readiness(openclaw, pluginVerified) {
     : [];
   if (!readyAccounts.length) {
     return {
-      ready: false, bridgeVerified: false, pluginVerified, socketVerified: false, accountCount: 0,
+      ready: false, bridgeVerified: false, pluginVerified: false, socketVerified: false, accountCount: 0,
     };
   }
-  let pluginReady = pluginVerified;
-  if (!pluginReady) {
-    const pluginOutput = await run(process.execPath, [
-      openclaw, 'plugins', 'inspect', 'mimiagent-bridge', '--runtime', '--json',
-    ]);
-    const plugin = JSON.parse(pluginOutput);
-    pluginReady = plugin.plugin?.status === 'loaded' && plugin.plugin?.activated === true;
-  }
+  const pluginOutput = await run(process.execPath, [
+    openclaw, 'plugins', 'inspect', 'mimiagent-bridge', '--runtime', '--json',
+  ]);
+  const plugin = JSON.parse(pluginOutput);
+  const pluginReady = plugin.plugin?.status === 'loaded' && plugin.plugin?.activated === true;
   if (!pluginReady) {
     return {
       ready: false, bridgeVerified: false, pluginVerified: false, socketVerified: false,
@@ -223,33 +239,45 @@ async function readiness(openclaw, pluginVerified) {
   };
 }
 
-async function send(openclaw, target, payload) {
+function sendTimeout(deadlineAt) {
+  if (!Number.isFinite(deadlineAt)) return COMMAND_TIMEOUT_MS;
+  const remaining = Math.floor(deadlineAt - Date.now() - 1_000);
+  if (remaining < 1_000) throw new Error('send deadline expired before dispatch');
+  return Math.min(COMMAND_TIMEOUT_MS, remaining);
+}
+
+async function send(openclaw, target, payload, deadlineAt) {
   const { account, to } = parseTarget(target);
   const text = payloadText(payload);
   if (!text) throw new Error('message text is empty');
-  const output = await run(process.execPath, [openclaw,
-    'message', 'send', '--channel', 'openclaw-weixin', '--account', account,
-    '--target', to, '--message', text, '--json',
-  ]);
-  const result = JSON.parse(output);
-  if (result.dryRun === true) throw new Error('openclaw unexpectedly used dry-run');
-  if (!result.messageId && !result.result?.messageId) throw new Error('openclaw did not return a message id');
-  return { sent: true, messageId: result.messageId || result.result?.messageId };
+  const timeoutMs = sendTimeout(deadlineAt);
+  try {
+    const output = await run(process.execPath, [openclaw,
+      'message', 'send', '--channel', 'openclaw-weixin', '--account', account,
+      '--target', to, '--message', text, '--json',
+    ], timeoutMs);
+    const result = JSON.parse(output);
+    if (result.dryRun === true) throw new Error('openclaw unexpectedly used dry-run');
+    if (!result.messageId && !result.result?.messageId) throw new Error('openclaw did not return a message id');
+    return { sent: true, messageId: result.messageId || result.result?.messageId };
+  } catch (error) {
+    throw new UncertainSendError(
+      `OpenClaw 发送进程已启动但未获得可靠确认：${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
 }
 
 async function main() {
   const openclaw = await resolveOpenClaw();
   let lastReady;
-  let pluginVerified = false;
   let consecutiveFailures = 0;
   let checkingPromise;
   const updateStatus = async () => {
     if (checkingPromise) return await checkingPromise;
     checkingPromise = (async () => {
       try {
-        const status = await readiness(openclaw, pluginVerified);
+        const status = await readiness(openclaw);
         const ready = status.ready;
-        pluginVerified = status.pluginVerified;
         consecutiveFailures = 0;
         emit({
           type: 'status',
@@ -268,7 +296,7 @@ async function main() {
           lastReady = false;
         }
         return {
-          ready: false, bridgeVerified: false, pluginVerified, socketVerified: false,
+          ready: false, bridgeVerified: false, pluginVerified: false, socketVerified: false,
           accountCount: 0, error: errorText(error),
         };
       } finally {
@@ -297,12 +325,12 @@ async function main() {
         try {
           message = JSON.parse(line);
           if (message.type === 'deliver') {
-            await send(openclaw, message.target, message.payload);
+            await send(openclaw, message.target, message.payload, message.deadlineAt);
             emit({ type: 'delivery_ack', id: message.id, ok: true });
             return;
           }
           if (message.type === 'action' && message.action === 'send_message') {
-            const result = await send(openclaw, message.target, message.payload);
+            const result = await send(openclaw, message.target, message.payload, message.deadlineAt);
             emit({ type: 'action_result', id: message.id, ok: true, result });
             return;
           }
@@ -329,10 +357,20 @@ async function main() {
         } catch (error) {
           const id = message?.id;
           const type = message?.type === 'deliver' ? 'delivery_ack' : 'action_result';
-          emit({ type, id, ok: false, error: errorText(error) });
+          emit({
+            type, id, ok: false, error: errorText(error),
+            ...(error?.uncertain === true ? { uncertain: true } : {}),
+          });
         }
       });
     }
+  });
+}
+
+for (const signal of ['SIGTERM', 'SIGINT']) {
+  process.once(signal, () => {
+    for (const child of activeChildren) terminateChild(child);
+    process.exit(0);
   });
 }
 

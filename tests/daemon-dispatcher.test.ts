@@ -522,6 +522,37 @@ test('dispatcher dead-letters an uncertain delivery without automatically replay
   }
 });
 
+test('a failed local delivery commit never requeues a remotely confirmed message', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-dispatcher-confirm-commit-'));
+  const store = new MimiStore(path.join(root, 'mimi.db'));
+  const attention = await AttentionEngine.load(path.join(root, 'assistant.json'), store);
+  const notifier = new NotifierRegistry();
+  let deliveries = 0;
+  notifier.register('connector:confirmed', { deliver: async () => { deliveries += 1; } });
+  const outboxId = enqueueOutbox(store, 'confirmed-commit', 'connector:confirmed');
+  const originalComplete = store.completeOutbox.bind(store);
+  let failCommit = true;
+  store.completeOutbox = ((id: string, owner: string) => {
+    if (failCommit) {
+      failCommit = false;
+      throw new Error('simulated SQLite commit failure');
+    }
+    return originalComplete(id, owner);
+  }) as typeof store.completeOutbox;
+  const dispatcher = new MimiDispatcher(store, {} as MimiAgent, attention, notifier);
+  try {
+    assert.equal(await dispatcher.processOnce(), true);
+    assert.equal(deliveries, 1);
+    assert.equal(store.getOutbox(outboxId)?.status, 'sending');
+
+    store.claimOutbox('recovery-worker', 60_000, new Date(Date.now() + 240_000));
+    assert.equal(store.getOutbox(outboxId)?.status, 'dead_letter');
+    assert.equal(deliveries, 1);
+  } finally {
+    store.close();
+  }
+});
+
 test('a slow Outbox delivery does not block admission of a new Conversation Event', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-dispatcher-slow-delivery-'));
   const store = new MimiStore(path.join(root, 'mimi.db'));

@@ -469,6 +469,26 @@ test('persists run checkpoints and recovers a process exit at the latest progres
   assert.match(summary?.progress ?? '', /context\.ts/);
 });
 
+test('durable run recovery rolls back only the incomplete transcript attempt', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-session-attempt-rollback-'));
+  const session = new FileSession(root, 'durable-attempt');
+  await session.addItems([{ role: 'user', content: 'stable history' }] as AgentInputItem[]);
+  await session.beginRun('send once', 'event-run', 'crashed-owner', true);
+  await session.addItems([
+    { role: 'user', content: 'send once' },
+    { role: 'assistant', content: 'partial duplicate-prone output' },
+  ] as AgentInputItem[]);
+
+  const recovered = await session.recoverInterruptedRun('event-run');
+  assert.equal(recovered?.status, 'interrupted');
+  assert.deepEqual(await session.getItems(), [{ role: 'user', content: 'stable history' }]);
+
+  await session.beginRun('send once', 'retry-run', undefined, true);
+  await session.addItems([{ role: 'user', content: 'send once' }] as AgentInputItem[]);
+  assert.equal(await session.rollbackRunItems('retry-run'), true);
+  assert.deepEqual(await session.getItems(), [{ role: 'user', content: 'stable history' }]);
+});
+
 test('keeps completed and failed run outcomes in session metadata', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'nano-session-outcome-'));
   const session = new FileSession(root, 'demo');

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.11.2] - 2026-07-20 00:59
+
+### Fixed
+
+- prevent duplicate connector deliveries (@Kickflip73)
+
 ## [0.11.1] - 2026-07-20 00:25
 
 ### Fixed

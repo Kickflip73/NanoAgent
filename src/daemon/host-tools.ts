@@ -67,7 +67,15 @@ export function createMimiHostTools(context: MimiHostToolContext): Tool[] {
       block: context.blockTask,
     }),
     ...(context.connectors
-      ? createConnectorHostTools(context.connectors)
+      ? createConnectorHostTools(context.connectors, (request, receipt) => {
+          const route = context.replyRoute;
+          if (request.action !== 'send_message'
+            || receipt.outcome !== 'confirmed'
+            || route?.channel !== `connector:${request.connector}`
+            || route.target !== request.target) return;
+          context.deliveryControl.suppressed = true;
+          context.deliveryControl.reason = '已通过同一 Connector 会话显式发送回复，抑制重复最终投递';
+        })
       : context.connectorRuntime
         ? createConnectorTaskHostTools(context.connectorRuntime)
         : []),

@@ -288,6 +288,48 @@ test('QQ connector exposes bounded background directory, history, and string-id 
   }
 });
 
+test('QQ connector marks a lost send confirmation uncertain instead of retryable', async () => {
+  let sends = 0;
+  const server = createServer(async (request, response) => {
+    await requestBody(request);
+    if (request.url === '/send_private_msg') {
+      sends += 1;
+      response.destroy();
+      return;
+    }
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ status: 'ok', retcode: 0, data: { online: true, good: true } }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === 'object');
+  const script = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../examples/connectors/qq-napcat-connector.mjs');
+  const child = spawn(process.execPath, [script], {
+    env: { NC_HTTP_URL: `http://127.0.0.1:${address.port}`, NC_WS_PORT: '0', NC_ACCESS_TOKEN: 'fixture' },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  const next = outputReader(child);
+  try {
+    child.stdin.write(`${JSON.stringify({
+      type: 'deliver', id: 'uncertain-delivery', target: 'private:12345', payload: { text: 'send once' },
+    })}\n`);
+    const delivery = await nextOfType(next, 'delivery_ack');
+    assert.equal(delivery.ok, false);
+    assert.equal(delivery.uncertain, true);
+
+    child.stdin.write(`${JSON.stringify({
+      type: 'action', id: 'uncertain-action', action: 'send_message',
+      target: 'private:12345', payload: { text: 'send once through action' },
+    })}\n`);
+    const action = await nextOfType(next, 'action_result');
+    assert.equal(action.ok, false);
+    assert.equal(action.uncertain, true);
+    assert.equal(sends, 2);
+  } finally {
+    await stop(child, server);
+  }
+});
+
 test('QQ connector requires an authenticated reverse WebSocket', async () => {
   const script = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../examples/connectors/qq-napcat-connector.mjs');
   const child = spawn(process.execPath, [script], {

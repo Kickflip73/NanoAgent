@@ -144,6 +144,27 @@ test('clears Team worker ledger children with their parent run', async () => {
   assert.equal(executions, 2);
 });
 
+test('never TTL-prunes durable Event ledgers before explicit host finalization', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-ledger-durable-retention-'));
+  const ledger = new ExecutionLedger(path.join(root, 'ledger.json'), { retentionMs: 1 });
+  let eventExecutions = 0;
+  const durable = {
+    sessionId: 'owner', runId: 'event:dead-letter', toolName: 'connector_action',
+    callId: 'send-once', argumentsJson: '{"text":"hello"}',
+  };
+  await ledger.executeOnce(durable, async () => ({ executions: ++eventExecutions }));
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  await ledger.executeOnce({
+    sessionId: 'owner', runId: 'ordinary-run', toolName: 'write_file',
+    callId: 'other', argumentsJson: '{}',
+  }, async () => 'other');
+
+  assert.deepEqual(await ledger.executeOnce(durable, async () => ({ executions: ++eventExecutions })), {
+    executions: 1,
+  });
+  assert.equal(eventExecutions, 1);
+});
+
 test('wraps SDK side-effect tools with the active run ledger', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'nano-ledger-tool-'));
   const ledger = new ExecutionLedger(path.join(root, 'ledger.json'));

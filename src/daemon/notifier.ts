@@ -9,8 +9,16 @@ export class UncertainDeliveryError extends Error {
   override readonly name = 'UncertainDeliveryError';
 }
 
+export class PermanentDeliveryError extends Error {
+  override readonly name = 'PermanentDeliveryError';
+}
+
 export function isUncertainDeliveryError(error: unknown): error is UncertainDeliveryError {
   return error instanceof UncertainDeliveryError;
+}
+
+export function isPermanentDeliveryError(error: unknown): error is PermanentDeliveryError {
+  return error instanceof PermanentDeliveryError;
 }
 
 function messageText(payload: unknown): string {
@@ -89,7 +97,7 @@ export class NotifierRegistry {
 
   async deliver(message: OutboxMessage): Promise<void> {
     const sink = this.sinks.get(message.channel);
-    if (!sink) throw new Error(`未配置通知通道：${message.channel}`);
+    if (!sink) throw new PermanentDeliveryError(`未配置通知通道：${message.channel}`);
     await sink.deliver(message);
   }
 }

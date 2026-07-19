@@ -31,6 +31,7 @@ export interface RunCheckpoint {
   };
   ownerId?: string;
   ownerPid?: number;
+  historyStart?: number;
   startedAt: string;
   updatedAt: string;
 }
@@ -83,6 +84,7 @@ const sessionFileSchema = z.object({
     }).strict().optional(),
     ownerId: z.string().optional(),
     ownerPid: z.number().int().positive().optional(),
+    historyStart: z.number().int().nonnegative().optional(),
     startedAt: z.string(),
     updatedAt: z.string(),
   }).optional(),
@@ -232,7 +234,12 @@ export class FileSession implements Session {
     return checkpoint ? { ...checkpoint } : undefined;
   }
 
-  async beginRun(input: string, runId?: string, ownerId?: string): Promise<RunCheckpoint> {
+  async beginRun(
+    input: string,
+    runId?: string,
+    ownerId?: string,
+    rollbackIncompleteItems = false,
+  ): Promise<RunCheckpoint> {
     return this.mutate((session) => {
       if (session.checkpoint?.status === 'running' && checkpointOwnerIsLive(session.checkpoint)) {
         throw new Error(`Session ${this.id} 已被另一个活跃 Run 占用`);
@@ -246,6 +253,7 @@ export class FileSession implements Session {
         nextAction: '继续当前任务',
         ownerId,
         ownerPid: process.pid,
+        ...(rollbackIncompleteItems ? { historyStart: session.items.length } : {}),
         startedAt: now,
         updatedAt: now,
       };
@@ -362,6 +370,23 @@ export class FileSession implements Session {
     });
   }
 
+  async rollbackRunItems(expectedRunId: string): Promise<boolean> {
+    return this.mutateWhen((session) => {
+      const checkpoint = session.checkpoint;
+      if (!checkpoint || checkpoint.runId !== expectedRunId || checkpoint.historyStart === undefined) {
+        return { result: false, changed: false };
+      }
+      const start = Math.min(checkpoint.historyStart, session.items.length);
+      if (session.items.length === start) return { result: false, changed: false };
+      session.items.splice(start);
+      if (session.contextArchive && session.contextArchive.coveredItems > start) {
+        session.contextArchive = undefined;
+      }
+      session.updatedAt = new Date().toISOString();
+      return { result: true, changed: true };
+    });
+  }
+
   async recoverInterruptedRun(expectedRunId?: string): Promise<RunCheckpoint | undefined> {
     return this.mutateWhen((session) => {
       if (!session.checkpoint
@@ -371,6 +396,13 @@ export class FileSession implements Session {
         return { result: session.checkpoint ? { ...session.checkpoint } : undefined, changed: false };
       }
       const now = new Date().toISOString();
+      if (session.checkpoint.historyStart !== undefined) {
+        const start = Math.min(session.checkpoint.historyStart, session.items.length);
+        session.items.splice(start);
+        if (session.contextArchive && session.contextArchive.coveredItems > start) {
+          session.contextArchive = undefined;
+        }
+      }
       session.checkpoint = {
         ...session.checkpoint,
         status: 'interrupted',

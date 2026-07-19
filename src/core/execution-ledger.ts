@@ -303,7 +303,12 @@ export class ExecutionLedger {
   private prune(ledger: LedgerFile, now: number): void {
     const cutoff = now - this.retentionMs;
     for (const [key, entry] of Object.entries(ledger.entries)) {
-      if (entry.status !== 'started' && Date.parse(entry.updatedAt) < cutoff) delete ledger.entries[key];
+      // Durable Events can remain in dead letter until the owner retries their
+      // immutable ID. Their ledgers are cleared explicitly after Event commit;
+      // TTL pruning here would silently replay old external effects.
+      if (!entry.runId.startsWith('event:')
+        && entry.status !== 'started'
+        && Date.parse(entry.updatedAt) < cutoff) delete ledger.entries[key];
     }
   }
 }
