@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.11.1] - 2026-07-20 00:25
+
+### Fixed
+
+- preserve completion evidence across resumed runs (@Kickflip73)
+
 ## [Unreleased]
 
 ### Changed

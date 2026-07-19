@@ -1151,10 +1151,18 @@ export class MimiAgent {
 
   private async evaluateRunCompletion(run: ActiveRun, plans: PlanStore): Promise<CompletionGateDecision> {
     const runId = run.options?.executionKey ?? run.runId;
-    const [calls, steps] = await Promise.all([
+    let [calls, steps] = await Promise.all([
       this.ledger.listCalls(run.sessionId, runId),
       run.goalCreatedAt ? plans.get() : Promise.resolve([]),
     ]);
+    // When this run has no tool calls (e.g. resumed after Completion Gate rejection),
+    // include calls from the previous run so the gate can find evidence.
+    if (calls.length === 0) {
+      const checkpoint = await run.session.getCheckpoint();
+      if (checkpoint && checkpoint.runId !== run.runId) {
+        calls = await this.ledger.listCalls(run.sessionId, checkpoint.runId);
+      }
+    }
     return evaluateCompletion(
       run.completionContract,
       run.completionReport,
