@@ -477,6 +477,28 @@ test('migrates legacy daemon files only at the explicit stopped-daemon boundary'
   assert.equal(await readFile(mimiPaths(migrated).database, 'utf8'), 'durable-state');
 });
 
+test('keeps modern daemon files authoritative when legacy filenames remain in the modern directory', async () => {
+  const home = await mkdtemp(path.join(os.tmpdir(), 'mimi-modern-daemon-residue-'));
+  const modernRoot = path.join(home, '.mimi-agent', 'daemon');
+  await mkdir(modernRoot, { recursive: true });
+  await writeFile(path.join(modernRoot, 'mimi.db'), 'modern-state');
+  await writeFile(path.join(modernRoot, PRE_MIMI_DAEMON_FILES.database), 'legacy-residue');
+  const config = {
+    provider: 'openai' as const,
+    workspaceRoot: home,
+    dataRoot: path.join(home, '.mimi-agent'),
+    daemonDataRoot: modernRoot,
+    skillsRoot: path.join(home, 'skills'),
+    mcpConfig: path.join(home, 'mcp.json'),
+    historyLimit: 40,
+    maxTurns: 20,
+  };
+  const migrated = migrateLegacyMimiDaemon(config, home);
+  assert.equal(migrated, config);
+  assert.equal(await readFile(mimiPaths(migrated).database, 'utf8'), 'modern-state');
+  assert.equal(await readFile(path.join(modernRoot, PRE_MIMI_DAEMON_FILES.database), 'utf8'), 'legacy-residue');
+});
+
 test('rejects symlinks for automatically discovered daemon runtime roots', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-daemon-symlink-'));
   const home = path.join(root, 'home');

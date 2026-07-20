@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.11.5] - 2026-07-20 11:25
+
+### Fixed
+
+- tolerate legacy file residue during upgrade (@Kickflip73)
+
 ## [0.11.4] - 2026-07-20 11:15
 
 ### Fixed

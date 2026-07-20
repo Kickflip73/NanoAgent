@@ -81,8 +81,10 @@ export function mimiPaths(config: AppConfig): MimiPaths {
 export function migrateLegacyMimiDaemon(config: AppConfig, homeDirectory = os.homedir()): AppConfig {
   const legacyRoot = path.join(homeDirectory, PRE_MIMI_DATA_DIRECTORY, PRE_MIMI_DAEMON_DIRECTORY);
   const modernRoot = path.join(homeDirectory, '.mimi-agent', 'daemon');
-  let root = path.resolve(config.daemonDataRoot ?? path.join(config.dataRoot, 'mimi'));
-  if (root === path.resolve(legacyRoot)) {
+  const configuredRoot = path.resolve(config.daemonDataRoot ?? path.join(config.dataRoot, 'mimi'));
+  const migratingLegacyDirectory = configuredRoot === path.resolve(legacyRoot);
+  let root = configuredRoot;
+  if (migratingLegacyDirectory) {
     mkdirSync(path.dirname(modernRoot), { recursive: true, mode: 0o700 });
     if (existsSync(modernRoot)) {
       if (readdirSync(modernRoot).length) {
@@ -103,7 +105,12 @@ export function migrateLegacyMimiDaemon(config: AppConfig, homeDirectory = os.ho
     const from = path.join(root, legacy);
     const to = path.join(root, modern);
     if (!existsSync(from)) continue;
-    if (existsSync(to)) throw new Error(`MimiAgent 新旧 Daemon 文件同时存在：${to} / ${from}`);
+    if (existsSync(to)) {
+      if (migratingLegacyDirectory) {
+        throw new Error(`MimiAgent 新旧 Daemon 文件同时存在：${to} / ${from}`);
+      }
+      continue;
+    }
     renameSync(from, to);
   }
   return root === path.resolve(config.daemonDataRoot ?? path.join(config.dataRoot, 'mimi'))
