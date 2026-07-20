@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- replace the legacy `MemoryStore` and flat RAG index with a unified profile-isolated MemoryHub backed by Markdown Wiki pages, SQLite FTS5/BM25, optional embedding RRF, source receipts and forget suppressions
+- split `MIMI.md` Soul from hierarchical `AGENTS.md` / `CLAUDE.md` project guidance, and replace legacy memory/RAG tools and CLI commands with the canonical `/memory` surface
+- add an atomic one-time backup/conversion marker for usable legacy memories while skipping todo and unconfirmed entries
+- index complete rounds as owner-gated episode evidence and add multi-page compilation plans, supersession intervals, deterministic lint, recurring Error Book entries, audit/conflict/capture commands, and bounded semantic maintenance
+- register terminal Task observations transactionally and consolidate them through low-priority profile-scoped maintenance Tasks with strict tool, evidence, trust, page, retry, and fairness limits
+- back up Mimi SQLite/WAL/SHM and legacy user Soul before cutover, move identifiable owner facts into private Wiki, and auto-create minimal AGENTS guidance only for writable development tasks
+
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
@@ -11,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- add a detached `codex` background executor that records process/thread artifacts and commits its own terminal result without Mimi fallback or validation
 - split immutable daemon Events from executable Tasks, with atomic schema v12 cutover and no dual-write compatibility path
 - move lease, retry, control, attempt, lifecycle, schedule occurrence, and Outbox ownership to Task IDs
 - separate Event timeline and Task management in daemon CLI/IPC, including Task-only dead-letter retry
@@ -19,6 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - validate the physical v12 Event/Task schema and atomically recover empty half-migrated databases instead of trusting `user_version` alone
+- keep the interactive input cursor clear of Terminal.app's IME wrapping boundary and remove high-frequency status redraws that could trigger native macOS 26 Terminal crashes
+- soft-wrap editable CLI input across multiple terminal rows while preserving explicit newlines and cursor placement
+- clear a non-empty CLI draft with double Escape while retaining the existing single-Escape action
+- keep Up/Down navigation in input history when a recalled entry such as `/help` also matches command suggestions
+- avoid repeating Markdown code gutters inside a source line when delayed streaming chunks flush before its newline
+- let the process supervisor schedule persisted `codex` tasks and forbid failed background work from falling back to execution in the current Session
+- fall back to a readable input width when a TTY temporarily reports zero columns instead of collapsing soft-wrapped input to two characters per row
 
 ## [0.11.7] - 2026-07-20 11:47
 

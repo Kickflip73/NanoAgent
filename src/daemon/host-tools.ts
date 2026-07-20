@@ -11,6 +11,7 @@ import {
 import type { ConnectorManager } from './connectors.js';
 import { createMimiDeliveryTools, type MimiDeliveryControl } from './delivery-tools.js';
 import { createMimiPeopleTools } from './people-tools.js';
+import { createMemoryMaintenanceTools, type MemoryMaintenanceRuntime } from './memory-maintenance-tools.js';
 import { createMimiRoutineTools } from './routine-tools.js';
 import { createMimiScheduleTools } from './schedule-tools.js';
 import { createMimiSessionActivityTools } from './session-activity-tools.js';
@@ -42,12 +43,14 @@ export interface MimiHostToolContext {
     reason?: string,
   ) => BackgroundTaskPauseResult | Promise<BackgroundTaskPauseResult>;
   blockTask?: (request: BackgroundTaskBlockRequest) => unknown | Promise<unknown>;
+  memoryMaintenance?: MemoryMaintenanceRuntime;
 }
 
 /** One composition root for the Host Tools exposed to every Daemon run. */
 export function createMimiHostTools(context: MimiHostToolContext): Tool[] {
   return [
     ...createMimiActivityTools(context.store),
+    ...createMemoryMaintenanceTools(context.store, context.task, context.memoryMaintenance),
     ...createMimiAttentionRuleTools(context.attention),
     ...createMimiBriefingTools(context.attention),
     ...createMimiDeliveryTools(context.task, context.event, context.deliveryControl),

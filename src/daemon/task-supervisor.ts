@@ -23,6 +23,7 @@ import {
 
 interface WorkerRecord {
   taskId: string;
+  taskType: import('./types.js').TaskType;
   workerToken: string;
   child: ChildProcess;
   workspaceAccess: 'read' | 'write';
@@ -55,6 +56,8 @@ export interface TaskWorkerSnapshot {
   workerId?: string;
   heartbeatAt?: string;
   workspaceAccess: 'read' | 'write';
+  executor?: 'mimi' | 'codex';
+  codexPid?: number;
 }
 
 const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'dead_letter']);
@@ -154,6 +157,7 @@ export class TaskProcessSupervisor {
   private stopping = false;
   private pumpFaulted = false;
   private lastPumpErrorLogAt = 0;
+  private ordinaryCompletionsSinceMaintenance = 0;
 
   constructor(
     private readonly store: MimiStore,
@@ -194,14 +198,36 @@ export class TaskProcessSupervisor {
   }
 
   status(): TaskWorkerSnapshot[] {
-    return [...this.workers.values()].map((worker) => ({
+    const attached = [...this.workers.values()].map((worker) => ({
       taskId: worker.taskId,
       pid: worker.child.pid,
       spawnedAt: new Date(worker.spawnedAt).toISOString(),
       workerId: worker.workerId,
       heartbeatAt: worker.heartbeatAt,
       workspaceAccess: worker.workspaceAccess,
+      executor: this.store.getTask(worker.taskId)?.executor === 'codex' ? 'codex' as const : 'mimi' as const,
     }));
+    const attachedIds = new Set(attached.map((worker) => worker.taskId));
+    const detached = this.store.runningTasks({ executor: 'codex' }, 50)
+      .filter((task) => !attachedIds.has(task.id))
+      .map((task): TaskWorkerSnapshot => {
+        const objective = task.objective && typeof task.objective === 'object'
+          ? task.objective as Record<string, unknown>
+          : {};
+        const codex = objective.codex && typeof objective.codex === 'object'
+          ? objective.codex as Record<string, unknown>
+          : {};
+        return {
+          taskId: task.id,
+          pid: typeof codex.runnerPid === 'number' ? codex.runnerPid : undefined,
+          codexPid: typeof codex.codexPid === 'number' ? codex.codexPid : undefined,
+          spawnedAt: typeof codex.startedAt === 'string' ? codex.startedAt : task.updatedAt,
+          heartbeatAt: task.updatedAt,
+          workspaceAccess: task.workspaceAccess === 'read' ? 'read' : 'write',
+          executor: 'codex',
+        };
+      });
+    return [...attached, ...detached];
   }
 
   authorizeWorker(taskId: string, workerToken: string): boolean {
@@ -283,21 +309,35 @@ export class TaskProcessSupervisor {
     this.pumping = true;
     try {
       this.terminateStaleWorkers();
+      this.store.emitDueMemoryMaintenanceTasks();
       const limit = Math.max(1, Math.min(8, this.options.maxWorkers ?? 2));
       const activeWorkers = [...this.workers.values()];
-      if (activeWorkers.some((worker) => worker.workspaceAccess === 'write')) return;
-      const available = limit - activeWorkers.length;
+      const attachedIds = new Set(activeWorkers.map((worker) => worker.taskId));
+      const detachedCodex = this.store.runningTasks({ executor: 'codex' }, 50)
+        .filter((task) => !attachedIds.has(task.id));
+      if (activeWorkers.some((worker) => worker.workspaceAccess === 'write')
+        || detachedCodex.some((task) => task.workspaceAccess === 'write')) return;
+      const available = limit - activeWorkers.length - detachedCodex.length;
       if (available <= 0) return;
-      const ready = this.store.readyTasks({
+      let ready = this.store.readyTasks({
         types: ['background', 'scheduled', 'briefing', 'memory_maintenance'],
-        executor: 'isolated_worker',
       }, 50)
-        .filter((task) => !this.workers.has(task.id));
+        .filter((task) => (
+          task.executor === 'isolated_worker' || task.executor === 'codex'
+        ) && !this.workers.has(task.id));
       if (ready.length === 0) return;
+      if (this.ordinaryCompletionsSinceMaintenance >= 20) {
+        const maintenance = ready.find((task) => task.type === 'memory_maintenance');
+        const protectedWork = ready.some((task) => task.type !== 'memory_maintenance'
+          && (task.priority >= 100 || hasOwnerConversationRoot(this.store, task.id)));
+        if (maintenance && !protectedWork) {
+          ready = [maintenance, ...ready.filter((task) => task.id !== maintenance.id)];
+        }
+      }
       const workspaceAccess = (task: (typeof ready)[number]): 'read' | 'write' => {
         return task.workspaceAccess === 'read' ? 'read' : 'write';
       };
-      if (activeWorkers.length > 0) {
+      if (activeWorkers.length > 0 || detachedCodex.length > 0) {
         if (ready.some((task) => workspaceAccess(task) === 'write')) return;
         for (const task of ready.slice(0, available)) await this.launch(task.id, 'read');
         return;
@@ -371,6 +411,7 @@ export class TaskProcessSupervisor {
     const workerToken = randomBytes(32).toString('base64url');
     const record: WorkerRecord = {
       taskId,
+      taskType: task!.type,
       workerToken,
       child,
       workspaceAccess,
@@ -400,12 +441,23 @@ export class TaskProcessSupervisor {
         record.heartbeatAt = new Date().toISOString();
       } else if (message.type === 'heartbeat') {
         record.heartbeatAt = message.at;
+      } else if (message.type === 'detached') {
+        record.workerId = `codex-${message.runnerPid}-${taskId.slice(0, 8)}`;
+        record.heartbeatAt = new Date().toISOString();
+        if (record.child.connected) record.child.disconnect();
+        record.child.stderr?.destroy();
+        record.child.unref();
+        if (this.workers.get(taskId) === record) this.workers.delete(taskId);
       } else if (message.type === 'stream') {
         this.options.onStreamEvent?.(taskId, message.event as PendingMimiStreamEvent);
       } else if (message.type === 'error') {
         process.stderr.write(`[MimiAgent] background task ${taskId} failed: ${redact(message.error)}\n`);
       } else if (message.type === 'done') {
         record.gracefulExit = true;
+        if (record.taskType === 'memory_maintenance') this.ordinaryCompletionsSinceMaintenance = 0;
+        else if (message.status === 'completed' || message.status === 'dead_letter') {
+          this.ordinaryCompletionsSinceMaintenance += 1;
+        }
       }
     });
     child.once('error', (error) => {

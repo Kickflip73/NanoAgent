@@ -124,6 +124,43 @@ test('flushes a one-line answer incrementally before completion', async () => {
   renderer.stop();
 });
 
+test('does not repeat the code gutter when one source line arrives in delayed chunks', async () => {
+  const status = new BufferWriter();
+  const answer = new BufferWriter();
+  answer.isTTY = true;
+  const renderer = new TerminalRenderer(status, answer);
+
+  renderer.start();
+  renderer.handle({
+    type: 'raw_model_stream_event',
+    data: { type: 'output_text_delta', delta: '```js\nconst store = require("./main' },
+  } as RunStreamEvent);
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  renderer.handle({
+    type: 'raw_model_stream_event',
+    data: { type: 'output_text_delta', delta: '/store.js");\n```\n' },
+  } as RunStreamEvent);
+  renderer.finish();
+
+  const plain = answer.value.replace(/\x1b\[[0-9;]*m/g, '');
+  assert.match(plain, /│ const store = require\("\.\/main\/store\.js"\);/);
+  assert.doesNotMatch(plain, /main\s+│\s+\/store/);
+  assert.equal((plain.match(/│/g) ?? []).length, 1);
+});
+
+test('keeps TTY run status static instead of redrawing during IME input', async () => {
+  const status = new BufferWriter();
+  status.isTTY = true;
+  const renderer = new TerminalRenderer(status, new BufferWriter());
+
+  renderer.start();
+  status.value = '';
+  await new Promise((resolve) => setTimeout(resolve, 90));
+
+  assert.equal(status.value, '');
+  renderer.stop();
+});
+
 test('renders a compact project banner without ANSI in plain output', () => {
   const banner = renderBanner({
     version: '0.5.0',

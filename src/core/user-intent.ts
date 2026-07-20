@@ -35,3 +35,10 @@ export function explicitlyRequestsSessionClear(input: string): boolean {
   if (hasNegatedAction(value, actions)) return false;
   return /(?:^|[，。！？,.!?]\s*)(?:请(?:你)?|请帮我|帮我|麻烦(?:你)?|please\s+)?(?:清空|删除|重置).{0,12}(?:当前)?(?:会话|对话|聊天|历史)|(?:^|[.!?]\s*)(?:please\s+)?(?:clear|delete|reset).{0,16}(?:current\s+)?(?:session|conversation|chat|history)|\/clear\b/iu.test(value);
 }
+
+export function explicitlyRequestsHistoricalEvidence(input: string): boolean {
+  const value = normalize(input);
+  const actions = '查看|读取|搜索|回顾|回忆|引用|核对|找出|read|search|review|recall|quote|check';
+  if (hasNegatedAction(value, actions)) return false;
+  return /(?:之前|过去|上次|较早|历史|以前|曾经).{0,24}(?:会话|对话|聊天|原话|记录|讨论|说过|提到)|(?:会话|对话|聊天|session|conversation|history).{0,24}(?:历史|记录|原文|之前|过去|earlier|previous|past)|(?:read|search|review|recall|quote|check).{0,24}(?:earlier|previous|past).{0,12}(?:session|conversation|chat)/iu.test(value);
+}

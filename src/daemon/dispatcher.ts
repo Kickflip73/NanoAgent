@@ -15,6 +15,7 @@ import type { ConnectorManager } from './connectors.js';
 import type { MimiDeliveryControl } from './delivery-tools.js';
 import { AttentionEngine } from './attention.js';
 import { createMimiHostTools } from './host-tools.js';
+import type { MemoryMaintenanceRuntime } from './memory-maintenance-tools.js';
 import { MimiStore } from './store.js';
 import type { BackgroundTaskBlockRequest, BackgroundTaskPauseResult } from './task-tools.js';
 import type {
@@ -41,6 +42,7 @@ export interface DispatcherOptions {
   cancelEvent?: (eventId: string, reason?: string) => MaybePromise<EventCancelResult>;
   pauseEvent?: (eventId: string, reason?: string) => MaybePromise<BackgroundTaskPauseResult>;
   connectorRuntime?: ConnectorTaskRuntime;
+  memoryMaintenance?: MemoryMaintenanceRuntime;
 }
 
 interface ActiveExecution {
@@ -545,6 +547,7 @@ export class MimiDispatcher {
             deliveryControl,
             replyRoute,
             sessionId: decision.sessionId!,
+            memoryMaintenance: this.options.memoryMaintenance,
             cancelEvent: this.options.cancelEvent
               ?? ((eventId, reason) => this.cancel(eventId, reason)),
             pauseEvent: this.options.pauseEvent

@@ -2,7 +2,9 @@
 
 MimiAgent 是一个使用 TypeScript 和 OpenAI Agents SDK 构建的轻量级、本地优先、长期在线的个人 Agent。
 
-它由一个长期运行的 `MimiHost` 统一承载 Agent Runtime、Session、Memory、Goal/Plan、Skills、MCP、RAG、SubAgent 和受控 Ultra Team。CLI、IM、邮件、日程、天气与其他 Connector 都是同一个 MimiAgent 的输入输出渠道，不会各自创建独立 Agent。外部事件先可靠写入 SQLite Inbox，再经过 Attention、权限收窄和串行 Run，结果按需进入 Outbox 主动投递。
+它由一个长期运行的 `MimiHost` 统一承载 Agent Runtime、Session、MemoryHub、Goal/Plan、Skills、MCP、SubAgent 和受控 Ultra Team。CLI、IM、邮件、日程、天气与其他 Connector 都是同一个 MimiAgent 的输入输出渠道，不会各自创建独立 Agent。外部事实先写入不可变 Event Store，再由 EventRouter 幂等产生 Task；Task Queue 独立承担 priority、lease、retry、result，结果按需进入 Outbox 主动投递。
+
+MemoryHub 使用 LLMWiki Markdown 保存 semantic memory。private Wiki 按 profile 物理隔离，workspace Wiki 位于 `knowledge/wiki/`；Session、Event 和原始 Document 继续作为证据真相。SQLite 保存 FTS5/BM25、可选 Embedding vector、links 等派生索引，以及不可随 reindex 删除的 receipt 和 suppression 控制账本。默认查询 Wiki-first，Embedding 缺失或失败时无损回退词法检索。
 
 安装后只需运行 `mimi`：它会自动连接或启动长期运行的同一个 Agent，也可通过 `mimi "任务"` 执行单次任务。CLI 提供会话、状态、Skill、MCP、Memory、Plan、Goal、索引和恢复命令，并与长期运行模式共享同一套命令语义和 FileSession transcript。
 

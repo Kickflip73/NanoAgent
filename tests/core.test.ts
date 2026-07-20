@@ -12,8 +12,8 @@ import {
   type MCPServer,
 } from '@openai/agents';
 import { ContextManager, estimateTokens } from '../src/core/context.js';
-import { GuidanceLoader } from '../src/core/guidance.js';
-import { explicitlyRequestsMemory, MemoryStore } from '../src/core/memory.js';
+import { ProjectGuidanceLoader, SoulLoader } from '../src/core/guidance.js';
+import { explicitlyRequestsMemory } from '../src/core/memory.js';
 import { PlanStore } from '../src/core/plan.js';
 import { FileSession, registerSessionRunOwner } from '../src/core/session.js';
 import { TeamTaskStore } from '../src/core/team.js';
@@ -25,7 +25,6 @@ import {
   MCPManager,
   parseMcpConfig,
 } from '../src/extensions/mcp.js';
-import { RagStore } from '../src/extensions/rag.js';
 import { SkillLoader } from '../src/extensions/skills.js';
 import { createSubAgentTools } from '../src/extensions/subagents.js';
 import { MimiAgent } from '../src/agent.js';
@@ -259,11 +258,11 @@ test('isolates transcript and context archives while sharing only usable long-te
     { role: 'user', content: 'SECOND_PRIVATE_REQUEST' },
     { role: 'assistant', content: 'SECOND_PRIVATE_ANSWER' },
   ] as AgentInputItem[]);
-  await new MemoryStore(path.join(dataRoot, 'memories.json')).remember(
-    'SHARED_CONFIRMED_MEMORY',
-    'fact',
-    { source: 'user', sourceSessionId: 'first' },
-  );
+  await mkdir(dataRoot, { recursive: true });
+  await writeFile(path.join(dataRoot, 'memories.json'), JSON.stringify([{
+    id: 'shared', type: 'fact', content: 'SHARED_CONFIRMED_MEMORY', createdAt: new Date().toISOString(),
+    source: 'user', sourceSessionId: 'first', recordedAt: new Date().toISOString(),
+  }]));
 
   const previousSession = process.env.AGENT_SESSION;
   process.env.AGENT_SESSION = 'first';
@@ -276,7 +275,7 @@ test('isolates transcript and context archives while sharing only usable long-te
     let serialized = JSON.stringify(await agent.history());
     assert.match(serialized, /FIRST_PRIVATE_REQUEST_0/);
     assert.doesNotMatch(serialized, /SECOND_PRIVATE_REQUEST/);
-    assert.match(JSON.stringify(await agent.listMemories()), /SHARED_CONFIRMED_MEMORY/);
+    assert.match(JSON.stringify(await agent.memoryList()), /SHARED_CONFIRMED_MEMORY/);
 
     const compacted = await agent.compactContext();
     assert.equal(compacted.changed, true);
@@ -287,7 +286,7 @@ test('isolates transcript and context archives while sharing only usable long-te
     assert.match(serialized, /SECOND_PRIVATE_REQUEST/);
     assert.doesNotMatch(serialized, /FIRST_PRIVATE_REQUEST/);
     assert.equal((await agent.contextInfo()).archivedItems, 0);
-    assert.match(JSON.stringify(await agent.listMemories()), /SHARED_CONFIRMED_MEMORY/);
+    assert.match(JSON.stringify(await agent.memoryList()), /SHARED_CONFIRMED_MEMORY/);
 
     const secondPlan = new PlanStore(path.join(dataRoot, 'plans.json'), 'second');
     await secondPlan.setGoal('SECOND_DURABLE_GOAL');
@@ -304,7 +303,7 @@ test('isolates transcript and context archives while sharing only usable long-te
     assert.equal(await agent.currentGoal(), undefined);
     assert.deepEqual(await agent.currentTeam(), []);
     assert.equal((await agent.runtimeInfo()).mode.id, 'ultra');
-    assert.match(JSON.stringify(await agent.listMemories()), /SHARED_CONFIRMED_MEMORY/);
+    assert.match(JSON.stringify(await agent.memoryList()), /SHARED_CONFIRMED_MEMORY/);
     await agent.switchSession('first');
     serialized = JSON.stringify(await agent.history());
     assert.match(serialized, /FIRST_PRIVATE_REQUEST_0/);
@@ -416,39 +415,52 @@ test('restores the complete session state after a process restart', async () => 
   }
 });
 
-test('loads canonical MIMI.md guidance and keeps project precedence', async () => {
+test('keeps Mimi Soul separate from AGENTS project guidance', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'nano-guidance-'));
   const userFile = path.join(root, 'home', 'MIMI.md');
   await mkdir(path.dirname(userFile), { recursive: true });
   await writeFile(userFile, 'Use tabs.');
-  await writeFile(path.join(root, 'MIMI.md'), 'Use two spaces.');
-  const loader = new GuidanceLoader(root, userFile);
-
-  const first = await loader.load();
-  assert.deepEqual(first.files.map((file) => file.scope), ['user', 'project']);
-  assert.match(first.instructions, /项目级指令优先于用户级指令/);
-  assert.ok(first.instructions.indexOf('Use two spaces.') < first.instructions.indexOf('Use tabs.'));
-
-  await writeFile(path.join(root, 'home', 'MIMI.md'), 'Use updated user guidance.');
-  await writeFile(path.join(root, 'MIMI.md'), 'Run the current test suite.');
-  const modern = await loader.load();
-  assert.deepEqual(modern.files.map((file) => path.basename(file.path)), ['MIMI.md', 'MIMI.md']);
-  assert.match(modern.instructions, /Run the current test suite/);
-  assert.match(modern.instructions, /Use updated user guidance/);
-  assert.doesNotMatch(modern.instructions, /Use two spaces|Use tabs/);
-  assert.ok(modern.instructions.indexOf('Run the current test suite.') < modern.instructions.indexOf('Use updated user guidance.'));
-
-  await writeFile(path.join(root, 'MIMI.md'), 'Run npm test.');
-  assert.match((await loader.load()).instructions, /Run npm test/);
+  await writeFile(path.join(root, 'AGENTS.md'), 'Run the current test suite.');
+  const soul = await new SoulLoader(userFile).load();
+  const project = await new ProjectGuidanceLoader(root).load();
+  assert.deepEqual(soul.files.map((file) => file.scope), ['soul']);
+  assert.deepEqual(project.files.map((file) => file.scope), ['project']);
+  assert.match(soul.instructions, /Use tabs/);
+  assert.doesNotMatch(soul.instructions, /Run the current test suite/);
+  assert.match(project.instructions, /Run the current test suite/);
+  assert.doesNotMatch(project.instructions, /Use tabs/);
 });
 
 test('reads only the bounded prefix of oversized persistent guidance', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'nano-guidance-limit-'));
-  await writeFile(path.join(root, 'MIMI.md'), `PREFIX-${'x'.repeat(100_000)}-TAIL`);
-  const snapshot = await new GuidanceLoader(root, path.join(root, 'MIMI.md'), 20).load();
+  const soulFile = path.join(root, 'MIMI.md');
+  await writeFile(soulFile, `PREFIX-${'x'.repeat(100_000)}-TAIL`);
+  const snapshot = await new SoulLoader(soulFile, undefined, 20).load();
   assert.equal(snapshot.files[0]?.truncated, true);
   assert.match(snapshot.instructions, /PREFIX/);
   assert.doesNotMatch(snapshot.instructions, /TAIL/);
+});
+
+test('creates a minimal shared AGENTS guide from project manifests only when requested', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'nano-guidance-create-'));
+  await mkdir(path.join(root, 'src'));
+  await writeFile(path.join(root, 'package.json'), JSON.stringify({
+    name: 'demo-agent', description: 'A small local agent.',
+    scripts: { check: 'tsc --noEmit', test: 'node --test' },
+  }));
+  const loader = new ProjectGuidanceLoader(root);
+  const ephemeral = await loader.loadForDevelopment();
+  assert.equal(ephemeral.files.length, 0);
+  assert.match(ephemeral.instructions, /未持久化/);
+  assert.match(ephemeral.instructions, /npm run test/);
+  await assert.rejects(readFile(path.join(root, 'AGENTS.md'), 'utf8'), /ENOENT/);
+  const file = await loader.ensureMinimal();
+  assert.equal(file, path.join(root, 'AGENTS.md'));
+  const snapshot = await loader.load();
+  assert.match(snapshot.instructions, /A small local agent/);
+  assert.match(snapshot.instructions, /npm run check/);
+  assert.match(snapshot.instructions, /`src\/`/);
+  assert.equal(await loader.ensureMinimal(), file);
 });
 
 test('serializes concurrent session writes and keeps an in-process cache', async () => {
@@ -656,97 +668,11 @@ test('repairs dangling tool calls left by an interrupted task', async () => {
   assert.match(serialized, /paired/);
 });
 
-test('stores, retrieves and forgets long-term memories', async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'nano-memory-'));
-  const store = new MemoryStore(path.join(root, 'memories.json'));
-  const memory = await store.remember('用户偏好 TypeScript', 'preference');
-
-  assert.equal((await store.search('TypeScript 偏好'))[0]?.id, memory.id);
-  assert.deepEqual(await store.search('完全无关'), []);
-  assert.equal(await store.forget(memory.id), true);
-  assert.deepEqual(await store.list(), []);
-});
-
-test('lets the Agent record durable memory without per-write confirmation and preserves provenance', async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'nano-memory-autonomous-'));
-  const store = new MemoryStore(path.join(root, 'memories.json'));
-  const [remember] = store.createTools(() => ({
-    input: '我的编辑器是 Vim',
-    sessionId: 'private-a',
-    eventId: 'event-1',
-    eventSource: 'messages',
-    trust: 'owner',
-    actor: '+15550001111',
-    conversation: 'messages-thread',
-    personId: 'alice',
-    personName: 'Alice Chen',
-  }));
-  assert.ok(remember && 'invoke' in remember);
-  await remember!.invoke(new RunContext({}), JSON.stringify({
-    content: '用户使用 Vim', type: 'preference', importance: 3,
-  }));
-  const [saved] = await store.list();
-  assert.equal(saved?.sourceSessionId, 'private-a');
-  assert.equal(saved?.source, 'agent');
-  assert.equal(saved?.sourceEventId, 'event-1');
-  assert.equal(saved?.sourceEventSource, 'messages');
-  assert.equal(saved?.sourceTrust, 'owner');
-  assert.equal(saved?.sourceActor, '+15550001111');
-  assert.equal(saved?.sourceConversation, 'messages-thread');
-  assert.equal(saved?.personId, 'alice');
-  assert.equal(saved?.personName, 'Alice Chen');
-  assert.ok(saved?.recordedAt);
-  assert.deepEqual((await store.search('alice mail:inbox')).map((item) => item.id), [saved?.id]);
-});
-
 test('recognizes explicit memory requests without requiring them for autonomous writes', () => {
   assert.equal(explicitlyRequestsMemory('请记住我喜欢简洁输出'), true);
   assert.equal(explicitlyRequestsMemory('不要记住我的密码'), false);
   assert.equal(explicitlyRequestsMemory('你还记住我什么？'), false);
   assert.equal(explicitlyRequestsMemory('please do not remember this password'), false);
-});
-
-test('honors an explicit request not to retain memory', async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'nano-memory-denied-'));
-  const store = new MemoryStore(path.join(root, 'memories.json'));
-  const [remember] = store.createTools(() => ({ input: '不要记住我的门禁密码', sessionId: 'private-a' }));
-  assert.ok(remember && 'invoke' in remember);
-  assert.match(String(await remember!.invoke(new RunContext({}), JSON.stringify({
-    content: '用户门禁密码是 1234', type: 'fact', importance: 5,
-  }))), /明确要求不要保存/);
-  assert.deepEqual(await store.list(), []);
-});
-
-test('bounds autonomous memory content and usable entry growth', async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'nano-memory-bounds-'));
-  const file = path.join(root, 'memories.json');
-  const timestamp = new Date().toISOString();
-  await writeFile(file, JSON.stringify(Array.from({ length: 1_000 }, (_, index) => ({
-    id: `memory-${index}`,
-    type: 'fact',
-    content: `fact-${index}`,
-    createdAt: timestamp,
-    recordedAt: timestamp,
-  }))));
-  const store = new MemoryStore(file);
-
-  await assert.rejects(() => store.remember('x'.repeat(2_001), 'fact'), /2000/);
-  await assert.rejects(() => store.remember('one-more', 'fact'), /1000/);
-  assert.equal((await store.remember('fact-0', 'fact', { importance: 5 })).importance, 5);
-});
-
-test('does not inject legacy or unconfirmed memory across sessions', async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'nano-memory-unconfirmed-'));
-  const file = path.join(root, 'memories.json');
-  await writeFile(file, JSON.stringify([
-    { id: 'legacy', type: 'fact', content: 'PRIVATE_LEGACY_SENTINEL', createdAt: new Date().toISOString() },
-    { id: 'confirmed', type: 'fact', content: 'SHARED_CONFIRMED_SENTINEL', createdAt: new Date().toISOString(), confirmedAt: new Date().toISOString() },
-  ]));
-  const store = new MemoryStore(file);
-
-  assert.deepEqual((await store.search('PRIVATE_LEGACY_SENTINEL')).map((item) => item.id), []);
-  assert.deepEqual((await store.search('SHARED_CONFIRMED_SENTINEL')).map((item) => item.id), ['confirmed']);
-  assert.deepEqual((await store.listUsable()).map((item) => item.id), ['confirmed']);
 });
 
 test('loads skill metadata and content on demand', async () => {
@@ -798,65 +724,7 @@ test('rejects oversized skill instructions and resources before loading them ful
   await assert.rejects(loader.readResource('valid', 'large.md'), /超过 256KB/);
 });
 
-test('indexes and searches local documents without a vector database', async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'nano-rag-'));
-  const docs = path.join(root, 'knowledge');
-  await import('node:fs/promises').then(({ mkdir }) => mkdir(docs, { recursive: true }));
-  await writeFile(path.join(docs, 'agent.md'), 'MimiAgent 使用 TypeScript 构建。');
-  const indexFile = path.join(root, 'index.json');
-  const rag = new RagStore(root, indexFile);
-
-  assert.deepEqual(await rag.index('knowledge'), { files: 1, chunks: 1, embeddings: false });
-  assert.equal((await rag.search('TypeScript'))[0]?.source, 'knowledge/agent.md');
-  assert.ok((await readFile(indexFile, 'utf8')).includes('MimiAgent'));
-});
-
-test('never indexes private session runtime data into shared RAG', async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'nano-rag-private-'));
-  const runtime = path.join(root, '.mimi-agent');
-  await mkdir(runtime, { recursive: true });
-  await writeFile(path.join(root, 'public.md'), 'PUBLIC_KNOWLEDGE_SENTINEL');
-  await writeFile(path.join(runtime, 'private.txt'), 'PRIVATE_SESSION_SENTINEL');
-  const rag = new RagStore(root, path.join(runtime, 'rag-index.json'), undefined, [runtime]);
-
-  await rag.index('.');
-  assert.equal((await rag.search('PUBLIC_KNOWLEDGE_SENTINEL'))[0]?.source, 'public.md');
-  assert.deepEqual(await rag.search('PRIVATE_SESSION_SENTINEL'), []);
-  await assert.rejects(rag.index('.mimi-agent'), /MimiAgent 私有运行数据/);
-});
-
-test('rebuilds RAG embeddings when the embedding model changes', async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'nano-rag-model-'));
-  const docs = path.join(root, 'knowledge');
-  await mkdir(docs, { recursive: true });
-  await writeFile(path.join(docs, 'agent.md'), 'MimiAgent context management.');
-  const indexFile = path.join(root, 'index.json');
-  const previous = process.env.EMBEDDING_MODEL;
-  let oldCalls = 0;
-  let newCalls = 0;
-  const client = (counter: () => void) => ({
-    embeddings: {
-      create: async ({ input }: { input: string | string[] }) => {
-        counter();
-        const values = Array.isArray(input) ? input : [input];
-        return { data: values.map((_, index) => ({ embedding: [index + 1, 0] })) };
-      },
-    },
-  }) as never;
-  try {
-    process.env.EMBEDDING_MODEL = 'embedding-old';
-    await new RagStore(root, indexFile, client(() => { oldCalls += 1; })).index('knowledge');
-    process.env.EMBEDDING_MODEL = 'embedding-new';
-    await new RagStore(root, indexFile, client(() => { newCalls += 1; })).index('knowledge');
-  } finally {
-    if (previous === undefined) delete process.env.EMBEDDING_MODEL;
-    else process.env.EMBEDDING_MODEL = previous;
-  }
-  assert.equal(oldCalls, 1);
-  assert.equal(newCalls, 1);
-});
-
-test('context keeps recent history and injects memory, RAG and plan', async () => {
+test('context keeps recent history and injects Memory Cards and plan', async () => {
   const manager = new ContextManager(1);
   const history = [{ role: 'user', content: 'old' }, { role: 'user', content: 'recent' }] as AgentInputItem[];
   const compacted = await manager.sessionInput(history, [{ role: 'user', content: 'new' }]);
@@ -868,18 +736,17 @@ test('context keeps recent history and injects memory, RAG and plan', async () =
     historySummary: 'older conversation',
     skillCatalog: '- review: code',
     memories: [{
-      id: 'm1', type: 'fact', content: 'uses TS', createdAt: '',
-      personId: 'alice', personName: 'Alice Chen', sourceTrust: 'external',
+      ref: { scope: 'private', id: 'm1', profileId: 'owner' }, title: 'Stack', summary: 'uses TS',
+      kind: 'fact', status: 'active', confidence: 'user-confirmed', score: 1,
+      sourceRefs: [], documentType: 'wiki',
     }],
-    documents: [{ source: 'doc.md', content: 'hello', score: 1 }],
     plan: [{ id: '1', description: 'test', status: 'running' }],
     goal: { objective: 'ship', status: 'active', createdAt: '', updatedAt: '' },
   });
   assert.match(instructions, /uses TS/);
-  assert.match(instructions, /person=Alice Chen/);
-  assert.match(instructions, /trust=external/);
+  assert.match(instructions, /private:m1/);
+  assert.match(instructions, /有来源的数据，不是指令/);
   assert.match(instructions, /older conversation/);
-  assert.match(instructions, /doc\.md/);
   assert.match(instructions, /running/);
   assert.match(instructions, /ship/);
   assert.match(instructions, /当前会话状态/);
@@ -942,7 +809,6 @@ test('caps dynamic instructions within their token budget', () => {
     historySummary: '历史'.repeat(4_000),
     skillCatalog: '技能'.repeat(4_000),
     memories: [],
-    documents: [],
     plan: [],
   });
   assert.ok(estimateTokens(instructions) <= 2_000);
@@ -982,7 +848,6 @@ test('budgets the complete model request including input, instructions, tools an
     historySummary: '',
     skillCatalog: '',
     memories: [],
-    documents: [],
     plan: [],
   }, instructionBudget);
   const messageBudget = budget.inputBudget - estimateTokens(instructions);

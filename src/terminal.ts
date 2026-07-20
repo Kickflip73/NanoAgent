@@ -306,6 +306,7 @@ class MarkdownStream {
   private readonly state = { code: false };
   private timer?: NodeJS.Timeout;
   private previousBlank = false;
+  private partialLineOpen = false;
 
   constructor(
     private readonly output: Writable,
@@ -318,6 +319,13 @@ class MarkdownStream {
     while (newline >= 0) {
       const line = this.buffer.slice(0, newline);
       this.buffer = this.buffer.slice(newline + 1);
+      if (this.partialLineOpen) {
+        this.output.write(`${this.renderContinuation(line)}\n`);
+        this.partialLineOpen = false;
+        this.previousBlank = false;
+        newline = this.buffer.indexOf('\n');
+        continue;
+      }
       const blank = line.trim() === '';
       if (!blank || !this.previousBlank) {
         this.output.write(`${renderMarkdownLine(line, this.tty, this.state)}\n`);
@@ -331,9 +339,17 @@ class MarkdownStream {
   flush(): boolean {
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
-    if (!this.buffer) return false;
-    this.output.write(renderMarkdownLine(this.buffer, this.tty, this.state));
+    if (!this.buffer) {
+      const wrotePartial = this.partialLineOpen;
+      this.partialLineOpen = false;
+      this.previousBlank = false;
+      return wrotePartial;
+    }
+    this.output.write(this.partialLineOpen
+      ? this.renderContinuation(this.buffer)
+      : renderMarkdownLine(this.buffer, this.tty, this.state));
     this.buffer = '';
+    this.partialLineOpen = false;
     this.previousBlank = false;
     return true;
   }
@@ -346,8 +362,11 @@ class MarkdownStream {
         this.scheduleFlush();
         return;
       }
-      this.output.write(renderMarkdownLine(this.buffer, this.tty, this.state));
+      this.output.write(this.partialLineOpen
+        ? this.renderContinuation(this.buffer)
+        : renderMarkdownLine(this.buffer, this.tty, this.state));
       this.buffer = '';
+      this.partialLineOpen = true;
     }, 45);
     this.timer.unref();
   }
@@ -360,6 +379,12 @@ class MarkdownStream {
     const codeMarkers = (this.buffer.match(/(?<!`)`(?!`)/g) ?? []).length;
     return boldMarkers % 2 === 0 && codeMarkers % 2 === 0;
   }
+
+  private renderContinuation(value: string): string {
+    const clean = value.replace(/\x1b/g, '');
+    if (this.state.code) return this.tty ? `${ansi.gray}${clean}${ansi.reset}` : clean;
+    return inlineMarkdown(clean, this.tty);
+  }
 }
 
 function badge(tone: keyof typeof badges, tty: boolean): string {
@@ -369,9 +394,6 @@ function badge(tone: keyof typeof badges, tty: boolean): string {
 }
 
 export class TerminalRenderer {
-  private readonly frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-  private timer?: NodeJS.Timeout;
-  private frame = 0;
   private label = '';
   private active?: 'answer' | 'reasoning';
   private markdown?: MarkdownStream;
@@ -402,8 +424,6 @@ export class TerminalRenderer {
       return;
     }
     this.draw();
-    this.timer = setInterval(() => this.draw(), 80);
-    this.timer.unref();
   }
 
   handle(event: RunStreamEvent): void {
@@ -526,16 +546,10 @@ export class TerminalRenderer {
   }
 
   private draw(): void {
-    const icon = this.frames[this.frame % this.frames.length];
-    this.frame += 1;
-    this.status.write(`\r\x1b[2K${ansi.gray}${icon} ${this.label}${ansi.reset}`);
+    this.status.write(`\r\x1b[2K${ansi.gray}● ${this.label}${ansi.reset}`);
   }
 
   private stopSpinner(): void {
-    if (this.timer) {
-      clearInterval(this.timer);
-      this.timer = undefined;
-    }
     if (this.status.isTTY && this.label) this.status.write('\r\x1b[2K');
     this.label = '';
   }

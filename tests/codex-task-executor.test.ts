@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmod, mkdtemp, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -15,19 +15,26 @@ process.stdout.write(JSON.stringify({type:'turn.completed',usage:{input_tokens:4
 `);
   await chmod(fixture, 0o755);
   const events: string[] = [];
+  let pid: number | undefined;
+  const outputJsonlPath = path.join(root, 'events.jsonl');
   const result = await new CodexCliTaskExecutor(fixture).execute({
     objective: '实现功能',
     successCriteria: '测试通过',
     workspaceRoot: root,
     workspaceAccess: 'write',
+    outputJsonlPath,
+    onStarted: (startedPid) => { pid = startedPid; },
     onProgress: (event) => { if (typeof event.type === 'string') events.push(event.type); },
   });
   assert.equal(result.threadId, 'thread-123');
   assert.equal(result.answer, 'implemented and tested');
+  assert.equal(result.exitCode, 0);
+  assert.equal(typeof pid, 'number');
+  assert.match(await readFile(outputJsonlPath, 'utf8'), /thread\.started/);
   assert.deepEqual(events, ['thread.started', 'item.completed', 'turn.completed']);
 });
 
-test('Codex executor reports a missing optional CLI without hiding the fallback signal', async () => {
+test('Codex executor reports a missing CLI as its own terminal failure', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-codex-missing-'));
   await assert.rejects(new CodexCliTaskExecutor(path.join(root, 'missing-codex')).execute({
     objective: 'work', workspaceRoot: root, workspaceAccess: 'read',

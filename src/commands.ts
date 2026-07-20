@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { MimiAgent } from './agent.js';
+import type { MemoryRef, MemoryScope } from './core/memory.js';
 import type { SessionSummary } from './core/session.js';
 import { OUTPUT_LEVELS, type OutputLevel } from './terminal.js';
 
@@ -11,6 +12,7 @@ export interface BackgroundTaskSummary {
   status: string;
   objective?: string;
   strategy?: string;
+  executor?: 'mimi' | 'codex';
   workspaceAccess?: 'read' | 'write';
   sessionId?: string;
   originSessionId?: string;
@@ -21,6 +23,16 @@ export interface BackgroundTaskSummary {
   updatedAt?: string;
   result?: unknown;
   error?: string;
+  codex?: {
+    runnerPid?: number;
+    codexPid?: number;
+    threadId?: string;
+    startedAt?: string;
+    checkpointedAt?: string;
+    lastEvent?: string;
+    outputJsonlPath?: string;
+    summaryPath?: string;
+  };
   worker?: {
     pid?: number;
     workerId?: string;
@@ -89,13 +101,23 @@ export interface CommandTarget {
   contextInfo(): ReturnType<MimiAgent['contextInfo']>;
   compactContext(): ReturnType<MimiAgent['compactContext']>;
   guidanceInfo(): ReturnType<MimiAgent['guidanceInfo']>;
-  listMemories(): ReturnType<MimiAgent['listMemories']>;
+  memoryList(scope?: MemoryScope | 'all'): ReturnType<MimiAgent['memoryList']>;
+  memorySearch(query: string, scope?: MemoryScope | 'all'): ReturnType<MimiAgent['memorySearch']>;
+  memoryRead(ref: MemoryRef): ReturnType<MimiAgent['memoryRead']>;
+  memoryForget(ref: MemoryRef): ReturnType<MimiAgent['memoryForget']>;
+  memoryIngest(path: string, signal?: AbortSignal): ReturnType<MimiAgent['memoryIngest']>;
+  memoryCaptureRound(roundRef?: string): ReturnType<MimiAgent['memoryCaptureRound']>;
+  memoryLint(): ReturnType<MimiAgent['memoryLint']>;
+  memoryConflicts(limit?: number): ReturnType<MimiAgent['memoryConflicts']>;
+  memoryAudit(limit?: number): ReturnType<MimiAgent['memoryAudit']>;
+  memoryMaintain?(): MaybePromise<unknown>;
+  memoryReindex(): ReturnType<MimiAgent['memoryReindex']>;
+  memoryStatus(): ReturnType<MimiAgent['memoryStatus']>;
   currentPlan(): ReturnType<MimiAgent['currentPlan']>;
   currentTeam(): ReturnType<MimiAgent['currentTeam']>;
   currentGoal(): ReturnType<MimiAgent['currentGoal']>;
   setGoal(objective: string): ReturnType<MimiAgent['setGoal']>;
   resumePrompt(): ReturnType<MimiAgent['resumePrompt']>;
-  indexKnowledge(target?: string, signal?: AbortSignal): ReturnType<MimiAgent['indexKnowledge']>;
   listBackgroundTasks?(limit?: number): MaybePromise<BackgroundTaskSummary[]>;
   inspectBackgroundTask?(taskId: string): MaybePromise<BackgroundTaskSummary>;
   cancelBackgroundTask?(taskId: string, reason?: string): MaybePromise<BackgroundTaskCancelResult>;
@@ -119,14 +141,13 @@ export const COMMANDS = [
   { value: '/context', description: '查看上下文用量' },
   { value: '/compact', description: '压缩并归档较早上下文' },
   { value: '/instructions', description: '查看持久指令文件' },
-  { value: '/memories', description: '列出长期记忆' },
+  { value: '/memory', description: '搜索、读取、导入、检查或遗忘 Memory' },
   { value: '/plan', description: '查看任务计划' },
   { value: '/team', description: '查看 Ultra Team 任务板' },
   { value: '/tasks', description: '查看后台任务' },
   { value: '/task', description: '查看、暂停、继续或取消后台任务' },
   { value: '/goal', description: '查看或设置长期目标' },
   { value: '/resume', description: '依据持久任务状态继续' },
-  { value: '/index', description: '索引本地知识库' },
   { value: '/retry', description: '重试上一条输入' },
   { value: '/help', description: '显示命令帮助' },
   { value: '/exit', description: '退出 MimiAgent CLI' },
@@ -147,8 +168,8 @@ const HELP = `内置命令：
   /mcp [reload]       查看或重新连接 MCP Server
   /context            查看上下文、记忆和计划用量
   /compact            归档较早历史，保留最近两轮
-  /instructions       查看用户级与项目级 MIMI.md
-  /memories           列出长期记忆
+  /instructions       查看 Soul 与项目开发指令
+  /memory <操作>      status/list/search/read/ingest/capture/lint/conflicts/audit/forget/reindex/maintain
   /plan               查看当前任务计划
   /team               查看 Ultra Team 子任务、依赖和结果
   /tasks [limit]      查看最近的后台任务
@@ -158,7 +179,6 @@ const HELP = `内置命令：
   /task resume <id>   继续后台任务，可在 ID 后补充上下文
   /goal [objective]   查看或设置当前长期目标
   /resume             依据 Checkpoint / Goal / Plan / Team 尽力续跑
-  /index [path]       索引知识库，默认 knowledge
   /retry              重新执行上一条用户输入
   /help               显示帮助
   /exit               退出
@@ -239,6 +259,7 @@ function taskDetails(task: BackgroundTaskSummary): string {
     `状态      ${taskStatus(task.status)}`,
     `目标      ${task.objective ?? '未记录'}`,
     task.strategy ? `策略      ${task.strategy}` : '',
+    task.executor ? `执行器    ${task.executor}` : '',
     task.workspaceAccess ? `工作区    ${task.workspaceAccess === 'read' ? '只读' : '可写（独占）'}` : '',
     task.sessionId ? `任务会话  ${task.sessionId}` : '',
     task.originSessionId ? `来源会话  ${task.originSessionId}` : '',
@@ -247,6 +268,12 @@ function taskDetails(task: BackgroundTaskSummary): string {
     task.attempts !== undefined ? `尝试次数  ${task.attempts}` : '',
     task.worker ? `工作进程  ${task.worker.pid ?? task.worker.workerId ?? '启动中'}` : '',
     task.worker?.heartbeatAt ? `最近心跳  ${task.worker.heartbeatAt}` : '',
+    task.codex?.runnerPid ? `追踪进程  ${task.codex.runnerPid}` : '',
+    task.codex?.codexPid ? `Codex PID ${task.codex.codexPid}` : '',
+    task.codex?.threadId ? `Codex 线程 ${task.codex.threadId}` : '',
+    task.codex?.lastEvent ? `Codex 状态 ${task.codex.lastEvent}` : '',
+    task.codex?.outputJsonlPath ? `事件产物  ${task.codex.outputJsonlPath}` : '',
+    task.codex?.summaryPath ? `结果产物  ${task.codex.summaryPath}` : '',
     ...taskProgress(task),
     task.createdAt ? `创建时间  ${task.createdAt}` : '',
     task.updatedAt ? `更新时间  ${task.updatedAt}` : '',
@@ -300,7 +327,7 @@ export class CommandHandler {
         `Memories  ${info.memoryCount}`,
         `MCP       ${info.mcpServers.join(', ') || '未连接'}`,
         `Team      ${info.team.total ? `${info.team.completed}/${info.team.total} 完成 · ${info.team.running} 运行` : '未启用'}`,
-        `MIMI.md   ${info.guidanceFiles.length ? `${info.guidanceFiles.length} 个已加载` : '未配置'}`,
+        `Guidance  ${info.guidanceFiles.length ? `${info.guidanceFiles.length} 个已加载` : '未配置'}`,
       ].join('\n'));
     }
     if (command === '/model') {
@@ -413,16 +440,75 @@ export class CommandHandler {
     }
     if (command === '/instructions') {
       const guidance = await this.agent.guidanceInfo();
-      if (!guidance.files.length) return this.handled('未找到 MIMI.md。用户级：~/.mimi-agent/MIMI.md · 项目级：<workspace>/MIMI.md');
+      if (!guidance.files.length) return this.handled('未找到 Soul 或项目指令。Soul：~/.mimi-agent/MIMI.md · 项目：AGENTS.md / CLAUDE.md');
       return this.handled(guidance.files.map((file) =>
-        `${file.scope === 'project' ? '项目' : '用户'}  ${file.path}${file.truncated ? '（已截断）' : ''}`,
+        `${file.scope === 'project' ? '项目' : 'Soul'}  ${file.path}${file.truncated ? '（已截断）' : ''}`,
       ).join('\n'));
     }
-    if (command === '/memories') {
-      const memories = await this.agent.listMemories();
-      return this.handled(memories.map((memory) =>
-        `- ${memory.id} [${memory.type} · ${memory.source ?? 'legacy'}${memory.sourceTrust ? `/${memory.sourceTrust}` : ''}${memory.personId ? ` · ${memory.personName ?? memory.personId}` : ''}] ${memory.content}`,
-      ).join('\n') || '暂无长期记忆');
+    if (command === '/memory') {
+      const [operation = 'status', ...memoryArgs] = rest;
+      const value = memoryArgs.join(' ').trim();
+      const parseScope = (candidate?: string): MemoryScope | 'all' => (
+        candidate === 'private' || candidate === 'workspace' ? candidate : 'all'
+      );
+      const parseRef = (candidate: string): MemoryRef => {
+        const match = /^(private|workspace):(.+)$/.exec(candidate);
+        if (!match) throw new Error('MemoryRef 格式必须是 private:<id> 或 workspace:<id>');
+        return { scope: match[1] as MemoryScope, id: match[2]!, ...(match[1] === 'private' ? { profileId: 'owner' } : {}) };
+      };
+      if (operation === 'status') return this.handled(JSON.stringify(await this.agent.memoryStatus(), null, 2));
+      if (operation === 'list') {
+        const hits = await this.agent.memoryList(parseScope(value));
+        return this.handled(hits.map((hit) => `- ${hit.ref.scope}:${hit.ref.id} [${hit.kind}/${hit.status}] ${hit.title} — ${hit.summary}`).join('\n') || '暂无 Memory');
+      }
+      if (operation === 'search') {
+        if (!value) throw new Error('用法：/memory search <query>');
+        const hits = await this.agent.memorySearch(value);
+        return this.handled(hits.map((hit) => `- ${hit.ref.scope}:${hit.ref.id} [${hit.kind}/${hit.status}] ${hit.title} — ${hit.summary}`).join('\n') || '未找到相关 Memory');
+      }
+      if (operation === 'read') {
+        if (!value) throw new Error('用法：/memory read <scope:id>');
+        const document = await this.agent.memoryRead(parseRef(value));
+        return this.handled(`${document.metadata.title}\n${document.body}`);
+      }
+      if (operation === 'forget') {
+        if (!value) throw new Error('用法：/memory forget <scope:id>');
+        const receipt = await this.agent.memoryForget(parseRef(value));
+        return this.handled(receipt.forgotten ? `已遗忘 ${value}` : `Memory 不存在：${value}`);
+      }
+      if (operation === 'ingest') {
+        if (!value) throw new Error('用法：/memory ingest <source-path>');
+        const receipt = await this.agent.memoryIngest(value, signal);
+        return this.handled(`Ingest ${receipt.status} · ${receipt.pageRefs.map((ref) => `${ref.scope}:${ref.id}`).join(', ')}`);
+      }
+      if (operation === 'capture') {
+        const receipt = await this.agent.memoryCaptureRound(value || undefined);
+        return this.handled(`Capture ${receipt.status} · receipt=${receipt.id} · ${receipt.pageRefs.map((ref) => `${ref.scope}:${ref.id}`).join(', ')}`);
+      }
+      if (operation === 'lint') {
+        const report = await this.agent.memoryLint();
+        return this.handled(report.issues.map((issue) => `- [${issue.severity}] ${issue.code}: ${issue.message}`).join('\n') || `检查 ${report.checked} 页，无问题`);
+      }
+      if (operation === 'conflicts') {
+        const limit = value ? Number(value) : 20;
+        if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) throw new Error('用法：/memory conflicts [1-200]');
+        const conflicts = await this.agent.memoryConflicts(limit);
+        return this.handled(conflicts.map((hit) => `- ${hit.ref.scope}:${hit.ref.id} ${hit.title}`).join('\n') || '暂无冲突');
+      }
+      if (operation === 'audit') {
+        const limit = value ? Number(value) : 20;
+        if (!Number.isSafeInteger(limit) || limit < 1 || limit > 200) throw new Error('用法：/memory audit [1-200]');
+        const decisions = await this.agent.memoryAudit(limit);
+        return this.handled(decisions.map((decision) =>
+          `- ${decision.createdAt} ${decision.operation}/${decision.reasonCode}${decision.refId ? ` · ${decision.refId}` : ''}`,
+        ).join('\n') || '暂无 Memory 决策记录');
+      }
+      if (operation === 'maintain') {
+        if (!this.agent.memoryMaintain) throw new Error('当前入口没有 Daemon maintenance 控制面');
+        return this.handled(JSON.stringify(await this.agent.memoryMaintain(), null, 2));
+      }
+      if (operation === 'reindex') return this.handled(JSON.stringify(await this.agent.memoryReindex(), null, 2));
+      throw new Error(`未知 /memory 操作：${operation}`);
     }
     if (command === '/plan') {
       const plan = await this.agent.currentPlan();
@@ -507,11 +593,6 @@ export class CommandHandler {
       this.print('正在依据持久任务状态继续...');
       await this.runTask(prompt, signal);
       return 'handled';
-    }
-    if (command === '/index') {
-      this.print('正在构建知识库索引...');
-      const result = await this.agent.indexKnowledge(argument || 'knowledge', signal);
-      return this.handled(JSON.stringify(result));
     }
     if (command === '/retry') {
       const lastInput = this.lastInputs.get(this.agent.currentSessionId);

@@ -16,7 +16,7 @@ import {
   type AppConfig,
 } from '../config.js';
 import { ContextManager, estimateTokens, type ContextStats } from '../core/context.js';
-import { GuidanceLoader } from '../core/guidance.js';
+import { ProjectGuidanceLoader, SoulLoader } from '../core/guidance.js';
 import { ExecutionLedger, type ExecutionCallRecord } from '../core/execution-ledger.js';
 import {
   assertCompletionContractForTask,
@@ -26,7 +26,7 @@ import {
   type CompletionGateDecision,
   type CompletionReport,
 } from '../core/completion.js';
-import { MemoryStore } from '../core/memory.js';
+import { contentDigest, type CaptureInput, type MemoryHub, type RunMemoryContext, type SourceRef } from '../core/memory.js';
 import { PlanStore, type PlanStep } from '../core/plan.js';
 import { TeamTaskStore } from '../core/team.js';
 import {
@@ -37,7 +37,7 @@ import {
 } from '../core/session.js';
 import { TraceStore } from '../core/trace.js';
 import { MCPManager } from '../extensions/mcp.js';
-import { RagStore } from '../extensions/rag.js';
+import { createMemoryTools } from '../extensions/memory/tools.js';
 import { SkillLoader } from '../extensions/skills.js';
 import { createSubAgentTools } from '../extensions/subagents.js';
 import { createTeamTools } from '../extensions/team.js';
@@ -74,6 +74,7 @@ import { restrictedShellEnvironment } from './shell-environment.js';
 import {
   explicitlyRequestsSessionAccess,
   explicitlyRequestsSessionClear,
+  explicitlyRequestsHistoricalEvidence,
 } from '../core/user-intent.js';
 
 export { AGENT_MODES } from './instructions.js';
@@ -211,6 +212,8 @@ export type RunTrust = 'owner' | 'trusted' | 'external' | 'public' | 'system';
 
 export interface RunCause {
   eventId: string;
+  taskId?: string;
+  profileId?: string;
   source: string;
   actor?: string;
   conversation?: string;
@@ -284,10 +287,10 @@ export class MimiAgent {
   private readonly runner: Runner;
   private model: AgentModel;
   private context: ContextManager;
-  private readonly guidance: GuidanceLoader;
-  private readonly memory: MemoryStore;
+  private readonly soul: SoulLoader;
+  private readonly projectGuidance: ProjectGuidanceLoader;
+  private readonly memory: MemoryHub;
   private readonly skills: SkillLoader;
-  private readonly rag: RagStore;
   private readonly plans: PlanStore;
   private readonly team: TeamTaskStore;
   private readonly traces: TraceStore;
@@ -319,10 +322,10 @@ export class MimiAgent {
   ) {
     this.model = components.modelRuntime.model;
     this.context = components.context;
-    this.guidance = components.guidance;
+    this.soul = components.soul;
+    this.projectGuidance = components.projectGuidance;
     this.memory = components.memory;
     this.skills = components.skills;
-    this.rag = components.rag;
     this.plans = components.plans;
     this.team = components.team;
     this.traces = components.traces;
@@ -368,7 +371,6 @@ export class MimiAgent {
     this.tools = toolsForPermission(this.permissionMode, [
       ...createTools(config.workspaceRoot, config.provider === 'openai', privateRuntimePaths(config), localAccess),
       ...this.skills.createTools(),
-      ...this.rag.createTools(),
       ...this.mcp.createTools(),
       ...createRuntimeControlTools({
         status: () => this.runtimeInfo(),
@@ -451,6 +453,19 @@ export class MimiAgent {
     const canReadMemory = !runPolicy || allowedCapabilities.has('memory-read');
     const canReadState = !runPolicy || allowedCapabilities.has('state-read');
     const canReadSessionContext = runPolicy?.allowSessionContext !== false;
+    const developmentTask = this.isDevelopmentTask(input);
+    const canInitializeProjectGuidance = canReadLocal
+      && mode !== 'plan'
+      && this.permissionMode !== 'read-only'
+      && (!runPolicy || allowedCapabilities.has('write'));
+    if (canInitializeProjectGuidance && developmentTask) {
+      try {
+        await this.projectGuidance.ensureMinimal();
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== 'EACCES' && code !== 'EROFS' && code !== 'EPERM') throw error;
+      }
+    }
     const scopedTools = toolsForRunPolicy(toolsForPermission(
       this.permissionMode,
       [...this.tools, ...(options?.hostTools ?? [])],
@@ -471,15 +486,30 @@ export class MimiAgent {
       && recovery.status !== 'completed'
       && (recovery.input.trim() === input.trim() || input.includes('恢复最近一次未完成运行：'));
     await this.hooks.emit({ type: 'run_start', sessionId: run.sessionId, input });
-    const [memories, plan, storedGoal, teamSummary, history, guidance, storedArchive] = await Promise.all([
-      canReadMemory ? this.memory.search(this.memoryQuery(input, options?.cause)) : Promise.resolve([]),
+    const memoryContext = this.runMemoryContext(run, options?.cause);
+    const [hotProfile, memoryCards, plan, storedGoal, teamSummary, history, soul, projectGuidance, storedArchive] = await Promise.all([
+      canReadMemory ? this.memory.hotProfile(memoryContext) : Promise.resolve([]),
+      canReadMemory ? this.memory.search(this.memoryQuery(input, options?.cause), memoryContext) : Promise.resolve([]),
       canReadState ? runPlans.get() : Promise.resolve([]),
       canReadState ? runPlans.getGoal() : Promise.resolve(undefined),
       canReadState ? runTeam.summary() : Promise.resolve(''),
       canReadSessionContext ? run.session.getItems() : Promise.resolve([]),
-      canReadLocal ? this.guidance.load() : Promise.resolve({ instructions: '', files: [] }),
+      canReadLocal ? this.soul.load() : Promise.resolve({ instructions: '', files: [] }),
+      canReadLocal && developmentTask ? this.projectGuidance.loadForDevelopment() : Promise.resolve({ instructions: '', files: [] }),
       canReadSessionContext ? run.session.getContextArchive() : Promise.resolve(undefined),
     ]);
+    const memories = [...hotProfile, ...memoryCards]
+      .filter((memory, index, all) => all.findIndex((candidate) => candidate.ref.scope === memory.ref.scope
+        && candidate.ref.id === memory.ref.id) === index)
+      .slice(0, 13);
+    const persistentInstructions = [soul.instructions, projectGuidance.instructions].filter(Boolean).join('\n\n');
+    const memoryTools = createMemoryTools(this.memory, () => ({
+      ...memoryContext,
+      input: run.input,
+      allowEpisodeEvidence: explicitlyRequestsHistoricalEvidence(run.input),
+    }));
+    const delegatedMemoryTools = createMemoryTools(this.memory, () => memoryContext, { workspaceOnly: true });
+    const delegatedTools = [...scopedTools, ...delegatedMemoryTools];
     const activeStoredGoal = storedGoal?.status === 'active' || storedGoal?.status === 'paused'
       ? storedGoal
       : undefined;
@@ -511,8 +541,8 @@ export class MimiAgent {
     const subAgentTools = createSubAgentTools({
       mode,
       model,
-      tools: scopedTools,
-      persistentInstructions: canReadLocal ? guidance.instructions : '',
+      tools: delegatedTools,
+      persistentInstructions: canReadLocal ? persistentInstructions : '',
       onEvent: async (agent, eventType) => this.hooks.emit({
         type: 'subagent_event',
         sessionId: run.sessionId,
@@ -523,9 +553,9 @@ export class MimiAgent {
     const teamTools = createTeamTools({
       store: runTeam,
       model,
-      tools: scopedTools,
+      tools: delegatedTools,
       workspaceRoot: this.config.workspaceRoot,
-      persistentInstructions: canReadLocal ? guidance.instructions : '',
+      persistentInstructions: canReadLocal ? persistentInstructions : '',
       maxConcurrency: this.config.teamMaxConcurrency ?? 4,
       workerToolFactory: (task) => withExecutionLedger(
         createTeamWorkerTools({
@@ -533,7 +563,7 @@ export class MimiAgent {
           dataRoot: this.config.dataRoot,
           permissionMode: this.permissionMode,
           task,
-          searchKnowledgeTool: scopedTools.find((tool) => tool.name === 'search_knowledge'),
+          memorySearchTool: delegatedMemoryTools.find((tool) => tool.name === 'memory_search'),
         }),
         this.ledger,
         () => ({
@@ -555,17 +585,7 @@ export class MimiAgent {
     });
     const runTools = toolsForPermission(this.permissionMode, [
       ...scopedTools,
-      ...this.memory.createTools(() => ({
-        input: run.input,
-        sessionId: run.sessionId,
-        eventId: run.options?.cause?.eventId,
-        eventSource: run.options?.cause?.source,
-        trust: run.options?.cause?.trust,
-        actor: run.options?.cause?.actor,
-        conversation: run.options?.cause?.conversation,
-        personId: run.options?.cause?.personId,
-        personName: run.options?.cause?.personName,
-      })),
+      ...memoryTools,
       ...runPlans.createTools({
         beforeGoalSet: () => runTeam.clear(),
         completionContract: () => run.completionContract,
@@ -672,11 +692,11 @@ export class MimiAgent {
         run: { sessionId: run.sessionId, mode, modeLabel: currentMode.label, modelName },
         outputLevel: this.outputLevel,
       }) : '',
-      persistentInstructions: canReadLocal ? guidance.instructions : '',
+      identity: canReadLocal ? soul.instructions : '',
+      projectGuidance: canReadLocal ? projectGuidance.instructions : '',
       historySummary: '',
       skillCatalog: canReadLocal ? this.skills.catalog() : '',
       memories,
-      documents: [],
       plan: activePlan,
       goal,
       teamSummary: activeTeamSummary,
@@ -893,8 +913,90 @@ export class MimiAgent {
     return { skills: this.skills.list(), warnings: this.skills.diagnostics() };
   }
 
-  async listMemories() {
-    return this.memory.listUsable();
+  async memoryList(scope: 'private' | 'workspace' | 'all' = 'all') {
+    return this.memory.list(this.inspectionMemoryContext(), { scope });
+  }
+
+  async memorySearch(query: string, scope: 'private' | 'workspace' | 'all' = 'all') {
+    return this.memory.search(query, this.inspectionMemoryContext(), { scope });
+  }
+
+  async memoryRead(ref: import('../core/memory.js').MemoryRef) {
+    return this.memory.read(ref, this.inspectionMemoryContext());
+  }
+
+  async memoryForget(ref: import('../core/memory.js').MemoryRef) {
+    return this.memory.forget(ref, this.inspectionMemoryContext());
+  }
+
+  async memoryIngest(target: string, signal?: AbortSignal) {
+    signal?.throwIfAborted();
+    return this.memory.ingest(target, this.inspectionMemoryContext());
+  }
+
+  async memoryCapture(input: CaptureInput, profileId = 'owner') {
+    return this.memory.capture(input, this.inspectionMemoryContext(profileId, 'memory-maintenance'));
+  }
+
+  async memoryCaptureRound(roundRef?: string) {
+    const value = roundRef?.trim();
+    let title: string;
+    let content: string;
+    let sourceRefs: SourceRef[];
+    if (value) {
+      const direct = /^private:(episode_[a-z0-9]+)$/i.exec(value);
+      const round = /^([^@]+)@(.+)$/.exec(value);
+      const id = direct?.[1] ?? (round
+        ? `episode_${createHash('sha256').update(`${round[1]}\0${round[2]}`).digest('hex').slice(0, 24)}`
+        : undefined);
+      if (!id) throw new Error('RoundRef 必须是 sessionId@runId 或 private:episode_<id>');
+      const episode = await this.memory.read(
+        { scope: 'private', profileId: 'owner', id },
+        { ...this.inspectionMemoryContext(), allowEpisodeEvidence: true },
+      );
+      title = episode.metadata.title;
+      content = episode.body;
+      sourceRefs = episode.metadata.sourceRefs;
+    } else {
+      const checkpoint = await this.session.getCheckpoint();
+      if (!checkpoint || checkpoint.status !== 'completed' || !checkpoint.answer) {
+        throw new Error('当前 Session 没有可 capture 的已完成 round');
+      }
+      title = checkpoint.input.replace(/\s+/g, ' ').trim().slice(0, 120) || 'Captured round';
+      content = `用户：${checkpoint.input}\n\n助手：${checkpoint.answer}`;
+      sourceRefs = [{
+        type: 'session', id: `${this.sessionId}@${checkpoint.runId}`,
+        digest: `sha256:${contentDigest(content)}`, occurredAt: checkpoint.updatedAt, trust: 'owner',
+      }];
+    }
+    return this.memory.capture({
+      title, content, sourceRefs, scope: 'private', kind: 'synthesis',
+      confidence: 'user-confirmed', reasonCode: 'owner_manual_capture',
+    }, this.inspectionMemoryContext());
+  }
+
+  async memoryReject(sourceRefs: SourceRef[], reasonCode: string, profileId = 'owner') {
+    return this.memory.reject(sourceRefs, reasonCode, this.inspectionMemoryContext(profileId, 'memory-maintenance'));
+  }
+
+  async memoryConflicts(limit = 50) {
+    return this.memory.conflicts(this.inspectionMemoryContext(), limit);
+  }
+
+  async memoryAudit(limit = 50) {
+    return this.memory.audit(this.inspectionMemoryContext(), limit);
+  }
+
+  async memoryLint(profileId = 'owner') {
+    return this.memory.lint(this.inspectionMemoryContext(profileId, 'memory-lint'));
+  }
+
+  async memoryReindex() {
+    return this.memory.reindex(this.inspectionMemoryContext());
+  }
+
+  async memoryStatus() {
+    return this.memory.status(this.inspectionMemoryContext());
   }
 
   async currentPlan() {
@@ -942,7 +1044,10 @@ export class MimiAgent {
   }
 
   async runtimeInfo() {
-    const [sessionSummary, guidance, team] = await Promise.all([this.session.summary(), this.guidance.load(), this.team.list()]);
+    const [sessionSummary, soul, projectGuidance, team, memoryStatus] = await Promise.all([
+      this.session.summary(), this.soul.load(), this.projectGuidance.load(), this.team.list(),
+      this.memory.status(this.inspectionMemoryContext()),
+    ]);
     return {
       provider: this.config.provider,
       model: this.modelName,
@@ -955,10 +1060,11 @@ export class MimiAgent {
       maxTurns: this.config.maxTurns,
       permissionMode: this.permissionMode,
       skillCount: this.skills.list().length,
-      memoryCount: (await this.memory.listUsable()).length,
+      memoryCount: memoryStatus.pages,
       mcpServers: this.mcpServerNames,
       mcpStatuses: this.mcp.statuses(),
-      guidanceFiles: guidance.files.map((file) => ({ scope: file.scope, path: file.path, truncated: file.truncated })),
+      guidanceFiles: [...soul.files, ...projectGuidance.files]
+        .map((file) => ({ scope: file.scope, path: file.path, truncated: file.truncated })),
       team: {
         total: team.length,
         pending: team.filter((item) => item.status === 'pending').length,
@@ -970,7 +1076,8 @@ export class MimiAgent {
   }
 
   async guidanceInfo() {
-    return this.guidance.load();
+    const [soul, project] = await Promise.all([this.soul.load(), this.projectGuidance.load()]);
+    return { files: [...soul.files, ...project.files], instructions: [soul.instructions, project.instructions].filter(Boolean).join('\n\n') };
   }
 
   availableModels(): string[] {
@@ -1024,7 +1131,7 @@ export class MimiAgent {
   async contextInfo() {
     const [history, memories, plan, goal, team, archive, checkpoint] = await Promise.all([
       this.session.getItems(),
-      this.memory.listUsable(),
+      this.memory.list(this.inspectionMemoryContext()),
       this.plans.get(),
       this.plans.getGoal(),
       this.team.list(),
@@ -1061,7 +1168,7 @@ export class MimiAgent {
   }
 
   get toolNames(): string[] {
-    const scoped = [...this.tools, ...this.memory.createTools(), ...this.plans.createTools()];
+    const scoped = [...this.tools, ...createMemoryTools(this.memory, () => this.inspectionMemoryContext()), ...this.plans.createTools()];
     return toolNamesForMode(this.mode, scoped, this.permissionMode);
   }
 
@@ -1069,7 +1176,7 @@ export class MimiAgent {
     const scoped = [
       ...this.tools,
       ...hostTools,
-      ...this.memory.createTools(),
+      ...createMemoryTools(this.memory, () => this.inspectionMemoryContext()),
       ...this.plans.createTools(),
     ];
     const functionNames = toolNamesForMode(this.mode, scoped, this.permissionMode);
@@ -1084,10 +1191,6 @@ export class MimiAgent {
 
   private get currentMode() {
     return AGENT_MODES.find((item) => item.id === this.mode)!;
-  }
-
-  async indexKnowledge(target?: string, signal?: AbortSignal) {
-    return this.rag.index(target, signal);
   }
 
   get currentSessionId(): string {
@@ -1195,6 +1298,20 @@ export class MimiAgent {
       }
       if (gate?.decision === 'pass' && run.goalCreatedAt) {
         await this.plans.completeGoalFromGate(gate.reason, run.goalCreatedAt);
+      }
+      const cause = run.options?.cause;
+      if (cause?.source !== 'mimi:memory-maintenance' && cause?.source !== 'attention:briefing') {
+        await this.memory.recordEpisode({
+          sessionId: run.sessionId,
+          runId: run.runId,
+          input: run.input,
+          answer: committedAnswer,
+          occurredAt: completed.updatedAt,
+        }, this.runMemoryContext(run, cause)).catch(async (error) => {
+          await this.traces.record(run.sessionId, 'memory_episode_error', {
+            error: error instanceof Error ? error.message.slice(0, 1_000) : String(error).slice(0, 1_000),
+          });
+        });
       }
     } catch (error) {
       if (receiptCommitted && executionKey) {
@@ -1446,6 +1563,35 @@ export class MimiAgent {
     return [input, cause?.source, cause?.actor, cause?.conversation, cause?.personId, cause?.personName]
       .filter((value): value is string => Boolean(value))
       .join(' ');
+  }
+
+  private isDevelopmentTask(input: string): boolean {
+    return /(?:代码|仓库|项目|实现|修复|重构|构建|测试|编译|依赖|模块|函数|接口|组件|部署|code|repository|repo|project|implement|fix|refactor|build|test|compile|dependency|module|function|interface|component|deploy)/iu.test(input);
+  }
+
+  private runMemoryContext(run: ActiveRun, cause?: RunCause): RunMemoryContext {
+    return {
+      profileId: cause?.profileId ?? 'owner',
+      workspaceRoot: this.config.workspaceRoot,
+      sessionId: run.sessionId,
+      runId: run.runId,
+      cause: {
+        eventId: cause?.eventId,
+        taskId: cause?.taskId,
+        trust: cause?.trust ?? 'owner',
+        source: cause?.source ?? 'cli',
+      },
+    };
+  }
+
+  private inspectionMemoryContext(profileId = 'owner', source = 'cli'): RunMemoryContext {
+    return {
+      profileId,
+      workspaceRoot: this.config.workspaceRoot,
+      sessionId: this.sessionId,
+      runId: `inspect-${this.sessionId}`,
+      cause: { trust: source === 'memory-maintenance' ? 'system' : 'owner', source },
+    };
   }
 
   private async clearSessionState(

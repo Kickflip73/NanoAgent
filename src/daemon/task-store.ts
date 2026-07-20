@@ -158,6 +158,25 @@ export class TaskStore {
     `).all(...parameters) as Row[]).map(taskFromRow);
   }
 
+  listRunning(selector: TaskSelector, limit: number): TaskRecord[] {
+    const types = [...new Set(selector.types ?? [])].slice(0, 8);
+    const clauses = ["status = 'running'"];
+    const parameters: Array<string | number> = [];
+    if (types.length) {
+      clauses.push(`type IN (${types.map(() => '?').join(', ')})`);
+      parameters.push(...types);
+    }
+    if (selector.executor) {
+      clauses.push('executor = ?');
+      parameters.push(selector.executor);
+    }
+    parameters.push(limit);
+    return (this.database.prepare(`
+      SELECT * FROM tasks WHERE ${clauses.join(' AND ')}
+      ORDER BY priority DESC, created_at ASC LIMIT ?
+    `).all(...parameters) as Row[]).map(taskFromRow);
+  }
+
   claimCandidate(selector: TaskSelector, timestamp: string): TaskRecord | undefined {
     const types = [...new Set(selector.types ?? [])].slice(0, 8);
     const excludedSessions = [...new Set(selector.excludedSessionKeys ?? [])].slice(0, 16);

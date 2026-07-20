@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { createWriteStream } from 'node:fs';
 import readline from 'node:readline';
 
 export interface CodexTaskRequest {
@@ -8,7 +9,9 @@ export interface CodexTaskRequest {
   workspaceRoot: string;
   workspaceAccess: 'read' | 'write';
   threadId?: string;
+  outputJsonlPath?: string;
   signal?: AbortSignal;
+  onStarted?: (pid: number) => void;
   onProgress?: (event: Record<string, unknown>) => void;
 }
 
@@ -16,6 +19,7 @@ export interface CodexTaskResult {
   threadId?: string;
   answer: string;
   usage?: unknown;
+  exitCode: number;
 }
 
 function prompt(request: CodexTaskRequest): string {
@@ -48,6 +52,11 @@ export class CodexCliTaskExecutor {
         detached: process.platform !== 'win32',
       });
       const lines = readline.createInterface({ input: child.stdout });
+      const output = request.outputJsonlPath
+        ? createWriteStream(request.outputJsonlPath, { flags: 'a', mode: 0o600 })
+        : undefined;
+      let outputError: Error | undefined;
+      output?.once('error', (error) => { outputError = error; });
       let threadId: string | undefined;
       let answer = '';
       let usage: unknown;
@@ -80,6 +89,7 @@ export class CodexCliTaskExecutor {
       });
       lines.on('line', (line) => {
         if (Buffer.byteLength(line, 'utf8') > 1024 * 1024) return;
+        output?.write(`${line}\n`);
         try {
           const event = JSON.parse(line) as Record<string, unknown>;
           request.onProgress?.(event);
@@ -103,6 +113,7 @@ export class CodexCliTaskExecutor {
         settled = true;
         if (killTimer) clearTimeout(killTimer);
         request.signal?.removeEventListener('abort', onAbort);
+        output?.end();
         const wrapped = new Error(
           (error as NodeJS.ErrnoException).code === 'ENOENT'
             ? `Codex CLI 不可用：${this.executable}`
@@ -112,11 +123,15 @@ export class CodexCliTaskExecutor {
         wrapped.code = (error as NodeJS.ErrnoException).code;
         reject(wrapped);
       });
-      child.once('close', (code, signal) => {
-        if (settled) return;
+      child.once('close', async (code, signal) => {
+        if (settled) {
+          if (killTimer) clearTimeout(killTimer);
+          return;
+        }
         settled = true;
         if (killTimer) clearTimeout(killTimer);
         request.signal?.removeEventListener('abort', onAbort);
+        if (output) await new Promise<void>((done) => output.end(done));
         if (request.signal?.aborted) {
           reject(request.signal.reason ?? new Error('Codex 后台任务已取消'));
           return;
@@ -125,8 +140,23 @@ export class CodexCliTaskExecutor {
           reject(new Error(`Codex CLI 执行失败（code=${code ?? 'null'}, signal=${signal ?? 'none'}）：${stderr.trim()}`));
           return;
         }
-        resolve({ threadId, answer: answer.trim(), usage });
+        if (outputError) {
+          reject(new Error(`无法持久化 Codex JSONL 输出：${outputError.message}`, { cause: outputError }));
+          return;
+        }
+        resolve({ threadId, answer: answer.trim(), usage, exitCode: code });
       });
+      if (child.pid) {
+        try {
+          request.onStarted?.(child.pid);
+        } catch (error) {
+          settled = true;
+          terminate();
+          output?.end();
+          request.signal?.removeEventListener('abort', onAbort);
+          reject(error);
+        }
+      }
     });
   }
 }

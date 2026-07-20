@@ -14,7 +14,6 @@ import {
   type AppConfig,
 } from '../config.js';
 import { MimiAgent } from '../agent.js';
-import type { Memory } from '../core/memory.js';
 import { assertSessionId } from '../core/session-id.js';
 import { configureAgentRuntime, requireProviderApiKey } from '../runtime/bootstrap.js';
 import { MimiHost } from '../runtime/mimi-host.js';
@@ -72,8 +71,6 @@ import {
   type MimiActivitySnapshot,
   type MimiChatSnapshot,
   type MimiHistoryChunk,
-  type MimiMemoryContentChunk,
-  type MimiMemoryPage,
   type MimiSchedulePage,
   type ReplyRoute,
   type ScheduleRecord,
@@ -187,8 +184,6 @@ export async function createMimiChatSnapshot(
 
 const CHAT_SNAPSHOT_MAX_BYTES = 512 * 1024;
 const HISTORY_CHUNK_CHARACTERS = 256 * 1024;
-const MEMORY_PAGE_MAX_BYTES = 256 * 1024;
-const MEMORY_CONTENT_MAX_BYTES = 64 * 1024;
 
 function boundedChatItems(items: MimiChatSnapshot['items'], itemLimit: number): MimiChatSnapshot['items'] {
   const limit = Math.max(1, Math.min(200, Math.trunc(itemLimit)));
@@ -240,94 +235,6 @@ function truncateUtf8(value: string, maximumBytes: number): string {
   let end = low;
   if (end > 0 && /[\uD800-\uDBFF]/.test(value[end - 1]!)) end -= 1;
   return value.slice(0, end);
-}
-
-function boundedOptional(value: string | undefined, maximumBytes: number): string | undefined {
-  return value === undefined ? undefined : truncateUtf8(value, maximumBytes);
-}
-
-function memoryRevision(memories: Memory[]): string {
-  return createHash('sha256').update(JSON.stringify(memories)).digest('hex');
-}
-
-function memoryItem(memory: Memory, index: number): MimiMemoryPage['items'][number] {
-  const contentBytes = Buffer.byteLength(memory.content);
-  return {
-    index,
-    id: truncateUtf8(memory.id, 100),
-    type: memory.type,
-    content: truncateUtf8(memory.content, MEMORY_CONTENT_MAX_BYTES),
-    contentBytes,
-    contentTruncated: contentBytes > MEMORY_CONTENT_MAX_BYTES,
-    createdAt: truncateUtf8(memory.createdAt, 100),
-    updatedAt: boundedOptional(memory.updatedAt, 100),
-    importance: memory.importance,
-    source: memory.source,
-    sourceSessionId: boundedOptional(memory.sourceSessionId, 100),
-    sourceEventId: boundedOptional(memory.sourceEventId, 100),
-    sourceEventSource: boundedOptional(memory.sourceEventSource, 200),
-    sourceTrust: memory.sourceTrust,
-    sourceActor: boundedOptional(memory.sourceActor, 500),
-    sourceConversation: boundedOptional(memory.sourceConversation, 500),
-    personId: boundedOptional(memory.personId, 60),
-    personName: boundedOptional(memory.personName, 100),
-    recordedAt: boundedOptional(memory.recordedAt, 100),
-    confirmedAt: boundedOptional(memory.confirmedAt, 100),
-  };
-}
-
-export function createMimiMemoryPage(
-  memories: Memory[],
-  offset = 0,
-  expectedRevision?: string,
-): MimiMemoryPage {
-  if (!Number.isSafeInteger(offset) || offset < 0) throw new Error('memory offset 必须是非负安全整数');
-  const revision = memoryRevision(memories);
-  if (expectedRevision && expectedRevision !== revision) throw new Error('长期记忆在读取期间发生变化，请重试 /memories');
-  if (offset > memories.length) throw new Error('memory offset 超出当前长期记忆');
-  const items: MimiMemoryPage['items'] = [];
-  let encodedBytes = 2;
-  let index = offset;
-  while (index < memories.length) {
-    const item = memoryItem(memories[index]!, index);
-    const itemBytes = Buffer.byteLength(JSON.stringify(item)) + (items.length ? 1 : 0);
-    if (items.length > 0 && encodedBytes + itemBytes > MEMORY_PAGE_MAX_BYTES) break;
-    items.push(item);
-    encodedBytes += itemBytes;
-    index += 1;
-  }
-  return {
-    items,
-    nextOffset: index < memories.length ? index : undefined,
-    revision,
-    total: memories.length,
-  };
-}
-
-export function createMimiMemoryContentChunk(
-  memories: Memory[],
-  index: number,
-  id: string,
-  offset = 0,
-  expectedRevision?: string,
-): MimiMemoryContentChunk {
-  if (!Number.isSafeInteger(index) || index < 0 || index >= memories.length) {
-    throw new Error('memory index 超出当前长期记忆');
-  }
-  if (!Number.isSafeInteger(offset) || offset < 0) throw new Error('memory content offset 必须是非负安全整数');
-  const revision = memoryRevision(memories);
-  if (expectedRevision && expectedRevision !== revision) throw new Error('长期记忆在读取期间发生变化，请重试 /memories');
-  const memory = memories[index]!;
-  if (memory.id !== id) throw new Error('长期记忆分页身份不一致，请重试 /memories');
-  if (offset > memory.content.length) throw new Error('memory content offset 超出当前长期记忆');
-  const chunk = truncateUtf8(memory.content.slice(offset), MEMORY_PAGE_MAX_BYTES);
-  const end = offset + chunk.length;
-  return {
-    chunk,
-    nextOffset: end < memory.content.length ? end : undefined,
-    revision,
-    totalCharacters: memory.content.length,
-  };
 }
 
 const LAUNCH_AGENT_LABEL = 'com.mimiagent.daemon';
@@ -1120,7 +1027,7 @@ export async function runMimiDaemon(config: AppConfig): Promise<void> {
       if (!task) throw new Error('后台任务不存在');
       const summary = taskSummaryWithRuntime(task);
       const recentEvents = liveEvents.recent(task.id, 8);
-      const snapshot = task.sessionKey
+      const snapshot = task.executor !== 'codex' && task.sessionKey
         ? await host!.snapshot(task.sessionKey).catch(() => undefined)
         : undefined;
       return {
@@ -1230,34 +1137,39 @@ export async function runMimiDaemon(config: AppConfig): Promise<void> {
             if (operation === 'context') return agent.contextInfo();
             if (operation === 'compact') return agent.compactContext();
             if (operation === 'instructions') return agent.guidanceInfo();
-            if (operation === 'memories.page') {
-              const request = object(params.value);
-              const offset = request.offset === undefined ? 0 : Number(request.offset);
-              const revision = typeof request.revision === 'string' ? request.revision : undefined;
-              return createMimiMemoryPage(await agent.listMemories(), offset, revision);
+            if (operation === 'memory.list') {
+              const scope = params.value === 'private' || params.value === 'workspace' ? params.value : 'all';
+              return agent.memoryList(scope);
             }
-            if (operation === 'memory.content') {
+            if (operation === 'memory.search') {
               const request = object(params.value);
-              const index = Number(request.index);
-              const offset = request.offset === undefined ? 0 : Number(request.offset);
-              const revision = typeof request.revision === 'string' ? request.revision : undefined;
-              return createMimiMemoryContentChunk(
-                await agent.listMemories(),
-                index,
-                requiredString(request.id, 'id'),
-                offset,
-                revision,
-              );
+              const scope = request.scope === 'private' || request.scope === 'workspace' ? request.scope : 'all';
+              return agent.memorySearch(requiredString(request.query, 'query'), scope);
             }
-            if (operation === 'memories') return agent.listMemories();
+            if (operation === 'memory.read') return agent.memoryRead(object(params.value) as never);
+            if (operation === 'memory.forget') return agent.memoryForget(object(params.value) as never);
+            if (operation === 'memory.ingest') return agent.memoryIngest(requiredString(params.value, 'value'), signal);
+            if (operation === 'memory.capture') {
+              const roundRef = typeof params.value === 'string' && params.value.trim() ? params.value.trim() : undefined;
+              return agent.memoryCaptureRound(roundRef);
+            }
+            if (operation === 'memory.lint') return agent.memoryLint();
+            if (operation === 'memory.conflicts') return agent.memoryConflicts(limit(params.value, 20));
+            if (operation === 'memory.audit') return agent.memoryAudit(limit(params.value, 20));
+            if (operation === 'memory.maintain') {
+              const created = store.emitDueMemoryMaintenanceTasks(new Date(), 'owner');
+              return { created: created.map((task) => task.id), ...store.memoryObservationStatus('owner') };
+            }
+            if (operation === 'memory.reindex') return agent.memoryReindex();
+            if (operation === 'memory.status') return {
+              ...await agent.memoryStatus(),
+              observations: store.memoryObservationStatus('owner'),
+            };
             if (operation === 'plan') return agent.currentPlan();
             if (operation === 'team') return agent.currentTeam();
             if (operation === 'goal') return agent.currentGoal();
             if (operation === 'goal.set') return agent.setGoal(requiredString(params.value, 'value'));
             if (operation === 'resume') return { prompt: await agent.resumePrompt() };
-            if (operation === 'index') {
-              return agent.indexKnowledge(requiredString(params.value, 'value'), signal);
-            }
             if (operation === 'clear') {
               await agent.clearSession();
               return { cleared: true, sessionId };

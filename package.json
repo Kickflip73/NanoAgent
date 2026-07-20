@@ -36,7 +36,7 @@
     "openai-agents-sdk",
     "deepseek",
     "mcp",
-    "rag",
+    "memory-hub",
     "agent-skills",
     "subagents",
     "long-running-agents",

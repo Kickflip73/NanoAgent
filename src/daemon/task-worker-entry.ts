@@ -1,4 +1,6 @@
 import process from 'node:process';
+import { mkdir, rename, writeFile } from 'node:fs/promises';
+import path from 'node:path';
 import { MimiAgent } from '../runtime/mimi-agent.js';
 import { configureAgentRuntime } from '../runtime/bootstrap.js';
 import { MimiHost } from '../runtime/mimi-host.js';
@@ -111,6 +113,11 @@ async function run(raw: unknown): Promise<void> {
       maxConcurrentTasks: 1,
       claimTaskTypes: ['background', 'scheduled', 'briefing', 'memory_maintenance'],
       connectorRuntime: new KernelConnectorRuntime(init.socket, init.taskId, init.workerToken),
+      memoryMaintenance: {
+        capture: (input, profileId) => agent.memoryCapture(input, profileId),
+        reject: (sourceRefs, reasonCode, profileId) => agent.memoryReject(sourceRefs, reasonCode, profileId),
+        lint: (profileId) => agent.memoryLint(profileId),
+      },
       onStreamEvent: (eventId, event) => {
         const streamed = mimiStreamEvent(event);
         if (streamed) void send({ type: 'stream', taskId: eventId, event: streamed });
@@ -170,7 +177,7 @@ async function run(raw: unknown): Promise<void> {
     await host?.close().catch(() => undefined);
     store.close();
     process.removeAllListeners('message');
-    process.disconnect?.();
+    if (process.connected) process.disconnect?.();
   }
 }
 
@@ -183,7 +190,11 @@ async function runCodexTask(
   if (!claimed) {
     throw new Error(`Codex Task ${init.taskId} 无法取得执行租约`);
   }
-  store.beginTaskAttempt(init.taskId, workerId, claimed.sessionKey ?? `mimi-task-${init.taskId}`);
+  const attempt = store.beginTaskAttempt(
+    init.taskId,
+    workerId,
+    claimed.sessionKey ?? `mimi-task-${init.taskId}`,
+  );
   await send({ type: 'started', taskId: init.taskId, workerId, pid: process.pid });
   const lease = setInterval(() => {
     try {
@@ -207,6 +218,23 @@ async function runCodexTask(
     : {};
   const pendingControl = pendingCancel ?? pendingPause;
   if (pendingControl) codexController.abort(new Error(pendingControl.reason));
+  const startedAt = new Date().toISOString();
+  const artifactRoot = path.join(
+    init.config.daemonDataRoot ?? init.config.dataRoot,
+    'codex-tasks',
+    init.taskId,
+  );
+  const outputJsonlPath = path.join(artifactRoot, 'events.jsonl');
+  const summaryPath = path.join(artifactRoot, 'summary.json');
+  await mkdir(artifactRoot, { recursive: true, mode: 0o700 });
+  store.checkpointCodexTask(init.taskId, workerId, {
+    runnerPid: process.pid,
+    outputJsonlPath,
+    summaryPath,
+    startedAt,
+    lastEvent: 'codex.starting',
+  });
+  let codexPid: number | undefined;
   try {
     const result = await new CodexCliTaskExecutor().execute({
       objective: typeof payload.objective === 'string' ? payload.objective : String(payload.prompt ?? ''),
@@ -215,11 +243,25 @@ async function runCodexTask(
       workspaceRoot: init.config.workspaceRoot,
       workspaceAccess: init.workspaceAccess,
       threadId: typeof codexState.threadId === 'string' ? codexState.threadId : undefined,
+      outputJsonlPath,
       signal: codexController.signal,
+      onStarted: (pid) => {
+        codexPid = pid;
+        store.checkpointCodexTask(init.taskId, workerId, {
+          runnerPid: process.pid, codexPid: pid, lastEvent: 'codex.running',
+        });
+        void send({
+          type: 'detached', taskId: init.taskId, runnerPid: process.pid, codexPid: pid,
+        });
+      },
       onProgress: (event) => {
         const type = typeof event.type === 'string' ? event.type : 'progress';
         if (type === 'thread.started' && typeof event.thread_id === 'string') {
-          store.checkpointCodexTask(init.taskId, workerId, event.thread_id);
+          store.checkpointCodexTask(init.taskId, workerId, {
+            threadId: event.thread_id, lastEvent: type,
+          });
+        } else if (type === 'turn.completed' || type === 'turn.failed') {
+          store.checkpointCodexTask(init.taskId, workerId, { lastEvent: type });
         }
         void send({
           type: 'stream', taskId: init.taskId,
@@ -228,22 +270,59 @@ async function runCodexTask(
             tone: type === 'turn.failed' ? 'failure' : 'agent',
             title: `Codex · ${type}`,
             detail: JSON.stringify(event).slice(0, 1_000),
-            next: 'Codex 后台执行中，完成后交回 MimiAgent 验收',
+            next: 'Codex 独立执行中；MimiAgent 仅追踪进程与产物',
           },
         });
       },
     });
-    store.handoffCodexTaskToMimi(init.taskId, workerId, result);
+    const summary = {
+      taskId: init.taskId,
+      executor: 'codex',
+      exitCode: result.exitCode,
+      threadId: result.threadId,
+      answer: result.answer,
+      usage: result.usage,
+      process: { runnerPid: process.pid, codexPid, startedAt, completedAt: new Date().toISOString() },
+      artifacts: { outputJsonl: outputJsonlPath, summary: summaryPath },
+    };
+    await writeCodexSummary(summaryPath, summary);
+    store.completeCodexTask(init.taskId, workerId, {
+      ...result,
+      runnerPid: process.pid,
+      codexPid,
+      outputJsonlPath,
+      summaryPath,
+      startedAt,
+    }, attempt.id);
   } catch (error) {
+    await writeCodexSummary(summaryPath, {
+      taskId: init.taskId,
+      executor: 'codex',
+      status: 'failed',
+      error: error instanceof Error ? error.message : String(error),
+      process: { runnerPid: process.pid, codexPid, startedAt, completedAt: new Date().toISOString() },
+      artifacts: { outputJsonl: outputJsonlPath, summary: summaryPath },
+    }).catch(() => undefined);
     const current = store.getTask(init.taskId);
     if (current?.controlIntent) {
-      store.settleTaskControl(init.taskId, workerId);
+      store.settleTaskControl(init.taskId, workerId, attempt.id);
     } else if (shutdownRequested) {
-      store.failTask(init.taskId, workerId, new Error('Codex worker 正在停止，任务已安全重排队'));
+      store.failTask(
+        init.taskId,
+        workerId,
+        new Error('Codex runner 被停止'),
+        attempt.id,
+        new Date(),
+        false,
+        'failed',
+      );
     } else {
-      store.handoffCodexTaskToMimi(init.taskId, workerId, {
-        error: error instanceof Error ? error.message : String(error),
-      });
+      try {
+        store.checkpointCodexTask(init.taskId, workerId, { lastEvent: 'codex.failed' });
+      } catch {
+        // The terminal write below remains authoritative if this diagnostic races the lease.
+      }
+      store.failTask(init.taskId, workerId, error, attempt.id, new Date(), false, 'failed');
     }
   } finally {
     clearInterval(lease);
@@ -253,6 +332,12 @@ async function runCodexTask(
     type: 'done', taskId: init.taskId, processed: true,
     status: store.getTask(init.taskId)?.status,
   });
+}
+
+async function writeCodexSummary(summaryPath: string, value: unknown): Promise<void> {
+  const temporarySummaryPath = `${summaryPath}.${process.pid}.tmp`;
+  await writeFile(temporarySummaryPath, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+  await rename(temporarySummaryPath, summaryPath);
 }
 
 process.on('message', (raw: unknown) => {
@@ -280,6 +365,7 @@ process.on('message', (raw: unknown) => {
 });
 
 process.on('disconnect', () => {
+  if (initialized && codexController) return;
   shutdownRequested = true;
   codexController?.abort(new Error('Codex Task worker 与 Kernel 的 IPC 连接已断开'));
   dispatcher?.forceStop('Task worker 与 Kernel 的 IPC 连接已断开');

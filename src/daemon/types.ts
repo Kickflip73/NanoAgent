@@ -1,6 +1,6 @@
 import type { AgentInputItem } from '@openai/agents';
 import type { AgentPermissionMode } from '../config.js';
-import type { Memory } from '../core/memory.js';
+import type { MemoryHit, SourceRef } from '../core/memory.js';
 import type { PlanStep } from '../core/plan.js';
 import type { RunCheckpoint } from '../core/session.js';
 
@@ -156,6 +156,38 @@ export interface TaskAttemptRecord {
   error?: string;
 }
 
+export interface MemoryObservation {
+  sourceKey: string;
+  eventId: string;
+  taskId: string;
+  runId: string;
+  sessionId: string;
+  profileId: string;
+  outcome: 'completed' | 'dead_letter';
+  trust: EventTrust;
+  contentDigest: string;
+  observedAt: string;
+  compiledAt?: string;
+  receiptId?: string;
+}
+
+export interface MemoryObservationCard extends MemoryObservation {
+  sourceRef: SourceRef;
+  objective: unknown;
+  result?: unknown;
+  error?: string;
+}
+
+export interface MemoryObservationStatus {
+  pending: number;
+  oldestPendingAt?: string;
+  queuedMaintenance: number;
+  runsLast24Hours: number;
+  changesSinceSemanticLint: number;
+  semanticLintDue: boolean;
+  lastSemanticLintAt?: string;
+}
+
 export type OutboxStatus = 'pending' | 'sending' | 'sent' | 'dead_letter' | 'archived';
 
 export interface OutboxMessage {
@@ -271,10 +303,8 @@ export interface MimiSchedulePage {
   total: number;
 }
 
-// Protocol 7 separates immutable Events from executable Tasks. This changes
-// both the status payload and several RPC method/result shapes, so a v6 daemon
-// must be replaced instead of being reused by a v7 CLI.
-export const DAEMON_PROTOCOL_VERSION = 7;
+// Protocol 9 completes the MemoryHub control surface and maintenance status.
+export const DAEMON_PROTOCOL_VERSION = 9;
 
 export interface DaemonTaskWorkerStatus {
   taskId: string;
@@ -409,25 +439,7 @@ export interface MimiHistoryChunk {
   totalCharacters: number;
 }
 
-export interface MimiMemoryItem extends Memory {
-  index: number;
-  contentBytes: number;
-  contentTruncated: boolean;
-}
-
-export interface MimiMemoryPage {
-  items: MimiMemoryItem[];
-  nextOffset?: number;
-  revision: string;
-  total: number;
-}
-
-export interface MimiMemoryContentChunk {
-  chunk: string;
-  nextOffset?: number;
-  revision: string;
-  totalCharacters: number;
-}
+export type MimiMemoryItem = MemoryHit;
 
 export type MimiStreamEvent = {
   sequence: number;

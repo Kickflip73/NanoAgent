@@ -101,7 +101,7 @@ test('explicit run policies can expose only selected side-effect tool names', ()
 });
 
 test('explicit run policies can bound both read-only and side-effect tools by name', () => {
-  const tools = ['read_file', 'list_memories', 'run_shell', 'upsert_mimi_source_policy'].map(fakeTool);
+  const tools = ['read_file', 'memory_search', 'run_shell', 'upsert_mimi_source_policy'].map(fakeTool);
   assert.deepEqual(toolsForRunPolicy(tools, {
     allowedCapabilities: ['read', 'memory-read', 'execute', 'state-write'],
     allowedTools: ['read_file', 'run_shell'],
@@ -112,41 +112,41 @@ test('explicit run policies can bound both read-only and side-effect tools by na
 
 test('preserves SubAgent and Team role tool order', () => {
   assert.deepEqual(subAgentToolNames('researcher'), [
-    'current_time', 'read_file', 'list_directory', 'search_files', 'inspect_changes', 'http_get', 'web_search', 'search_knowledge',
+    'current_time', 'read_file', 'list_directory', 'search_files', 'inspect_changes', 'http_get', 'web_search', 'memory_search', 'memory_read', 'memory_links',
   ]);
   assert.deepEqual(subAgentToolNames('architect'), [
-    'read_file', 'list_directory', 'search_files', 'inspect_changes', 'web_search', 'search_knowledge',
+    'read_file', 'list_directory', 'search_files', 'inspect_changes', 'web_search', 'memory_search', 'memory_read', 'memory_links',
   ]);
   assert.deepEqual(subAgentToolNames('reviewer'), [
-    'read_file', 'list_directory', 'search_files', 'inspect_changes', 'search_knowledge',
+    'read_file', 'list_directory', 'search_files', 'inspect_changes', 'memory_search', 'memory_read', 'memory_links',
   ]);
 
   assert.deepEqual(teamRoleToolNames('explorer'), [
-    'current_time', 'read_file', 'list_directory', 'search_files', 'inspect_changes', 'http_get', 'web_search', 'search_knowledge',
+    'current_time', 'read_file', 'list_directory', 'search_files', 'inspect_changes', 'http_get', 'web_search', 'memory_search', 'memory_read', 'memory_links',
   ]);
   assert.deepEqual(teamRoleToolNames('architect'), [
-    'read_file', 'list_directory', 'search_files', 'inspect_changes', 'web_search', 'search_knowledge',
+    'read_file', 'list_directory', 'search_files', 'inspect_changes', 'web_search', 'memory_search', 'memory_read', 'memory_links',
   ]);
   assert.deepEqual(teamRoleToolNames('builder'), [
     'current_time', 'calculate', 'read_file', 'write_file', 'edit_file', 'apply_patch', 'move_file',
-    'list_directory', 'search_files', 'inspect_changes', 'search_knowledge',
+    'list_directory', 'search_files', 'inspect_changes', 'memory_search', 'memory_read', 'memory_links',
   ]);
   assert.deepEqual(teamRoleToolNames('tester'), [
-    'current_time', 'calculate', 'read_file', 'list_directory', 'search_files', 'inspect_changes', 'search_knowledge',
+    'current_time', 'calculate', 'read_file', 'list_directory', 'search_files', 'inspect_changes', 'memory_search', 'memory_read', 'memory_links',
   ]);
   assert.deepEqual(teamRoleToolNames('reviewer'), [
-    'read_file', 'list_directory', 'search_files', 'inspect_changes', 'search_knowledge',
+    'read_file', 'list_directory', 'search_files', 'inspect_changes', 'memory_search', 'memory_read', 'memory_links',
   ]);
   assert.deepEqual(teamRoleToolNames('builder', true), [
     'current_time', 'calculate', 'read_file', 'write_file', 'edit_file', 'apply_patch', 'move_file',
-    'list_directory', 'search_files', 'inspect_changes', 'search_knowledge', 'run_shell',
+    'list_directory', 'search_files', 'inspect_changes', 'memory_search', 'memory_read', 'memory_links', 'run_shell',
   ]);
 });
 
 test('classifies the existing durable side-effect tools from one policy source', () => {
   const sideEffects = [
     'write_file', 'edit_file', 'apply_patch', 'move_file', 'run_shell', 'http_request', 'connector_action',
-    'set_mimi_connector_enabled', 'reload_mimi_connectors', 'index_knowledge',
+    'set_mimi_connector_enabled', 'reload_mimi_connectors', 'memory_ingest',
     'remember', 'forget', 'update_plan', 'set_goal', 'update_goal',
     'snooze_mimi', 'clear_mimi_snooze',
     'cancel_interrupted_mimi_task',
@@ -156,7 +156,7 @@ test('classifies the existing durable side-effect tools from one policy source',
   ];
   for (const name of sideEffects) assert.equal(isSideEffectTool(name), true, name);
   for (const name of [
-    'read_file', 'http_get', 'recall', 'show_plan', 'delegate_review',
+    'read_file', 'http_get', 'memory_search', 'show_plan', 'delegate_review',
     'prepare_task', 'finish_task', 'finish_mimi_silently', 'get_mimi_snooze', 'unknown_extension',
   ]) {
     assert.equal(isSideEffectTool(name), false, name);

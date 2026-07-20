@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp } from 'node:fs/promises';
+import { mkdtemp, readdir } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -193,6 +193,25 @@ test('ingress deduplicates connector redelivery and applies Attention before cre
   }
 });
 
+test('Task session ownership binds explicit session keys to non-owner profiles', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-profile-session-'));
+  const store = new MimiStore(path.join(root, 'mimi.db'));
+  try {
+    const route = (profileId: string) => store.ingestEvent({
+      id: `event-${profileId}`, externalId: `event-${profileId}`, source: 'connector:test', kind: 'command',
+      trust: 'trusted', payload: { prompt: 'same upstream conversation' }, profileId, sessionKey: 'shared-key',
+      occurredAt: '2026-07-20T00:00:00.000Z', receivedAt: '2026-07-20T00:00:00.000Z', priority: 50,
+    }).task!;
+    const first = route('profile-a');
+    const second = route('profile-b');
+    assert.notEqual(first.sessionKey, second.sessionKey);
+    assert.notEqual(first.sessionKey, 'shared-key');
+    assert.notEqual(second.sessionKey, 'shared-key');
+  } finally {
+    store.close();
+  }
+});
+
 test('v11 cutover atomically preserves Task, Run and Outbox ownership without parallel tables', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-event-task-v11-'));
   const file = path.join(root, 'mimi.db');
@@ -206,12 +225,14 @@ test('v11 cutover atomically preserves Task, Run and Outbox ownership without pa
     assert.equal(store.getOutbox('legacy-outbox')?.taskId, 'legacy-task');
     assert.equal(store.getEventRouteReceipt('legacy-task')?.decision, 'task_created');
     assert.equal(store.getEventRouteReceipt('migration-task-legacy-task')?.decision, 'observe_only');
+    const backups = await readdir(path.join(root, 'backups'), { recursive: true });
+    assert.equal(backups.some((entry) => entry.endsWith('mimi.db')), true);
   } finally {
     store.close();
   }
   const database = new DatabaseSync(file, { readOnly: true });
   try {
-    assert.equal((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 12);
+    assert.equal((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 13);
     assert.equal(database.prepare("SELECT name FROM sqlite_master WHERE name = 'events_v2'").get(), undefined);
     assert.equal(database.prepare("SELECT name FROM sqlite_master WHERE name = 'task_attempts'").get(), undefined);
     assert.equal((database.prepare('PRAGMA foreign_key_check').all() as unknown[]).length, 0);

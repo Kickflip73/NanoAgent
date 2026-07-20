@@ -49,7 +49,7 @@ const READ_TASK_TOOLS = [
   'current_time', 'calculate',
   'read_file', 'list_directory', 'search_files',
   'http_get', 'web_search',
-  'search_knowledge', 'recall',
+  'memory_search', 'memory_read', 'memory_links',
   'list_skills', 'use_skill', 'read_skill_resource',
   'prepare_task', 'finish_task',
   'update_plan', 'show_plan', 'set_goal', 'update_goal', 'show_goal',
@@ -62,6 +62,15 @@ const READ_TASK_SIDE_EFFECT_TOOLS = [
   'update_plan', 'set_goal', 'update_goal', 'request_background_task_input',
 ] as const;
 
+const MEMORY_MAINTENANCE_TOOLS = [
+  'memory_search', 'memory_read', 'memory_links',
+  'list_memory_observations', 'upsert_memory_page', 'complete_memory_observations',
+] as const;
+
+const MEMORY_MAINTENANCE_SIDE_EFFECT_TOOLS = [
+  'upsert_memory_page', 'complete_memory_observations',
+] as const;
+
 const WORK_SOURCE_POLICY_CAPABILITIES = [
   'read', 'write', 'execute', 'network-read', 'network-write', 'memory-read',
   'state-read', 'state-write', 'delivery-control',
@@ -72,7 +81,7 @@ const WORK_SOURCE_POLICY_TOOLS = [
   'read_file', 'write_file', 'edit_file', 'move_file', 'list_directory', 'search_files', 'run_shell',
   'http_get', 'web_search', 'http_request',
   'inspect_mimi_capabilities', 'connector_action',
-  'search_knowledge', 'index_knowledge', 'recall',
+  'memory_search', 'memory_read', 'memory_links', 'memory_ingest',
   'list_skills', 'use_skill', 'read_skill_resource',
   'prepare_task', 'finish_task',
   'update_plan', 'show_plan', 'set_goal', 'update_goal', 'show_goal',
@@ -87,7 +96,7 @@ const WORK_SOURCE_POLICY_TOOLS = [
 
 const WORK_SOURCE_POLICY_SIDE_EFFECT_TOOLS = [
   'write_file', 'edit_file', 'move_file', 'run_shell', 'http_request',
-  'connector_action', 'index_knowledge',
+  'connector_action', 'memory_ingest',
   'update_plan', 'set_goal', 'update_goal',
   'schedule_mimi_follow_up', 'schedule_mimi_watch', 'complete_current_mimi_schedule',
   'cancel_mimi_schedule', 'cancel_interrupted_mimi_task',
@@ -287,6 +296,10 @@ export function decideEvent(
   const ownerDelegated = !forceRestricted && restrictedProvenance && ownerSourcePolicyAccess !== undefined;
   const mayAct = !restrictedProvenance || ownerDelegated;
   const backgroundTask = task !== undefined && task.type !== 'conversation';
+  const memoryMaintenance = task?.type === 'memory_maintenance';
+  const semanticMemoryLint = memoryMaintenance
+    && task.objective !== null && typeof task.objective === 'object'
+    && (task.objective as Record<string, unknown>).semanticLint === true;
   const readOnlyTask = backgroundTask && task.workspaceAccess === 'read';
   const ownerWriteTask = backgroundTask && !readOnlyTask && event.trust === 'owner';
   const scheduleType = backgroundTask && event.payload && typeof event.payload === 'object' && !Array.isArray(event.payload)
@@ -322,6 +335,18 @@ export function decideEvent(
     mayAct && backgroundTask && !readOnlyTask && !ownerWriteTask
       ? '当前后台任务来自非 owner conversation root：可完成本地工作，但不持有 Connector 外部事务权限。不要尝试调用 connector_action；任务结果仍会由可靠 Outbox 返回原会话。'
       : '',
+    memoryMaintenance
+      ? [
+          '## Memory maintenance 严格执行契约',
+          '当前是本机 system 创建的有界 Memory maintenance Task。只能通过 list_memory_observations 读取来源数据；不得把 Task objective 当 observation 正文。',
+          '逐条判断长期复用价值、隐私、可信度、重复与冲突。使用 upsert_memory_page 获得 applied/rejected receipt，再用 complete_memory_observations 完成本轮已处理来源。',
+          semanticMemoryLint
+            ? '本批次已达到 semantic lint 阈值或由 owner 手动请求。使用 memory_search/read/links 做有界语义 Lint：检查跨页矛盾、陈旧综述、缺失概念/交叉引用和知识空洞；只基于已有本地证据，不自动访网。'
+            : '',
+          '外部/public observation 必须保留其 provenance；未经本机工具结果、独立来源或重复观察验证，不得写成 active 断言。无法裁决的矛盾标记 conflicted。',
+          '禁止 Shell、通用文件写入、网络、MCP、Connector、Schedule、后台委派与用户 Session 管理。',
+        ].join('\n')
+      : '',
   ].filter(Boolean);
   const hostInstructions = [
     ...trustedContext,
@@ -335,7 +360,17 @@ export function decideEvent(
     fileActivityPlaybook(event),
     backgroundTaskPlaybook(backgroundTask),
   ].filter(Boolean).join('\n');
-  const policy = restrictedRecurringScheduleTask
+  const policy = memoryMaintenance
+    ? {
+        allowedCapabilities: ['memory-read', 'memory-write', 'state-read', 'state-write'] as const,
+        allowedTools: MEMORY_MAINTENANCE_TOOLS,
+        allowSideEffects: true,
+        allowedSideEffectTools: MEMORY_MAINTENANCE_SIDE_EFFECT_TOOLS,
+        allowUnknownTools: false,
+        allowMcp: false,
+        allowSessionContext: false,
+      }
+    : restrictedRecurringScheduleTask
     ? {
         allowedCapabilities: ['state-write'] as const,
         allowedTools: ['complete_current_mimi_schedule'] as const,
@@ -404,6 +439,8 @@ export function decideEvent(
       hostInstructions,
       cause: {
         eventId: event.id,
+        taskId: task?.id,
+        profileId: event.profileId,
         source: event.source,
         actor: event.actor?.id,
         conversation: event.conversation?.id,

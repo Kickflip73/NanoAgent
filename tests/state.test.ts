@@ -1,18 +1,12 @@
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
 import { access, chmod, mkdtemp, readdir, stat, utimes, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
-import { promisify } from 'node:util';
 import test from 'node:test';
 import type { AgentInputItem } from '@openai/agents';
-import { MemoryStore } from '../src/core/memory.js';
 import { PlanStore } from '../src/core/plan.js';
 import { FileSession, registerSessionRunOwner } from '../src/core/session.js';
 import { AtomicJsonStore } from '../src/core/state-file.js';
-
-const execFileAsync = promisify(execFile);
 
 test('skips the atomic rename when a conditional state mutation is unchanged', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'nano-state-noop-'));
@@ -38,37 +32,6 @@ test('hardens permissions on an existing sensitive state file', async () => {
   assert.deepEqual(await store.read(), { value: 1 });
   assert.equal((await stat(file)).mode & 0o777, 0o600);
   assert.equal((await stat(root)).mode & 0o777, 0o700);
-});
-
-test('preserves concurrent memory writes across store instances', async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'nano-memory-instances-'));
-  const file = path.join(root, 'memories.json');
-  const first = new MemoryStore(file);
-  const second = new MemoryStore(file);
-
-  await Promise.all([
-    first.remember('first', 'fact'),
-    second.remember('second', 'fact'),
-  ]);
-
-  assert.deepEqual((await first.list()).map((item) => item.content).sort(), ['first', 'second']);
-});
-
-test('preserves concurrent memory writes across processes', async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'nano-memory-processes-'));
-  const file = path.join(root, 'memories.json');
-  const moduleUrl = pathToFileURL(path.resolve('src/core/memory.ts')).href;
-  const writeMemory = (content: string) => execFileAsync(process.execPath, [
-    '--import', 'tsx', '--input-type=module', '--eval',
-    `import { MemoryStore } from ${JSON.stringify(moduleUrl)}; await new MemoryStore(${JSON.stringify(file)}).remember(${JSON.stringify(content)}, 'fact');`,
-  ]);
-
-  await Promise.all([writeMemory('process-one'), writeMemory('process-two')]);
-
-  assert.deepEqual(
-    (await new MemoryStore(file).list()).map((item) => item.content).sort(),
-    ['process-one', 'process-two'],
-  );
 });
 
 test('does not let a stale session instance overwrite newer state', async () => {
@@ -110,15 +73,6 @@ test('isolates a corrupt session instead of breaking the whole session list', as
 
   assert.deepEqual(summaries.map((item) => item.id), ['valid']);
   assert.ok((await readdir(root)).some((name) => name.startsWith('broken.json.corrupt-')));
-});
-
-test('quarantines corrupt shared state and continues from an empty store', async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'nano-memory-corrupt-'));
-  const file = path.join(root, 'memories.json');
-  await writeFile(file, '{broken', 'utf8');
-
-  assert.deepEqual(await new MemoryStore(file).list(), []);
-  assert.ok((await readdir(root)).some((name) => name.startsWith('memories.json.corrupt-')));
 });
 
 test('uses runId CAS so late callbacks cannot overwrite a newer run', async () => {

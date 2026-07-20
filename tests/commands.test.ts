@@ -3,6 +3,7 @@ import test from 'node:test';
 import type { MimiAgent } from '../src/agent.js';
 import { CommandHandler } from '../src/commands.js';
 import { AGENT_MODES } from '../src/runtime/instructions.js';
+import type { MemoryRef } from '../src/core/memory.js';
 
 function fakeAgent(): MimiAgent {
   return {
@@ -19,7 +20,7 @@ function fakeAgent(): MimiAgent {
       skillCount: 2,
       memoryCount: 1,
       mcpServers: [],
-      guidanceFiles: [{ scope: 'project', path: '/tmp/demo/MIMI.md', truncated: false }],
+      guidanceFiles: [{ scope: 'project', path: '/tmp/demo/AGENTS.md', truncated: false }],
       team: { total: 0, pending: 0, running: 0, completed: 0, failed: 0 },
     }),
     listSessions: async () => ['demo'],
@@ -36,13 +37,30 @@ function fakeAgent(): MimiAgent {
     clearSession: async () => undefined,
     listSkills: () => [{ name: 'review', description: 'Review code' }],
     reloadSkills: async () => ({ skills: [{ name: 'review', description: 'Review code' }], warnings: [] }),
-    listMemories: async () => [{ id: 'm1', type: 'fact', content: 'uses TS', createdAt: '' }],
+    memoryList: async () => [{
+      ref: { scope: 'private', id: 'm1', profileId: 'owner' }, title: 'Stack', summary: 'uses TS',
+      kind: 'fact', status: 'active', confidence: 'user-confirmed', score: 1, sourceRefs: [], documentType: 'wiki',
+    }],
+    memorySearch: async () => [],
+    memoryRead: async () => ({
+      ref: { scope: 'private', id: 'm1', profileId: 'owner' },
+      metadata: { schemaVersion: 1, id: 'm1', title: 'Stack', kind: 'fact', scope: 'private', profileId: 'owner', status: 'active', confidence: 'user-confirmed', aliases: [], tags: [], sourceRefs: [], validFrom: null, validUntil: null, supersedes: [], createdAt: '', updatedAt: '' },
+      body: 'uses TS', digest: 'sha256:test',
+    }),
+    memoryForget: async (ref: MemoryRef) => ({ ref, forgotten: true, timestamp: '' }),
+    memoryIngest: async () => ({ id: 'r1', operation: 'ingest', status: 'applied', digest: 'd', pageRefs: [] }),
+    memoryCaptureRound: async () => ({ id: 'capture-1', operation: 'capture', status: 'applied', digest: 'd', pageRefs: [] }),
+    memoryLint: async () => ({ valid: true, checked: 1, issues: [] }),
+    memoryConflicts: async () => [],
+    memoryAudit: async () => [{ id: 1, operation: 'capture', reasonCode: 'test', createdAt: '' }],
+    memoryMaintain: async () => ({ created: [] }),
+    memoryReindex: async () => ({ pages: 1, privatePages: 1, workspacePages: 0, conflicted: 0, stale: 0, fts5: true, degraded: false }),
+    memoryStatus: async () => ({ pages: 1, privatePages: 1, workspacePages: 0, conflicted: 0, stale: 0, fts5: true, degraded: false }),
     currentPlan: async () => [{ id: '1', description: 'test', status: 'running' }],
     currentTeam: async () => [],
     currentGoal: async () => ({ objective: 'ship MimiAgent', status: 'active', createdAt: '', updatedAt: '' }),
     setGoal: async (objective: string) => ({ objective, status: 'active', createdAt: '', updatedAt: '' }),
     resumePrompt: async () => 'resume goal',
-    indexKnowledge: async () => ({ files: 1, chunks: 1, embeddings: false }),
     availableModels: () => ['deepseek-chat', 'deepseek-reasoner'],
     switchModel: () => undefined,
     contextInfo: async () => ({ historyItems: 4, historyLimit: 40, estimatedTokens: 1200, contextWindow: 128000, memories: 1, planSteps: 1, goal: 'active' }),
@@ -61,7 +79,7 @@ function fakeAgent(): MimiAgent {
     mcpStatuses: () => [],
     reloadMcp: async () => [],
     guidanceInfo: async () => ({
-      files: [{ scope: 'project', path: '/tmp/demo/MIMI.md', content: 'Run tests.', truncated: false }],
+      files: [{ scope: 'project', path: '/tmp/demo/AGENTS.md', content: 'Run tests.', truncated: false }],
       instructions: 'Run tests.',
     }),
   } as unknown as MimiAgent;
@@ -76,7 +94,10 @@ test('handles status and high-frequency inspection commands', async () => {
   try {
     assert.equal(await handler.execute('/status'), 'handled');
     assert.equal(await handler.execute('/skills'), 'handled');
-    assert.equal(await handler.execute('/memories'), 'handled');
+    assert.equal(await handler.execute('/memory list'), 'handled');
+    assert.equal(await handler.execute('/memory capture'), 'handled');
+    assert.equal(await handler.execute('/memory audit'), 'handled');
+    assert.equal(await handler.execute('/memory maintain'), 'handled');
     assert.equal(await handler.execute('/plan'), 'handled');
     assert.equal(await handler.execute('/team'), 'handled');
     assert.equal(await handler.execute('/instructions'), 'handled');
@@ -85,7 +106,7 @@ test('handles status and high-frequency inspection commands', async () => {
     assert.match(output.join('\n'), /Review code/);
     assert.match(output.join('\n'), /uses TS/);
     assert.match(output.join('\n'), /running/);
-    assert.match(output.join('\n'), /MIMI\.md/);
+    assert.match(output.join('\n'), /AGENTS\.md/);
   } finally {
     console.log = original;
   }
@@ -110,19 +131,19 @@ test('status reports the effective Plan restriction instead of claiming Shell is
   }
 });
 
-test('passes command cancellation to knowledge indexing', async () => {
+test('passes command cancellation to memory ingest', async () => {
   const agent = fakeAgent();
   let received: AbortSignal | undefined;
-  agent.indexKnowledge = async (_target?: string, signal?: AbortSignal) => {
+  agent.memoryIngest = async (_target: string, signal?: AbortSignal) => {
     received = signal;
     signal?.throwIfAborted();
-    return { files: 0, chunks: 0, embeddings: false };
+    return { id: 'r', operation: 'ingest', status: 'applied', digest: 'd', pageRefs: [] };
   };
   const controller = new AbortController();
   controller.abort(new Error('stop index'));
   const handler = new CommandHandler(agent, async () => undefined, { write: () => undefined });
 
-  await assert.rejects(handler.execute('/index knowledge', controller.signal), /stop index/);
+  await assert.rejects(handler.execute('/memory ingest knowledge/source.md', controller.signal), /stop index/);
   assert.equal(received, controller.signal);
 });
 

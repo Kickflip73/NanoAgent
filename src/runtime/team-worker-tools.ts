@@ -8,7 +8,7 @@ export interface TeamWorkerToolOptions {
   dataRoot: string;
   permissionMode: AgentPermissionMode;
   task: TeamTask;
-  searchKnowledgeTool?: Tool;
+  memorySearchTool?: Tool;
 }
 
 export function createTeamWorkerTools(options: TeamWorkerToolOptions): Tool[] {
@@ -25,6 +25,6 @@ export function createTeamWorkerTools(options: TeamWorkerToolOptions): Tool[] {
         allowShell: false,
       },
     ),
-    ...(options.searchKnowledgeTool ? [options.searchKnowledgeTool] : []),
+    ...(options.memorySearchTool ? [options.memorySearchTool] : []),
   ];
 }

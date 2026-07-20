@@ -1,6 +1,6 @@
 import os from 'node:os';
 import path from 'node:path';
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmdirSync, statSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmdirSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import {
@@ -18,23 +18,38 @@ import {
 export type DaemonStatusWire = Omit<DaemonStatus, 'protocolVersion'> & { protocolVersion?: unknown };
 export type DaemonProtocolState = 'legacy' | 'current' | 'newer';
 
-export const MIMI_BUILD_VERSION = (() => {
+export function computeMimiBuildVersion(modulePath: string): string {
   try {
-    const manifest = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8')) as {
+    const runtimeRoot = path.dirname(path.dirname(modulePath));
+    const manifest = JSON.parse(readFileSync(path.join(runtimeRoot, '..', 'package.json'), 'utf8')) as {
       version?: unknown;
     };
     const version = typeof manifest.version === 'string' ? manifest.version : 'unknown';
-    const modulePath = fileURLToPath(import.meta.url);
-    const digest = createHash('sha256')
-      .update(readFileSync(modulePath))
-      .update(String(statSync(modulePath).mtimeMs))
-      .digest('hex')
-      .slice(0, 12);
+    const extension = path.extname(modulePath);
+    const files: string[] = [];
+    const directories = [runtimeRoot];
+    while (directories.length) {
+      const directory = directories.pop();
+      if (!directory) continue;
+      for (const entry of readdirSync(directory, { withFileTypes: true })) {
+        const absolute = path.join(directory, entry.name);
+        if (entry.isDirectory()) directories.push(absolute);
+        else if (entry.isFile() && path.extname(entry.name) === extension) files.push(absolute);
+      }
+    }
+    files.sort((left, right) => left.localeCompare(right));
+    const hash = createHash('sha256').update(version).update('\0');
+    for (const file of files) {
+      hash.update(path.relative(runtimeRoot, file)).update('\0').update(readFileSync(file)).update('\0');
+    }
+    const digest = hash.digest('hex').slice(0, 12);
     return `${version}+${digest}`;
   } catch {
     return 'unknown';
   }
-})();
+}
+
+export const MIMI_BUILD_VERSION = computeMimiBuildVersion(fileURLToPath(import.meta.url));
 
 export interface MimiPaths {
   root: string;
@@ -186,6 +201,12 @@ export function daemonProtocolAction(
     throw new Error(
       `MimiAgent 后台协议版本 ${String(status.protocolVersion)} 高于当前 CLI ${DAEMON_PROTOCOL_VERSION}；请升级 CLI，当前后台未被停止。`,
     );
+  }
+  // A matching protocol is the compatibility contract. When only the build
+  // differs, keep serving new clients until in-flight work reaches a safe
+  // restart boundary; the next idle client will perform the upgrade.
+  if (state === 'current' && buildMismatch && !permissionMismatch && daemonHasActiveWork(status)) {
+    return 'reuse';
   }
   if (daemonHasActiveWork(status)) {
     const active = status.activeEventId ? `（活动事件 ${status.activeEventId}）` : '';

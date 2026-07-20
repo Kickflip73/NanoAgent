@@ -18,7 +18,7 @@ const delegationSchema = z.object({
   strategy: z.enum(['single', 'team']).default('single')
     .describe('single 由一个 Task Lead 完成；可安全拆分的大型任务才使用 team'),
   executor: z.enum(['mimi', 'codex']).default('mimi')
-    .describe('mimi（默认）由 MimiAgent 执行；codex 使用可选本地 Codex CLI，完成后仍交回 Mimi 验收'),
+    .describe('mimi（默认）由 MimiAgent 执行；codex 由独立 Codex CLI 进程自主执行，MimiAgent 只登记、启动和追踪'),
   workspaceAccess: z.enum(['read', 'write']).default('write')
     .describe('write（默认）可修改工作区且独占执行；read 只读工作区，可与其他只读后台任务并行'),
   priority: z.number().int().min(0).max(100).default(70),
@@ -81,6 +81,16 @@ export interface BackgroundTaskSummary {
   updatedAt: string;
   result?: unknown;
   error?: string;
+  codex?: {
+    runnerPid?: number;
+    codexPid?: number;
+    threadId?: string;
+    startedAt?: string;
+    checkpointedAt?: string;
+    lastEvent?: string;
+    outputJsonlPath?: string;
+    summaryPath?: string;
+  };
 }
 
 export function backgroundTaskSummary(task: TaskRecord): BackgroundTaskSummary {
@@ -103,6 +113,9 @@ export function backgroundTaskSummary(task: TaskRecord): BackgroundTaskSummary {
     updatedAt: task.updatedAt,
     result: task.result,
     error: task.error,
+    ...(task.executor === 'codex' && payload.codex && typeof payload.codex === 'object'
+      ? { codex: payload.codex as BackgroundTaskSummary['codex'] }
+      : {}),
   };
 }
 
@@ -213,7 +226,7 @@ export function createBackgroundTaskTools(context: BackgroundTaskToolContext): T
   return [
     tool({
       name: 'delegate_background_task',
-      description: '把无需在当前对话立即得到结果的长程、大型、多阶段、持续等待或定时型工作交给 MimiAgent 后台 Task Lead。成功后立即返回 taskId；当前对话不得等待或轮询该任务，也不得重复执行同一工作。简单问答、短操作和用户明确要当前结果的任务不要委派。Task Lead 内部拆分使用 Ultra Team，不会递归创建 durable 后台任务。',
+      description: '把无需在当前对话立即得到结果的长程、大型、多阶段、持续等待或定时型工作持久化为后台任务。executor=mimi 时由 Task Lead 执行；executor=codex 时 MimiAgent 只登记、启动并追踪独立 Codex CLI，不参与其 Plan、工具调用、重试或验收，也不会失败后回退给 Mimi。成功后立即返回 taskId；当前对话不得等待、轮询或重复执行。',
       parameters: delegationSchema,
       execute: async (input) => {
         const normalized = delegationSchema.parse(input);
@@ -249,6 +262,7 @@ export function createBackgroundTaskTools(context: BackgroundTaskToolContext): T
           executor: normalized.executor === 'codex' ? 'codex' : 'isolated_worker',
           workspaceAccess: normalized.workspaceAccess,
           priority: normalized.priority,
+          ...(normalized.executor === 'codex' ? { maxAttempts: 1 } : {}),
         });
         return {
           taskId: inserted.id,

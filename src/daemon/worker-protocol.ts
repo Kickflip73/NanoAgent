@@ -108,7 +108,7 @@ export const taskWorkerInitSchema = z.object({
   if (init.embeddingCredential && init.config.provider !== 'deepseek') {
     context.addIssue({
       code: z.ZodIssueCode.custom,
-      message: 'Embedding credential 仅用于 DeepSeek Task 的 OpenAI RAG',
+      message: 'Embedding credential 仅用于 DeepSeek Task 的 OpenAI MemoryHub 检索',
       path: ['embeddingCredential'],
     });
   }
@@ -179,6 +179,12 @@ export const taskWorkerOutputSchema = z.discriminatedUnion('type', [
     type: z.literal('heartbeat'),
     taskId: z.string().uuid(),
     at: z.string().datetime(),
+  }).strict(),
+  z.object({
+    type: z.literal('detached'),
+    taskId: z.string().uuid(),
+    runnerPid: z.number().int().positive(),
+    codexPid: z.number().int().positive(),
   }).strict(),
   z.object({
     type: z.literal('done'),

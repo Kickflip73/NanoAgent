@@ -31,8 +31,6 @@ import type {
   DaemonStatus,
   MimiChatSnapshot,
   MimiHistoryChunk,
-  MimiMemoryContentChunk,
-  MimiMemoryPage,
   MimiStreamEvent,
   MimiStreamTaskState,
   MimiStreamSnapshot,
@@ -40,6 +38,7 @@ import type {
   TaskRecord,
 } from './types.js';
 import type { SessionSummary } from '../core/session.js';
+import type { MemoryRef, MemoryScope } from '../core/memory.js';
 
 const CHAT_COMMANDS: CompletionItem[] = [...COMMANDS];
 const CHAT_RECONNECT_INITIAL_DELAY_MS = 50;
@@ -520,68 +519,52 @@ export class RemoteCommandTarget implements CommandTarget {
     return this.client.invoke('instructions', undefined, this.sessionId);
   }
 
-  async listMemories(): Promise<CommandMethodResult<'listMemories'>> {
-    const memories: MimiMemoryPage['items'] = [];
-    let offset = 0;
-    let revision: string | undefined;
-    let total: number | undefined;
-    while (true) {
-      const page = await this.client.invoke<MimiMemoryPage>(
-        'memories.page',
-        { offset, revision },
-        this.sessionId,
-      );
-      if (!Number.isSafeInteger(page.total) || page.total < 0 || (total !== undefined && page.total !== total)) {
-        throw new Error('MimiAgent 返回了无效的长期记忆总数');
-      }
-      if (revision && page.revision !== revision) throw new Error('长期记忆在读取期间发生变化，请重试 /memories');
-      revision = page.revision;
-      total = page.total;
-      for (let index = 0; index < page.items.length; index += 1) {
-        if (page.items[index]?.index !== offset + index) {
-          throw new Error('MimiAgent 返回了无效的长期记忆分页索引');
-        }
-      }
-      memories.push(...page.items);
-      const expectedOffset = offset + page.items.length;
-      if (page.nextOffset === undefined) {
-        if (expectedOffset !== page.total) throw new Error('MimiAgent 长期记忆分页提前结束');
-        break;
-      }
-      if (!Number.isSafeInteger(page.nextOffset) || page.nextOffset !== expectedOffset || page.nextOffset > page.total) {
-        throw new Error('MimiAgent 返回了无效的长期记忆分页游标');
-      }
-      offset = page.nextOffset;
-    }
-    for (const memory of memories) {
-      if (!memory.contentTruncated) continue;
-      const chunks: string[] = [];
-      let contentOffset = 0;
-      while (true) {
-        const result: MimiMemoryContentChunk = await this.client.invoke<MimiMemoryContentChunk>(
-          'memory.content',
-          { index: memory.index, id: memory.id, offset: contentOffset, revision },
-          this.sessionId,
-        );
-        if (result.revision !== revision) throw new Error('长期记忆在读取期间发生变化，请重试 /memories');
-        chunks.push(result.chunk);
-        const expectedOffset = contentOffset + result.chunk.length;
-        if (result.nextOffset === undefined) {
-          if (expectedOffset !== result.totalCharacters) throw new Error('MimiAgent 长期记忆正文分页提前结束');
-          break;
-        }
-        if (!Number.isSafeInteger(result.nextOffset) || result.nextOffset !== expectedOffset) {
-          throw new Error('MimiAgent 返回了无效的长期记忆正文游标');
-        }
-        contentOffset = result.nextOffset;
-      }
-      memory.content = chunks.join('');
-      if (Buffer.byteLength(memory.content) !== memory.contentBytes) {
-        throw new Error('MimiAgent 长期记忆正文长度校验失败');
-      }
-      memory.contentTruncated = false;
-    }
-    return memories;
+  memoryList(scope: MemoryScope | 'all' = 'all'): Promise<CommandMethodResult<'memoryList'>> {
+    return this.client.invoke('memory.list', scope, this.sessionId);
+  }
+
+  memorySearch(query: string, scope: MemoryScope | 'all' = 'all'): Promise<CommandMethodResult<'memorySearch'>> {
+    return this.client.invoke('memory.search', { query, scope }, this.sessionId);
+  }
+
+  memoryRead(ref: MemoryRef): Promise<CommandMethodResult<'memoryRead'>> {
+    return this.client.invoke('memory.read', ref, this.sessionId);
+  }
+
+  memoryForget(ref: MemoryRef): Promise<CommandMethodResult<'memoryForget'>> {
+    return this.client.invoke('memory.forget', ref, this.sessionId);
+  }
+
+  memoryIngest(target: string, signal?: AbortSignal): Promise<CommandMethodResult<'memoryIngest'>> {
+    return this.client.invoke('memory.ingest', target, this.sessionId, 20 * 60_000, signal);
+  }
+
+  memoryCaptureRound(roundRef?: string): Promise<CommandMethodResult<'memoryCaptureRound'>> {
+    return this.client.invoke('memory.capture', roundRef, this.sessionId);
+  }
+
+  memoryLint(): Promise<CommandMethodResult<'memoryLint'>> {
+    return this.client.invoke('memory.lint', undefined, this.sessionId);
+  }
+
+  memoryConflicts(limit = 20): Promise<CommandMethodResult<'memoryConflicts'>> {
+    return this.client.invoke('memory.conflicts', limit, this.sessionId);
+  }
+
+  memoryAudit(limit = 20): Promise<CommandMethodResult<'memoryAudit'>> {
+    return this.client.invoke('memory.audit', limit, this.sessionId);
+  }
+
+  memoryMaintain(): Promise<unknown> {
+    return this.client.invoke('memory.maintain', undefined, this.sessionId);
+  }
+
+  memoryReindex(): Promise<CommandMethodResult<'memoryReindex'>> {
+    return this.client.invoke('memory.reindex', undefined, this.sessionId);
+  }
+
+  memoryStatus(): Promise<CommandMethodResult<'memoryStatus'>> {
+    return this.client.invoke('memory.status', undefined, this.sessionId);
   }
 
   currentPlan(): Promise<CommandMethodResult<'currentPlan'>> {
@@ -602,10 +585,6 @@ export class RemoteCommandTarget implements CommandTarget {
 
   async resumePrompt(): Promise<string> {
     return (await this.client.invoke<{ prompt: string }>('resume', undefined, this.sessionId)).prompt;
-  }
-
-  indexKnowledge(target = 'knowledge', signal?: AbortSignal): Promise<CommandMethodResult<'indexKnowledge'>> {
-    return this.client.invoke('index', target, this.sessionId, 20 * 60_000, signal);
   }
 
   listBackgroundTasks(limit = 20): Promise<BackgroundTaskSummary[]> {
