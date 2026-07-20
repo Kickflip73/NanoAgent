@@ -64,17 +64,17 @@ test('resolves model-specific context profiles and override precedence', () => {
   try {
     for (const key of keys) delete process.env[key];
     assert.deepEqual(resolveModelProfile(config, 'deepseek-v4-pro'), {
-      contextWindow: 1_048_576, outputReserve: 65_536,
+      contextWindow: 1_048_576, outputReserve: 65_536, supportsImageInput: false,
     });
     assert.deepEqual(resolveModelProfile(config, 'deepseek-v4-flash'), {
-      contextWindow: 128_000, outputReserve: 16_384,
+      contextWindow: 128_000, outputReserve: 16_384, supportsImageInput: false,
     });
     config.contextWindow = 256_000;
     config.outputReserve = 24_000;
     process.env.DEEPSEEK_V4_PRO_CONTEXT_WINDOW = '512000';
     process.env.DEEPSEEK_V4_PRO_OUTPUT_RESERVE = '48000';
     assert.deepEqual(resolveModelProfile(config, 'deepseek-v4-pro'), {
-      contextWindow: 512_000, outputReserve: 48_000,
+      contextWindow: 512_000, outputReserve: 48_000, supportsImageInput: false,
     });
   } finally {
     for (const key of keys) {
@@ -165,6 +165,42 @@ test('parses valid runtime limits once at startup', () => {
       ],
       [60, 128_000, 16_000, 120, 3, 'read-only', process.cwd()],
     );
+  } finally {
+    for (const key of keys) {
+      const value = previous[key];
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+test('keeps Computer Use disabled by default and validates explicit opt-in', () => {
+  const keys = [
+    'MIMI_COMPUTER_BACKEND', 'MIMI_CUA_DRIVER_COMMAND', 'MIMI_COMPUTER_ACTION_TIMEOUT_MS',
+    'MIMI_COMPUTER_MAX_ACTIONS_PER_RUN', 'MIMI_COMPUTER_MAX_SCREENSHOTS_PER_RUN',
+    'MIMI_COMPUTER_PAUSE_WHEN_TARGET_FRONTMOST', 'MIMI_COMPUTER_DEFAULT_ACCESS',
+    'MIMI_COMPUTER_FOREGROUND_LEASE_SECONDS', 'MIMI_COMPUTER_ARTIFACT_MAX_MIB',
+  ] as const;
+  const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  try {
+    for (const key of keys) delete process.env[key];
+    assert.equal(loadConfig(ISOLATED_HOME).computer, undefined);
+    process.env.MIMI_COMPUTER_BACKEND = 'cua';
+    assert.throws(() => loadConfig(ISOLATED_HOME), /MIMI_CUA_DRIVER_COMMAND/);
+    process.env.MIMI_CUA_DRIVER_COMMAND = '/bin/echo';
+    process.env.MIMI_COMPUTER_ACTION_TIMEOUT_MS = '12000';
+    process.env.MIMI_COMPUTER_MAX_ACTIONS_PER_RUN = '25';
+    process.env.MIMI_COMPUTER_MAX_SCREENSHOTS_PER_RUN = '6';
+    process.env.MIMI_COMPUTER_PAUSE_WHEN_TARGET_FRONTMOST = 'false';
+    process.env.MIMI_COMPUTER_DEFAULT_ACCESS = 'observe';
+    process.env.MIMI_COMPUTER_FOREGROUND_LEASE_SECONDS = '15';
+    assert.deepEqual(loadConfig(ISOLATED_HOME).computer, {
+      backend: 'cua', driverCommand: '/bin/echo', actionTimeoutMs: 12_000,
+      maxActionsPerRun: 25, maxScreenshotsPerRun: 6, pauseWhenTargetFrontmost: false,
+      defaultAccess: 'observe', foregroundLeaseSeconds: 15, artifactMaxBytes: 1024 * 1024 * 1024,
+    });
+    process.env.MIMI_COMPUTER_PAUSE_WHEN_TARGET_FRONTMOST = 'yes';
+    assert.throws(() => loadConfig(ISOLATED_HOME), /只能是 true 或 false/);
   } finally {
     for (const key of keys) {
       const value = previous[key];

@@ -4,6 +4,7 @@ import {
   type MimiRunOptions,
 } from '../runtime/mimi-agent.js';
 import type { ToolCapability } from '../runtime/tool-policy.js';
+import type { ComputerAccess } from '../extensions/computer/types.js';
 import { assertSessionId, sessionIdSchema } from '../core/session-id.js';
 import type { EventEnvelope, TaskRecord } from './types.js';
 
@@ -289,6 +290,8 @@ export function decideEvent(
   forceRestricted = false,
   task?: TaskRecord,
   triggerSource?: string,
+  ownerComputerAccess?: ComputerAccess,
+  ownerComputerApps?: readonly string[],
 ): EventDecision {
   const content = textPayload(event.payload);
   if (!content) return { action: 'ignore', reason: '事件没有可处理内容' };
@@ -297,6 +300,11 @@ export function decideEvent(
   const mayAct = !restrictedProvenance || ownerDelegated;
   const backgroundTask = task !== undefined && task.type !== 'conversation';
   const memoryMaintenance = task?.type === 'memory_maintenance';
+  const computerAccess = backgroundTask
+    ? 'none'
+    : ownerComputerAccess ?? (!restrictedProvenance ? 'background' : 'none');
+  const computerEnabled = computerAccess !== 'none';
+  const computerWriteEnabled = computerAccess !== 'observe' && computerAccess !== 'none';
   const semanticMemoryLint = memoryMaintenance
     && task.objective !== null && typeof task.objective === 'object'
     && (task.objective as Record<string, unknown>).semanticLint === true;
@@ -421,10 +429,21 @@ export function decideEvent(
             }
         : ownerDelegated
           ? {
-              allowedCapabilities: WORK_SOURCE_POLICY_CAPABILITIES,
-              allowedTools: WORK_SOURCE_POLICY_TOOLS,
+              allowedCapabilities: [
+                ...WORK_SOURCE_POLICY_CAPABILITIES,
+                ...(computerEnabled ? ['computer-read' as const] : []),
+                ...(computerWriteEnabled ? ['computer-write' as const] : []),
+              ],
+              allowedTools: [
+                ...WORK_SOURCE_POLICY_TOOLS,
+                ...(computerEnabled ? ['computer_observe' as const] : []),
+                ...(computerWriteEnabled ? ['computer_act' as const] : []),
+              ],
               allowSideEffects: true,
-              allowedSideEffectTools: WORK_SOURCE_POLICY_SIDE_EFFECT_TOOLS,
+              allowedSideEffectTools: [
+                ...WORK_SOURCE_POLICY_SIDE_EFFECT_TOOLS,
+                ...(computerWriteEnabled ? ['computer_act' as const] : []),
+              ],
               allowUnknownTools: false,
               allowMcp: false,
               allowSessionContext: true,
@@ -452,5 +471,9 @@ export function decideEvent(
       },
       ...(policy ? { policy } : {}),
     },
+      ...(computerEnabled ? {
+        computerAccess,
+        ...(ownerComputerApps ? { computerApps: ownerComputerApps } : {}),
+      } : {}),
   };
 }

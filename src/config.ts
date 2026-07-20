@@ -14,6 +14,7 @@ import {
   PRE_MIMI_DAEMON_DIRECTORY,
   PRE_MIMI_DATA_DIRECTORY,
 } from './core/mimi-legacy.js';
+import type { ComputerConfig } from './extensions/computer/types.js';
 
 export type AgentPermissionMode = 'workspace' | 'read-only' | 'trusted';
 
@@ -32,6 +33,7 @@ export interface AppConfig {
   sessionMaxConcurrency?: number;
   permissionMode?: AgentPermissionMode;
   trustedWorkspaceMcp?: string;
+  computer?: ComputerConfig;
 }
 
 interface EnvironmentEntry {
@@ -183,6 +185,43 @@ function optionalAbsolutePath(names: readonly [string, ...string[]], homeDirecto
   return expanded;
 }
 
+function booleanEnvironment(name: string, fallback: boolean): boolean {
+  const value = process.env[name];
+  if (value === undefined || value === '') return fallback;
+  if (value === 'true') return true;
+  if (value === 'false') return false;
+  throw new Error(`${name} 只能是 true 或 false`);
+}
+
+function computerConfig(homeDirectory: string): ComputerConfig | undefined {
+  const backend = process.env.MIMI_COMPUTER_BACKEND;
+  if (backend === undefined || backend === '') return undefined;
+  if (backend !== 'cua') throw new Error('MIMI_COMPUTER_BACKEND 第一阶段只能是 cua');
+  const selectedCommand = process.env.MIMI_CUA_DRIVER_COMMAND;
+  if (!selectedCommand) throw new Error('启用 Computer Use 时必须设置 MIMI_CUA_DRIVER_COMMAND');
+  if (!selectedCommand.startsWith('~') && !path.isAbsolute(selectedCommand)) {
+    throw new Error('MIMI_CUA_DRIVER_COMMAND 必须是可执行文件的绝对路径');
+  }
+  const driverCommand = expandHome(selectedCommand, homeDirectory);
+  const info = statSync(driverCommand);
+  if (!info.isFile() || (info.mode & 0o111) === 0) throw new Error('MIMI_CUA_DRIVER_COMMAND 必须指向可执行普通文件');
+  const defaultAccess = process.env.MIMI_COMPUTER_DEFAULT_ACCESS ?? 'background';
+  if (!['none', 'observe', 'background', 'foreground', 'admin'].includes(defaultAccess)) {
+    throw new Error('MIMI_COMPUTER_DEFAULT_ACCESS 必须是 none、observe、background、foreground 或 admin');
+  }
+  return {
+    backend,
+    driverCommand,
+    actionTimeoutMs: positiveSafeInteger(['MIMI_COMPUTER_ACTION_TIMEOUT_MS'], 15_000)!,
+    maxActionsPerRun: positiveSafeInteger(['MIMI_COMPUTER_MAX_ACTIONS_PER_RUN'], 50)!,
+    maxScreenshotsPerRun: positiveSafeInteger(['MIMI_COMPUTER_MAX_SCREENSHOTS_PER_RUN'], 12)!,
+    pauseWhenTargetFrontmost: booleanEnvironment('MIMI_COMPUTER_PAUSE_WHEN_TARGET_FRONTMOST', true),
+    defaultAccess: defaultAccess as ComputerConfig['defaultAccess'],
+    foregroundLeaseSeconds: positiveSafeInteger(['MIMI_COMPUTER_FOREGROUND_LEASE_SECONDS'], 30)!,
+    artifactMaxBytes: positiveSafeInteger(['MIMI_COMPUTER_ARTIFACT_MAX_MIB'], 1_024)! * 1024 * 1024,
+  };
+}
+
 export function resolveEnvironmentFile(
   environmentFile?: string,
   homeDirectory = os.homedir(),
@@ -314,5 +353,6 @@ export function loadConfig(homeDirectory = os.homedir()): AppConfig {
       ['MIMI_TRUST_WORKSPACE_MCP', 'TRUST_WORKSPACE_MCP'],
       homeDirectory,
     ),
+    computer: computerConfig(homeDirectory),
   };
 }

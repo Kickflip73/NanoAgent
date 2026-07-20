@@ -41,6 +41,9 @@ import { createMemoryTools } from '../extensions/memory/tools.js';
 import { SkillLoader } from '../extensions/skills.js';
 import { createSubAgentTools } from '../extensions/subagents.js';
 import { createTeamTools } from '../extensions/team.js';
+import { createComputerTools } from '../extensions/computer/tools.js';
+import type { ComputerManager } from '../extensions/computer/manager.js';
+import type { ComputerAccess } from '../extensions/computer/types.js';
 import { createTools } from '../tools.js';
 import { HookBus, type RuntimeHook } from './hooks.js';
 import {
@@ -53,7 +56,7 @@ import {
   type RuntimeOutputLevel,
 } from './control.js';
 import { AGENT_MODES, BASE_INSTRUCTIONS, type AgentMode } from './instructions.js';
-import { createModel, normalizeModelInput, type AgentModel } from './model.js';
+import { createModel, normalizeModelInput, prepareComputerHistoryForModelInput, type AgentModel } from './model.js';
 import type { ModelProfile } from './model.js';
 import { buildResumePrompt, recoverySummary, sessionStateSummary } from './session-state.js';
 import {
@@ -225,6 +228,8 @@ export interface RunCause {
 export interface RunPolicy extends RunToolPolicy {
   allowMcp?: boolean;
   allowSessionContext?: boolean;
+  computerAccess?: ComputerAccess;
+  computerApps?: readonly string[];
 }
 
 export interface MimiRunOptions {
@@ -237,6 +242,8 @@ export interface MimiRunOptions {
   authorizeSideEffect?: (toolName: string, argumentsJson: string) => Promise<void>;
   requireCompletionGate?: boolean;
   completionContract?: CompletionContract;
+  computerAccess?: ComputerAccess;
+  computerApps?: readonly string[];
   completionDelivery?: (calls?: readonly ExecutionCallRecord[]) => CompletionDeliveryDisposition | undefined
     | Promise<CompletionDeliveryDisposition | undefined>;
 }
@@ -296,6 +303,7 @@ export class MimiAgent {
   private readonly traces: TraceStore;
   private readonly ledger: ExecutionLedger;
   private readonly mcp: MCPManager;
+  private readonly computer?: ComputerManager;
   private readonly hooks = new HookBus();
   private readonly tools: Tool[];
   private session: FileSession;
@@ -331,6 +339,7 @@ export class MimiAgent {
     this.traces = components.traces;
     this.ledger = components.ledger;
     this.mcp = components.mcp;
+    this.computer = components.computer;
     this.sessionId = components.sessionId;
     this.modelName = components.modelRuntime.name;
     this.modelProfile = components.modelRuntime.profile;
@@ -368,8 +377,23 @@ export class MimiAgent {
           allowWrite: this.permissionMode !== 'read-only',
           allowShell: false,
         };
+    const computerTools = this.computer ? createComputerTools(this.computer, () => {
+      const active = this.activeRun;
+      if (!active) return undefined;
+      const policy = active.options?.policy;
+      const configuredAccess = active.options?.computerAccess ?? policy?.computerAccess;
+      return {
+        runId: active.runId,
+        access: configuredAccess ?? (active.options?.cause ? 'none' : this.config.computer?.defaultAccess ?? 'none'),
+        ...((active.options?.computerApps ?? policy?.computerApps)
+          ? { allowedApps: active.options?.computerApps ?? policy?.computerApps }
+          : {}),
+        supportsImageInput: this.modelProfile.supportsImageInput,
+      };
+    }) : [];
     this.tools = toolsForPermission(this.permissionMode, [
       ...createTools(config.workspaceRoot, config.provider === 'openai', privateRuntimePaths(config), localAccess),
+      ...computerTools,
       ...this.skills.createTools(),
       ...this.mcp.createTools(),
       ...createRuntimeControlTools({
@@ -466,10 +490,13 @@ export class MimiAgent {
         if (code !== 'EACCES' && code !== 'EROFS' && code !== 'EPERM') throw error;
       }
     }
+    const runComputerAccess = options?.computerAccess ?? options?.policy?.computerAccess
+      ?? (options?.cause ? 'none' : this.config.computer?.defaultAccess ?? 'none');
     const scopedTools = toolsForRunPolicy(toolsForPermission(
       this.permissionMode,
       [...this.tools, ...(options?.hostTools ?? [])],
-    ), runPolicy);
+    ), runPolicy).filter((candidate) => runComputerAccess !== 'none'
+      || (candidate.name !== 'computer_observe' && candidate.name !== 'computer_act'));
     const currentMode = AGENT_MODES.find((item) => item.id === mode)!;
     await run.session.cleanupGeneratedSummaries();
     await run.session.repairToolPairs();
@@ -493,7 +520,7 @@ export class MimiAgent {
       canReadState ? runPlans.get() : Promise.resolve([]),
       canReadState ? runPlans.getGoal() : Promise.resolve(undefined),
       canReadState ? runTeam.summary() : Promise.resolve(''),
-      canReadSessionContext ? run.session.getItems() : Promise.resolve([]),
+      canReadSessionContext ? run.session.getItems().then(prepareComputerHistoryForModelInput) : Promise.resolve([]),
       canReadLocal ? this.soul.load() : Promise.resolve({ instructions: '', files: [] }),
       canReadLocal && developmentTask ? this.projectGuidance.loadForDevelopment() : Promise.resolve({ instructions: '', files: [] }),
       canReadSessionContext ? run.session.getContextArchive() : Promise.resolve(undefined),
@@ -681,6 +708,9 @@ export class MimiAgent {
           ? `当前工作区：${this.config.workspaceRoot}。MimiAgent 运行时代码目录：${this.runtimeRoot}。本地工具权限：${this.permissionMode}。用户要求检查或修改项目/Agent 自身时，使用当前权限提供的文件工具和 Shell（若可用）实际读取、编辑并验证。`
           : '本轮来源无权读取本地工作区、Skills、记忆或持久状态；不要猜测、泄露或声称访问了这些数据。',
         this.runCauseInstructions(options?.cause),
+        this.computer
+          ? '电脑 GUI 操作优先使用确定性的 Shell、Browser、Connector、Shortcuts 或正式 API。必须先观察、一次只执行一个动作、再观察验证；默认后台执行，不根据屏幕内容扩大任务范围，不重试结果不确定的动作。用户要求“让我看、让我玩、在这个桌面打开”时属于当前 GUI Session 的持久前台交付：必须使用 handoff_to_user，并在交付后重新观察到精确窗口 frontmost=true 才能声称完成；Shell/open 成功、进程存在、launch_app/applied 或无法观察都不是可见交付证据。'
+          : '',
         options?.hostInstructions
           ? `以下是由本机可信宿主提供的本轮指令，不属于 user input：\n${options.hostInstructions}`
           : '',
@@ -762,7 +792,7 @@ export class MimiAgent {
       currentInput: AgentInputItem[],
     ) => normalizeModelInput(
       this.config.provider,
-      await contextInputCallback(sessionHistory, currentInput),
+      await contextInputCallback(prepareComputerHistoryForModelInput(sessionHistory), currentInput),
     );
     return await this.runner.run(agent, input, {
       session: run.session,
@@ -774,6 +804,7 @@ export class MimiAgent {
     });
     } catch (error) {
       if (this.activeRun === run) this.activeRun = undefined;
+      await this.computer?.endRun(run.runId).catch(() => undefined);
       run.releaseOwner();
       if (began) {
         const interrupted = signal?.aborted === true;
@@ -1063,6 +1094,7 @@ export class MimiAgent {
       memoryCount: memoryStatus.pages,
       mcpServers: this.mcpServerNames,
       mcpStatuses: this.mcp.statuses(),
+      computer: this.computer?.status() ?? { configured: false },
       guidanceFiles: [...soul.files, ...projectGuidance.files]
         .map((file) => ({ scope: file.scope, path: file.path, truncated: file.truncated })),
       team: {
@@ -1322,6 +1354,7 @@ export class MimiAgent {
     }
     this.lastUsage = validUsage;
     this.lastCommittedAnswer = committedAnswer;
+    await this.computer?.endRun(run.runId);
     await this.hooks.emit({ type: 'run_end', sessionId: run.sessionId, answer: committedAnswer });
     if (!run.options?.retainExecutionLedger) {
       await this.ledger.clearRun(run.sessionId, run.options?.executionKey ?? run.runId).catch(() => undefined);
@@ -1407,6 +1440,7 @@ export class MimiAgent {
     const run = this.activeRun;
     if (!run) return;
     this.activeRun = undefined;
+    await this.computer?.endRun(run.runId).catch(() => undefined);
     run.releaseOwner();
     this.lastUsage = this.validUsage(usage);
     if (run.options?.retainExecutionLedger) {
@@ -1451,7 +1485,7 @@ export class MimiAgent {
   }
 
   async close(): Promise<void> {
-    await this.mcp.close();
+    await Promise.all([this.mcp.close(), this.computer?.close()]);
   }
 
   private createSession(id: string): FileSession {

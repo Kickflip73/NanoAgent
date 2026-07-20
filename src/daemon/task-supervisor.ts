@@ -15,6 +15,7 @@ import {
   restrictedTaskShellEnvironment,
   taskProviderEnvironmentName,
   taskWorkerOutputSchema,
+  taskWorkerConfig,
   type TaskEmbeddingCredential,
   type TaskProviderCredential,
   type TaskWorkerControl,
@@ -485,7 +486,7 @@ export class TaskProcessSupervisor {
       providerCredential,
       embeddingCredential,
       mcpEnvironment,
-      config: this.config,
+      config: taskWorkerConfig(this.config),
     } satisfies TaskWorkerInit;
     child.send(init, (error) => {
       if (!error) return;

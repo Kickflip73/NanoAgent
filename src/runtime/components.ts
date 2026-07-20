@@ -12,6 +12,8 @@ import { TraceStore } from '../core/trace.js';
 import { isMcpConfigurationTrusted, MCPManager } from '../extensions/mcp.js';
 import { createRoutedMemoryHub } from '../extensions/memory/hub.js';
 import { SkillLoader } from '../extensions/skills.js';
+import { ComputerManager } from '../extensions/computer/manager.js';
+import { CuaDriverClient } from '../extensions/computer/cua-driver-client.js';
 import { createModel, type ModelRuntime } from './model.js';
 
 export interface RuntimeComponents {
@@ -27,6 +29,7 @@ export interface RuntimeComponents {
   ledger: ExecutionLedger;
   mcp: MCPManager;
   sessionId: string;
+  computer?: ComputerManager;
 }
 
 export async function createRuntimeComponents(
@@ -101,5 +104,12 @@ export async function createRuntimeComponents(
     ledger: new ExecutionLedger(path.join(config.dataRoot, 'execution-ledger.json')),
     mcp,
     sessionId,
+    ...(config.computer ? {
+      computer: new ComputerManager(
+        config.computer,
+        new CuaDriverClient(config.computer.driverCommand, config.computer.actionTimeoutMs),
+        config.dataRoot,
+      ),
+    } : {}),
   };
 }

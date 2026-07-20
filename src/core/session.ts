@@ -1,4 +1,5 @@
 import { readdir } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import type { AgentInputItem, Session } from '@openai/agents';
 import { z } from 'zod';
@@ -12,6 +13,21 @@ import { assertSessionId } from './session-id.js';
 import { AtomicJsonStore, StateFileCorruptError } from './state-file.js';
 
 export type RunStatus = 'running' | 'completed' | 'interrupted' | 'failed';
+
+function redactComputerToolInput(item: AgentInputItem): AgentInputItem {
+  const value = item as unknown as Record<string, unknown>;
+  if (value.type !== 'function_call' || value.name !== 'computer_act' || typeof value.arguments !== 'string') return item;
+  try {
+    const input = JSON.parse(value.arguments) as Record<string, unknown>;
+    const action = input.action as Record<string, unknown> | undefined;
+    if (action?.type !== 'type_text' || typeof action.text !== 'string') return item;
+    const digest = createHash('sha256').update(action.text).digest('hex');
+    action.text = `[REDACTED sha256:${digest} length:${action.text.length}]`;
+    return { ...value, arguments: JSON.stringify(input) } as unknown as AgentInputItem;
+  } catch {
+    return item;
+  }
+}
 
 export interface RunCheckpoint {
   runId: string;
@@ -259,7 +275,8 @@ export class FileSession implements Session {
   }
 
   async addItems(items: AgentInputItem[]): Promise<void> {
-    const validated = z.array(z.record(z.string(), z.unknown())).parse(items) as unknown as AgentInputItem[];
+    const validated = (z.array(z.record(z.string(), z.unknown())).parse(items) as unknown as AgentInputItem[])
+      .map(redactComputerToolInput);
     await this.mutate((session) => {
       session.items.push(...validated);
       session.updatedAt = new Date().toISOString();

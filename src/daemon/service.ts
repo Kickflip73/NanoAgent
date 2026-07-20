@@ -347,6 +347,12 @@ export interface MimiDoctorReport {
     };
   };
   launchAgent: { installed: boolean; file: string };
+  computer: {
+    configured: boolean;
+    backend?: 'cua';
+    ready?: boolean;
+    diagnostics?: Record<string, unknown>;
+  };
   issues: string[];
   nextActions: string[];
 }
@@ -734,6 +740,20 @@ export async function doctorMimi(config: AppConfig): Promise<MimiDoctorReport> {
   if (launchAgentInstalled && !persistentProviderKey) {
     issues.push(`launchd 持久环境文件缺少 ${providerKeyName(config)}`);
   }
+  let computerDiagnostics: Record<string, unknown> | undefined;
+  let computerReady = false;
+  if (config.computer) {
+    try {
+      const { CuaDriverClient } = await import('../extensions/computer/cua-driver-client.js');
+      const client = new CuaDriverClient(config.computer.driverCommand, config.computer.actionTimeoutMs);
+      computerDiagnostics = await client.diagnostics();
+      const permissions = object(computerDiagnostics.permissions);
+      computerReady = permissions.accessibility === true && permissions.screen_recording === true;
+      if (!computerReady) issues.push('Computer Use 缺少 CuaDriver Accessibility 或 Screen Recording 权限');
+    } catch (error) {
+      issues.push(`Computer Use 不可用：${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
 
   let daemonStatus: DaemonStatus | undefined;
   let runtimeConnectors: ConnectorCapability[] | undefined;
@@ -819,6 +839,11 @@ export async function doctorMimi(config: AppConfig): Promise<MimiDoctorReport> {
       } : {}),
     },
     launchAgent: { installed: launchAgentInstalled, file: installedLaunchAgentFile },
+    computer: {
+      configured: Boolean(config.computer),
+      ...(config.computer ? { backend: config.computer.backend, ready: computerReady } : {}),
+      ...(computerDiagnostics ? { diagnostics: computerDiagnostics } : {}),
+    },
     issues,
     nextActions,
   };
@@ -848,6 +873,17 @@ export function daemonLaunchEnvironment(config: AppConfig): Record<string, strin
   if (config.maxTurns !== null) environment.MIMI_MAX_TURNS = String(config.maxTurns);
   if (config.contextWindow !== undefined) environment.MIMI_CONTEXT_WINDOW = String(config.contextWindow);
   if (config.outputReserve !== undefined) environment.MIMI_OUTPUT_TOKEN_RESERVE = String(config.outputReserve);
+  if (config.computer) {
+    environment.MIMI_COMPUTER_BACKEND = config.computer.backend;
+    environment.MIMI_CUA_DRIVER_COMMAND = config.computer.driverCommand;
+    environment.MIMI_COMPUTER_ACTION_TIMEOUT_MS = String(config.computer.actionTimeoutMs);
+    environment.MIMI_COMPUTER_MAX_ACTIONS_PER_RUN = String(config.computer.maxActionsPerRun);
+    environment.MIMI_COMPUTER_MAX_SCREENSHOTS_PER_RUN = String(config.computer.maxScreenshotsPerRun);
+    environment.MIMI_COMPUTER_PAUSE_WHEN_TARGET_FRONTMOST = String(config.computer.pauseWhenTargetFrontmost);
+    environment.MIMI_COMPUTER_DEFAULT_ACCESS = config.computer.defaultAccess;
+    environment.MIMI_COMPUTER_FOREGROUND_LEASE_SECONDS = String(config.computer.foregroundLeaseSeconds);
+    environment.MIMI_COMPUTER_ARTIFACT_MAX_MIB = String(Math.floor(config.computer.artifactMaxBytes / 1024 / 1024));
+  }
   if (config.trustedWorkspaceMcp !== undefined) {
     environment.MIMI_TRUST_WORKSPACE_MCP = config.trustedWorkspaceMcp;
   }

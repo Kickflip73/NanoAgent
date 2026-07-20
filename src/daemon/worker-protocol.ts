@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import type { AppConfig } from '../config.js';
 import { restrictedShellEnvironment } from '../runtime/shell-environment.js';
 
 export function restrictedTaskShellEnvironment(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
@@ -73,6 +74,12 @@ const appConfigSchema = z.object({
   permissionMode: z.enum(['workspace', 'read-only', 'trusted']).optional(),
   trustedWorkspaceMcp: z.string().min(1).optional(),
 }).strict();
+
+export function taskWorkerConfig(config: AppConfig): z.infer<typeof appConfigSchema> {
+  const workerConfig = { ...config };
+  delete workerConfig.computer;
+  return appConfigSchema.parse(workerConfig);
+}
 
 export const taskWorkerTokenSchema = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
 

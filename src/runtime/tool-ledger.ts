@@ -3,6 +3,8 @@ import { createHash } from 'node:crypto';
 import type { ExecutionLedger } from '../core/execution-ledger.js';
 import { isSideEffectTool } from './tool-policy.js';
 
+export const TOOL_LEDGER_ARGUMENTS = Symbol('mimi.toolLedgerArguments');
+
 interface RunIdentity {
   sessionId: string;
   runId: string;
@@ -18,6 +20,10 @@ type InvokableTool = Tool & {
     input: string,
     details?: { toolCall?: { callId?: string } },
   ) => Promise<unknown>;
+};
+
+type LedgerAwareTool = Tool & {
+  [TOOL_LEDGER_ARGUMENTS]?: (rawInput: string) => string;
 };
 
 function isInvokable(tool: Tool): tool is InvokableTool {
@@ -72,7 +78,8 @@ export function withExecutionLedger(
         await run?.authorizeTool?.(tool.name, input);
         if (!sideEffect) return originalInvoke(runContext, input, details);
         const sdkCallId = details?.toolCall?.callId;
-        const argumentsJson = run?.semanticCallIds ? semanticArguments(input) : input;
+        const ledgerInput = (tool as LedgerAwareTool)[TOOL_LEDGER_ARGUMENTS]?.(input) ?? input;
+        const argumentsJson = run?.semanticCallIds ? semanticArguments(ledgerInput) : ledgerInput;
         const semanticKey = `${tool.name}\0${argumentsJson}`;
         const consecutiveDuplicate = run?.semanticCallIds && previousSemanticKey === semanticKey;
         const occurrence = run?.semanticCallIds

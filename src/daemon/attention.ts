@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { chmod, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { z } from 'zod';
+import { computerAccessSchema, type ComputerAccess } from '../extensions/computer/types.js';
 import { sessionIdSchema } from '../core/session-id.js';
 import {
   decideEvent,
@@ -68,6 +69,8 @@ export const mimiSourcePolicySchema = z.object({
   actor: z.string().min(1).max(200).optional(),
   conversation: z.string().min(1).max(200).optional(),
   access: z.enum(SOURCE_POLICY_ACCESS_LEVELS).default('reply'),
+  computerAccess: computerAccessSchema.default('none'),
+  computerApps: z.array(z.string().trim().min(1).max(500)).min(1).max(100).optional(),
   instructions: z.array(mimiInstructionSchema).min(1).max(10),
 }).strict();
 export type SourcePolicyConfig = z.infer<typeof mimiSourcePolicySchema>;
@@ -604,6 +607,8 @@ export class AttentionEngine {
       false,
       task,
       eventFact.source,
+      decisionContext.computerAccess,
+      decisionContext.computerApps,
     );
   }
 
@@ -836,18 +841,33 @@ export class AttentionEngine {
   private instructionsFor(event: EventEnvelope): {
     instructions: string[];
     sourcePolicyAccess?: SourcePolicyAccess;
+    computerAccess?: ComputerAccess;
+    computerApps?: string[];
   } {
     const instructions = [...this.config.decisionPolicy.standingOrders];
     let sourcePolicyAccess: SourcePolicyAccess | undefined;
+    let computerAccess: ComputerAccess | undefined;
+    let computerApps: Set<string> | undefined;
+    const levels: Record<ComputerAccess, number> = { none: 0, observe: 1, background: 2, foreground: 3, admin: 4 };
     for (const policy of this.config.decisionPolicy.sourcePolicies) {
       if (!globMatches(policy.source, event.source)) continue;
       if (policy.kinds && !policy.kinds.includes(event.kind as EventKind)) continue;
       if (policy.actor && (!event.actor || !globMatches(policy.actor, event.actor.id))) continue;
       if (policy.conversation && (!event.conversation || !globMatches(policy.conversation, event.conversation.id))) continue;
       if (policy.access === 'work' || sourcePolicyAccess === undefined) sourcePolicyAccess = policy.access;
+      if (computerAccess === undefined || levels[policy.computerAccess] > levels[computerAccess]) computerAccess = policy.computerAccess;
+      if (policy.computerApps) {
+        const selected = new Set(policy.computerApps);
+        computerApps = computerApps === undefined
+          ? selected
+          : new Set([...computerApps].filter((bundleId) => selected.has(bundleId)));
+      }
       instructions.push(...policy.instructions);
     }
-    return { instructions: [...new Set(instructions)], sourcePolicyAccess };
+    return {
+      instructions: [...new Set(instructions)], sourcePolicyAccess, computerAccess,
+      ...(computerApps ? { computerApps: [...computerApps] } : {}),
+    };
   }
 
   private matchesRule(rule: AttentionConfig['rules'][number], event: EventEnvelope): boolean {

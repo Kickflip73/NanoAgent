@@ -47,6 +47,8 @@ src/daemon/
 └── notifier.ts          system / local 通知与渠道注册
 ```
 
+可选 `extensions/computer` 以 Cua Driver 为隐藏 Backend，只向主 Agent 暴露 `computer_observe` 与 `computer_act` 两个 Function Tool。它按 Run 管理不可复用的 Observation、动作/截图预算、Cua session、前台 lease 和受保护录制 artifact；GUI 写动作继续经过统一 Tool policy、ExecutionLedger 与跨进程动作锁。默认配置不创建该 Extension。
+
 `src/agent.ts` 导出 `MimiAgent`；实现位于 `runtime/mimi-agent.ts`。
 
 产品身份、公开入口和运行时标识统一为 MimiAgent：`Mimi*` 类型、`mimi.db` / `mimi.sock` / 日志文件、`com.mimiagent.daemon` label、临时目录 `mimi-agent-file-locks`、`*_mimi_*` Tool ID、`mimiagent-bridge` plugin ID 与 `mimi.*.example.json` 文件名均由同一个 MimiHost 使用。旧版本数据只在 `core/mimi-legacy.ts` 的单向迁移边界识别；Daemon 确认旧进程停稳后，目录和内部文件才原子改名，避免状态丢失或双实例。

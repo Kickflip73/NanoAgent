@@ -1,0 +1,4 @@
+interface:
+  display_name: "Computer Use"
+  short_description: "Safely operate macOS apps through MimiAgent"
+  default_prompt: "Use $computer-use to operate a macOS application safely with observe-act-observe verification."

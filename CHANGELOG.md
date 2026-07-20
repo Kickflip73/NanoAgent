@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- add opt-in macOS Computer Use through Cua Driver with bounded observations and actions, permission-aware policy, protected artifacts, background-first execution, and verified visible handoff
 - replace the legacy `MemoryStore` and flat RAG index with a unified profile-isolated MemoryHub backed by Markdown Wiki pages, SQLite FTS5/BM25, optional embedding RRF, source receipts and forget suppressions
 - split `MIMI.md` Soul from hierarchical `AGENTS.md` / `CLAUDE.md` project guidance, and replace legacy memory/RAG tools and CLI commands with the canonical `/memory` surface
 - add an atomic one-time backup/conversion marker for usable legacy memories while skipping todo and unconfirmed entries

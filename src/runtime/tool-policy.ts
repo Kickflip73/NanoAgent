@@ -14,6 +14,8 @@ export type ToolCapability =
   | 'state-read'
   | 'state-write'
   | 'delivery-control'
+  | 'computer-read'
+  | 'computer-write'
   | 'control';
 export type SubAgentRole = 'researcher' | 'reviewer' | 'architect';
 
@@ -65,6 +67,8 @@ const TOOL_POLICY = {
     subAgents: ['researcher', 'architect'],
     teamRoles: ['explorer', 'architect'],
   },
+  computer_observe: { capabilities: ['computer-read'], modes: ALL_MODES },
+  computer_act: { capabilities: ['computer-write'], sideEffect: true },
   http_request: { capabilities: ['network-read', 'network-write'], sideEffect: true },
   inspect_mimi_capabilities: { capabilities: ['state-read'], modes: ALL_MODES },
   set_mimi_connector_enabled: { capabilities: ['state-write'], sideEffect: true },
@@ -216,6 +220,7 @@ export function toolsForPermission(
     const declared = customCapabilities[tool.name];
     if (!policy && !declared) return false;
     const capabilities = policy?.capabilities ?? declared ?? [];
+    if (capabilities.some((capability) => capability === 'computer-read' || capability === 'computer-write')) return false;
     if (capabilities.includes('execute') || capabilities.includes('network-write')) return false;
     // Deployment read-only limits MimiAgent's local durable state. Connector
     // transactions are separately authorized by owner/system provenance and
