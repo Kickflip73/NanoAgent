@@ -1,28 +1,8 @@
 import { z } from 'zod';
-
-const TASK_SECRET_NAME = /(key|token|secret|password|pass|credential|cookie|auth)/i;
-const TASK_RUNTIME_PATH_NAMES = new Set([
-  'MIMI_ENV_FILE',
-  'DOTENV_CONFIG_PATH',
-  'MIMI_DATA_DIR',
-  'AGENT_DATA_DIR',
-  'MIMI_DAEMON_DATA_DIR',
-  'MIMI_DAEMON_SOCKET',
-  'MIMI_CONNECTORS_CONFIG',
-  'MIMI_ASSISTANT_CONFIG',
-  'MIMI_MCP_CONFIG',
-  'AGENT_MCP_CONFIG',
-  'MIMI_SKILLS_DIR',
-  'AGENT_SKILLS_DIR',
-  'MIMI_WORKSPACE',
-  'AGENT_WORKSPACE',
-  'NODE_OPTIONS',
-]);
+import { restrictedShellEnvironment } from '../runtime/shell-environment.js';
 
 export function restrictedTaskShellEnvironment(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  return Object.fromEntries(Object.entries(source).filter(([name]) => (
-    !TASK_SECRET_NAME.test(name) && !TASK_RUNTIME_PATH_NAMES.has(name.toUpperCase())
-  )));
+  return restrictedShellEnvironment(source);
 }
 
 const openAiProviderCredentialSchema = z.object({

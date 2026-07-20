@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.11.4] - 2026-07-20 11:15
+
+### Fixed
+
+- harden unattended execution reliability (@Kickflip73)
+
 ## [0.11.3] - 2026-07-20 09:57
 
 ### Fixed
@@ -29,6 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- harden unattended execution with secret-free Shell environments, full process-group cleanup, public-network-only HTTP requests, persistent Connector inbound ACKs, poison-row quarantine, provider-bound model preferences, build-aware Daemon upgrades, and per-attempt logical side-effect identities
+- replace fixed-count stability patches with evidence-aware completion progress, immutable Event-to-Session binding, route-scoped Outbox lanes, prompt-budgeted briefings, protocol-preserving context compaction, and persisted Connector delivery receipts
 - bound Completion Gate deferrals and model turns, keep pure answers out of execution gating, isolate stale Goal/Plan/recovery context, preserve delivery suppression across crash recovery, batch briefing/context protocol units, and prevent one blocked IM channel from holding up another
 - disable the generic NapCat OneBot client after a remembered QQ account has an account-specific client, preventing a permanent duplicate reverse-WebSocket reconnect loop
 - keep CLI submission and event streaming alive across transient IPC timeouts, reconcile ambiguous submissions by stable Event ID, and forbid detached Shell work that escapes task ownership

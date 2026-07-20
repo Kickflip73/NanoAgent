@@ -1,6 +1,8 @@
 import os from 'node:os';
 import path from 'node:path';
-import { existsSync, mkdirSync, readdirSync, renameSync, rmdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmdirSync, statSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 import {
   preferredEnvironmentValue,
   type AgentPermissionMode,
@@ -15,6 +17,24 @@ import {
 
 export type DaemonStatusWire = Omit<DaemonStatus, 'protocolVersion'> & { protocolVersion?: unknown };
 export type DaemonProtocolState = 'legacy' | 'current' | 'newer';
+
+export const MIMI_BUILD_VERSION = (() => {
+  try {
+    const manifest = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8')) as {
+      version?: unknown;
+    };
+    const version = typeof manifest.version === 'string' ? manifest.version : 'unknown';
+    const modulePath = fileURLToPath(import.meta.url);
+    const digest = createHash('sha256')
+      .update(readFileSync(modulePath))
+      .update(String(statSync(modulePath).mtimeMs))
+      .digest('hex')
+      .slice(0, 12);
+    return `${version}+${digest}`;
+  } catch {
+    return 'unknown';
+  }
+})();
 
 export interface MimiPaths {
   root: string;
@@ -136,7 +156,8 @@ export function daemonProtocolAction(
 ): 'reuse' | 'upgrade' {
   const state = daemonProtocolState(status);
   const permissionMismatch = state === 'current' && status.permissionMode !== expectedPermissionMode;
-  if (state === 'current' && !permissionMismatch) return 'reuse';
+  const buildMismatch = state === 'current' && status.buildVersion !== MIMI_BUILD_VERSION;
+  if (state === 'current' && !permissionMismatch && !buildMismatch) return 'reuse';
   if (state === 'newer') {
     throw new Error(
       `MimiAgent 后台协议版本 ${String(status.protocolVersion)} 高于当前 CLI ${DAEMON_PROTOCOL_VERSION}；请升级 CLI，当前后台未被停止。`,
@@ -146,7 +167,9 @@ export function daemonProtocolAction(
     const active = status.activeEventId ? `（活动事件 ${status.activeEventId}）` : '';
     const configuration = permissionMismatch
       ? `（后台执行档位 ${String(status.permissionMode ?? 'unknown')}，当前配置 ${expectedPermissionMode}）`
-      : '';
+      : buildMismatch
+        ? `（后台构建 ${String(status.buildVersion ?? 'unknown')}，当前构建 ${MIMI_BUILD_VERSION}）`
+        : '';
     throw new Error(
       `MimiAgent 后台需要升级${configuration}，但仍有活动任务${active}；为避免中断外部事务，等待任务完成后重试。`,
     );

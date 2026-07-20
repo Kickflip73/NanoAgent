@@ -326,7 +326,13 @@ test('sends HTTP requests with the dedicated tool helper', async () => {
   assert.ok(address && typeof address === 'object');
 
   try {
-    const result = await requestUrl(`http://127.0.0.1:${address.port}/health`, 'GET', {}, undefined, 5);
+    await assert.rejects(
+      requestUrl(`http://127.0.0.1:${address.port}/health`, 'GET', {}, undefined, 5),
+      /只允许访问公网地址/,
+    );
+    const result = await requestUrl(
+      `http://127.0.0.1:${address.port}/health`, 'GET', {}, undefined, 5, undefined, true,
+    );
     assert.equal(result.status, 200);
     assert.match(result.body, /"ok":true/);
   } finally {
@@ -340,12 +346,80 @@ test('streams and truncates oversized HTTP responses', async () => {
   const address = server.address();
   assert.ok(address && typeof address === 'object');
   try {
-    const result = await requestUrl(`http://127.0.0.1:${address.port}/large`, 'GET', {}, undefined, 5);
+    const result = await requestUrl(
+      `http://127.0.0.1:${address.port}/large`, 'GET', {}, undefined, 5, undefined, true,
+    );
     assert.match(result.body, /响应已截断/);
     assert.ok(Buffer.byteLength(result.body, 'utf8') < 201_000);
   } finally {
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   }
+});
+
+test('redirects do not forward write bodies across origins', async () => {
+  let destinationRequests = 0;
+  const destination = createServer((_request, response) => {
+    destinationRequests += 1;
+    response.end('unexpected');
+  });
+  await new Promise<void>((resolve) => destination.listen(0, '127.0.0.1', resolve));
+  const destinationAddress = destination.address();
+  assert.ok(destinationAddress && typeof destinationAddress === 'object');
+  const origin = createServer((_request, response) => {
+    response.statusCode = 307;
+    response.setHeader('location', `http://127.0.0.1:${destinationAddress.port}/receive`);
+    response.end();
+  });
+  await new Promise<void>((resolve) => origin.listen(0, '127.0.0.1', resolve));
+  const originAddress = origin.address();
+  assert.ok(originAddress && typeof originAddress === 'object');
+  try {
+    await assert.rejects(requestUrl(
+      `http://127.0.0.1:${originAddress.port}/send`, 'POST',
+      { 'x-api-key': 'secret', 'content-type': 'text/plain' }, 'payload', 5, undefined, true,
+    ), /跨源重定向写请求/);
+    assert.equal(destinationRequests, 0);
+  } finally {
+    await Promise.all([
+      new Promise<void>((resolve, reject) => origin.close((error) => error ? reject(error) : resolve())),
+      new Promise<void>((resolve, reject) => destination.close((error) => error ? reject(error) : resolve())),
+    ]);
+  }
+});
+
+test('303 redirects convert POST to a header-clean GET', async () => {
+  const server = createServer((request, response) => {
+    if (request.url === '/start') {
+      response.statusCode = 303;
+      response.setHeader('location', '/finish');
+      response.end();
+      return;
+    }
+    response.end(JSON.stringify({
+      method: request.method,
+      contentLength: request.headers['content-length'],
+      contentType: request.headers['content-type'],
+    }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  assert.ok(address && typeof address === 'object');
+  try {
+    const result = await requestUrl(
+      `http://127.0.0.1:${address.port}/start`, 'POST',
+      { 'content-length': '7', 'content-type': 'text/plain' }, 'payload', 5, undefined, true,
+    );
+    assert.deepEqual(JSON.parse(result.body), { method: 'GET' });
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
+
+test('rejects hexadecimal IPv4-mapped IPv6 loopback targets', async () => {
+  await assert.rejects(
+    requestUrl('http://[::ffff:7f00:1]/', 'GET', {}, undefined, 1),
+    /只允许访问公网地址/,
+  );
 });
 
 test('runs shell commands in the workspace', async () => {
@@ -383,5 +457,19 @@ test('kills background shell children when the Agent task is aborted', async () 
   await new Promise((resolve) => setTimeout(resolve, 400));
 
   assert.equal(result.exitCode, 1);
+  await assert.rejects(access(marker), /ENOENT/);
+});
+
+test('kills background shell children after a successful parent shell exit', async () => {
+  if (process.platform === 'win32') return;
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-shell-success-tree-'));
+  const childScript = path.join(root, 'late-write.cjs');
+  const marker = path.join(root, 'should-not-exist.txt');
+  await writeFile(childScript, "process.on('SIGTERM', () => {}); setTimeout(() => require('node:fs').writeFileSync(process.argv[2], 'late'), 250);\n");
+  const command = `${JSON.stringify(process.execPath)} ${JSON.stringify(childScript)} ${JSON.stringify(marker)} >/dev/null 2>&1 & echo done`;
+
+  const result = await runShellCommand(root, command, 5);
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.stdout.trim(), 'done');
   await assert.rejects(access(marker), /ENOENT/);
 });

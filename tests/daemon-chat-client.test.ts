@@ -17,6 +17,7 @@ import {
 } from '../src/daemon/chat-client.js';
 import { MimiIpcServer } from '../src/daemon/ipc.js';
 import { createMimiMemoryContentChunk, createMimiMemoryPage } from '../src/daemon/service.js';
+import { MIMI_BUILD_VERSION } from '../src/daemon/client-runtime.js';
 import {
   DAEMON_PROTOCOL_VERSION,
   type DaemonStatus,
@@ -49,6 +50,7 @@ test('Mimi chat client uses the daemon owner Session for status and canonical hi
   const calls: Array<{ method: string; params: unknown }> = [];
   const status: DaemonStatus = {
     protocolVersion: DAEMON_PROTOCOL_VERSION,
+    buildVersion: MIMI_BUILD_VERSION,
     permissionMode: 'trusted',
     pid: 42, startedAt: new Date().toISOString(), workerId: 'worker',
     workspaceRoot: root,
@@ -166,6 +168,7 @@ test('Mimi chat client reconnects after a transient Unix socket disconnect and r
   await mkdir(path.dirname(socketPath), { recursive: true });
   const status: DaemonStatus = {
     protocolVersion: DAEMON_PROTOCOL_VERSION,
+    buildVersion: MIMI_BUILD_VERSION,
     permissionMode: 'trusted',
     pid: 42,
     startedAt: new Date().toISOString(),
@@ -437,6 +440,7 @@ test('one-shot daemon CLI honors MIMI_SESSION when selecting its initial Session
   process.env.AGENT_SESSION = 'legacy-session';
   const status: DaemonStatus = {
     protocolVersion: DAEMON_PROTOCOL_VERSION,
+    buildVersion: MIMI_BUILD_VERSION,
     permissionMode: 'trusted',
     pid: 42, startedAt: new Date().toISOString(), workerId: 'worker', workspaceRoot: root,
     activeHostMutations: 0,
@@ -501,6 +505,7 @@ test('Mimi chat client adopts the running daemon workspace when none was explici
     methods.push(method);
     if (method === 'status') return {
       protocolVersion: DAEMON_PROTOCOL_VERSION,
+      buildVersion: MIMI_BUILD_VERSION,
       permissionMode: 'trusted',
       pid: 42, startedAt: new Date().toISOString(), workerId: 'worker', workspaceRoot: daemonWorkspace,
       activeHostMutations: 0,
@@ -610,6 +615,7 @@ test('Mimi chat client upgrades an idle legacy daemon with the adopted Host work
       return {
         ...legacy,
         protocolVersion: DAEMON_PROTOCOL_VERSION,
+        buildVersion: MIMI_BUILD_VERSION,
         workerId: 'current-worker',
       };
     });

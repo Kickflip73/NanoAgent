@@ -228,18 +228,21 @@ test('semantic event ledger prevents a retried model call from creating duplicat
   const store = new MimiStore(path.join(root, 'mimi.db'));
   try {
     const ledger = new ExecutionLedger(path.join(root, 'execution-ledger.json'));
-    const tools = withExecutionLedger(
-      createMimiScheduleTools(store, store.enqueueEvent(event()).event), ledger, () => ({
+    const baseTools = createMimiScheduleTools(store, store.enqueueEvent(event()).event);
+    const identity = () => ({
       sessionId: 'work-followups', runId: 'event:owner-event', semanticCallIds: true,
-      }),
-    );
+    });
+    const tools = withExecutionLedger(baseTools, ledger, identity);
     const selected = tools.find((tool) => tool.name === 'schedule_mimi_follow_up');
     assert.ok(selected && 'invoke' in selected);
     const input = JSON.stringify({
       name: 'one reminder', prompt: 'check once', runAt: new Date(Date.now() + 60_000).toISOString(),
     });
     const first = await selected.invoke(new RunContext({}), input, { toolCall: { callId: 'first-sdk-id' } } as never);
-    const replay = await selected.invoke(new RunContext({}), input, { toolCall: { callId: 'changed-sdk-id' } } as never);
+    const retry = withExecutionLedger(baseTools, ledger, identity)
+      .find((tool) => tool.name === 'schedule_mimi_follow_up');
+    assert.ok(retry && 'invoke' in retry);
+    const replay = await retry.invoke(new RunContext({}), input, { toolCall: { callId: 'changed-sdk-id' } } as never);
     assert.equal((replay as { id: string }).id, (first as { id: string }).id);
     assert.equal(store.listSchedules().length, 1);
   } finally {

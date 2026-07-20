@@ -83,6 +83,72 @@ test('durable inbox deduplicates source events and atomically creates outbox mes
   }
 });
 
+test('malformed queue rows are quarantined without blocking later Event or Outbox work', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-poison-row-'));
+  const databaseFile = path.join(root, 'mimi.db');
+  const store = new MimiStore(databaseFile);
+  const database = new DatabaseSync(databaseFile);
+  try {
+    store.enqueueEvent({ ...envelope('poison-event'), externalId: 'poison-event' });
+    store.enqueueEvent({ ...envelope('healthy-event'), externalId: 'healthy-event' });
+    database.prepare("UPDATE events SET payload_json = '{' WHERE id = 'poison-event'").run();
+
+    assert.equal(store.claimEvent('worker')?.id, 'healthy-event');
+    assert.equal((database.prepare("SELECT status FROM events WHERE id = 'poison-event'").get() as {
+      status: string;
+    }).status, 'dead_letter');
+
+    const healthy = store.getEvent('healthy-event')!;
+    store.completeEvent(healthy.id, 'worker', { ok: true }, 'completed', {
+      route: { channel: 'local' }, payload: { text: 'poison' },
+    });
+    store.enqueueEvent({ ...envelope('outbox-source'), externalId: 'outbox-source' });
+    const source = store.claimEvent('worker')!;
+    store.completeEvent(source.id, 'worker', { ok: true }, 'completed', {
+      route: { channel: 'local' }, payload: { text: 'healthy' },
+    });
+    const poisonOutbox = database.prepare("SELECT id FROM outbox WHERE payload_json LIKE '%poison%'").get() as { id: string };
+    database.prepare('UPDATE outbox SET payload_json = ? WHERE id = ?').run('{', poisonOutbox.id);
+
+    assert.match(JSON.stringify(store.claimOutbox('delivery-worker')?.payload), /healthy/);
+    assert.equal((database.prepare('SELECT status FROM outbox WHERE id = ?').get(poisonOutbox.id) as {
+      status: string;
+    }).status, 'dead_letter');
+  } finally {
+    database.close();
+    store.close();
+  }
+});
+
+test('malformed expired and task-control rows are quarantined without poisoning recovery', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-recovery-poison-row-'));
+  const databaseFile = path.join(root, 'mimi.db');
+  const store = new MimiStore(databaseFile);
+  const database = new DatabaseSync(databaseFile);
+  try {
+    store.enqueueEvent({ ...envelope('expired-poison'), externalId: 'expired-poison', priority: 110 });
+    store.enqueueEvent({ ...envelope('healthy-after-expired'), externalId: 'healthy-after-expired' });
+    assert.equal(store.claimEvent('expired-owner', 1, new Date('2026-07-14T00:00:00.000Z'))?.id, 'expired-poison');
+    database.prepare("UPDATE events SET payload_json = '{' WHERE id = 'expired-poison'").run();
+    assert.equal(store.claimEvent('healthy-owner', 1_000, new Date('2026-07-14T00:00:01.000Z'))?.id, 'healthy-after-expired');
+    assert.equal((database.prepare("SELECT status FROM events WHERE id = 'expired-poison'").get() as { status: string }).status, 'dead_letter');
+
+    store.enqueueEvent({
+      ...envelope('task-control-poison'), externalId: 'task-control-poison',
+      executionLane: 'task', priority: 110,
+    });
+    store.enqueueEvent({
+      ...envelope('healthy-task'), externalId: 'healthy-task', executionLane: 'task',
+    });
+    database.prepare("UPDATE events SET payload_json = '{', task_control = 'pause' WHERE id = 'task-control-poison'").run();
+    assert.equal(store.claimEvent('task-owner', 1_000, new Date('2026-07-14T00:00:02.000Z'), 'task')?.id, 'healthy-task');
+    assert.equal((database.prepare("SELECT status FROM events WHERE id = 'task-control-poison'").get() as { status: string }).status, 'dead_letter');
+  } finally {
+    database.close();
+    store.close();
+  }
+});
+
 test('expired sending leases become uncertain dead letters instead of being replayed', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-outbox-lease-'));
   const store = new MimiStore(path.join(root, 'mimi.db'));
@@ -146,22 +212,65 @@ test('completion deferrals use durable exponential backoff without consuming fai
   const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-completion-deferral-'));
   const store = new MimiStore(path.join(root, 'mimi.db'));
   try {
-    store.enqueueEvent({ ...envelope('gate-task'), externalId: 'gate-task' });
+    store.enqueueEvent({
+      ...envelope('gate-task'), externalId: 'gate-task',
+      payload: { completionGate: { deferrals: 999 } },
+    });
     assert.ok(store.claimEventById('gate-task', 'worker'));
-    const first = store.deferEventForCompletion('gate-task', 'worker', 'missing test evidence');
+    const first = store.deferEventForCompletion('gate-task', 'worker', 'missing test evidence', new Date(), undefined, 'proof-a');
     assert.equal(first.status, 'queued');
     assert.equal(first.attempts, 0);
-    assert.equal((first.payload as { completionGate: { deferrals: number } }).completionGate.deferrals, 1);
+    assert.equal(first.completionDeferrals, 1);
+    assert.equal(first.completionNoProgressDeferrals, 1);
     assert.ok(Date.parse(first.notBefore) >= Date.parse(first.updatedAt) + 900);
 
     assert.ok(store.claimEventById('gate-task', 'worker', 60_000, new Date(first.notBefore)));
-    const second = store.deferEventForCompletion('gate-task', 'worker', 'still missing', new Date(first.notBefore));
+    const second = store.deferEventForCompletion(
+      'gate-task', 'worker', 'new evidence but still missing', new Date(first.notBefore), undefined, 'proof-b',
+    );
     assert.equal(second.status, 'queued');
+    assert.equal(second.completionDeferrals, 2);
+    assert.equal(second.completionNoProgressDeferrals, 1);
     assert.ok(store.claimEventById('gate-task', 'worker', 60_000, new Date(second.notBefore)));
-    const terminal = store.deferEventForCompletion('gate-task', 'worker', 'still missing', new Date(second.notBefore));
+    const third = store.deferEventForCompletion(
+      'gate-task', 'worker', 'same objective state', new Date(second.notBefore), undefined, 'proof-b',
+    );
+    assert.equal(third.status, 'queued');
+    assert.equal(third.completionNoProgressDeferrals, 2);
+    assert.ok(store.claimEventById('gate-task', 'worker', 60_000, new Date(third.notBefore)));
+    const terminal = store.deferEventForCompletion(
+      'gate-task', 'worker', 'wording changed only', new Date(third.notBefore), undefined, 'proof-b',
+    );
     assert.equal(terminal.status, 'dead_letter');
-    assert.equal((terminal.payload as { completionGate: { deferrals: number } }).completionGate.deferrals, 3);
+    assert.equal(terminal.completionDeferrals, 4);
+    assert.equal(terminal.completionNoProgressDeferrals, 3);
     assert.equal(store.listOutbox(10)[0]?.eventId, 'gate-task');
+
+    const retried = store.retryDeadLetterEvent('gate-task');
+    assert.equal(retried.completionDeferrals, 0);
+    assert.equal(retried.completionNoProgressDeferrals, 0);
+  } finally {
+    store.close();
+  }
+});
+
+test('a claimed event binds its resolved Session once and claim skips active Sessions', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-event-session-owner-'));
+  const store = new MimiStore(path.join(root, 'mimi.db'));
+  try {
+    store.enqueueEvent({ ...envelope('session-owner'), sessionKey: undefined });
+    const claimed = store.claimEventById('session-owner', 'worker')!;
+    assert.equal(claimed.sessionKey, undefined);
+    assert.equal(store.bindRunningEventSession(claimed.id, 'worker', 'mimi-fixed-session').sessionKey, 'mimi-fixed-session');
+    const queued = store.preemptEvent(claimed.id, 'worker', 'wait');
+    assert.equal(queued.status, 'queued');
+    assert.equal(store.claimEvent('other', 60_000, new Date(queued.notBefore), undefined, 5, ['mimi-fixed-session']), undefined);
+
+    const reclaimed = store.claimEventById(claimed.id, 'worker', 60_000, new Date(queued.notBefore))!;
+    assert.throws(
+      () => store.bindRunningEventSession(reclaimed.id, 'worker', 'mimi-different-session'),
+      /拒绝切换/,
+    );
   } finally {
     store.close();
   }
@@ -243,7 +352,7 @@ test('expired event leases recover and failed work uses bounded retry', async ()
   }
 });
 
-test('lease recovery honors the caller configured attempt limit', async () => {
+test('lease recovery honors the attempt limit fixed by the first claim', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-retry-limit-'));
   const store = new MimiStore(path.join(root, 'mimi.db'));
   try {
@@ -252,9 +361,20 @@ test('lease recovery honors the caller configured attempt limit', async () => {
       'single-attempt', 'dead-worker', 1_000, new Date('2026-07-14T00:00:01.000Z'), 1,
     ));
     assert.equal(store.claimEvent(
-      'recovery-worker', 60_000, new Date('2026-07-14T00:00:03.000Z'), undefined, 1,
+      'recovery-worker', 60_000, new Date('2026-07-14T00:00:03.000Z'), undefined, 5,
     ), undefined);
     assert.equal(store.getEvent('single-attempt')?.status, 'dead_letter');
+    assert.equal(store.getEvent('single-attempt')?.maxAttempts, 1);
+
+    store.enqueueEvent({ ...envelope('five-attempts'), externalId: 'five-attempts' });
+    assert.ok(store.claimEventById(
+      'five-attempts', 'other-dead-worker', 1_000, new Date('2026-07-14T00:00:04.000Z'), 5,
+    ));
+    assert.equal(store.claimEvent(
+      'strict-recovery-worker', 60_000, new Date('2026-07-14T00:00:06.000Z'), undefined, 1,
+    ), undefined);
+    assert.equal(store.getEvent('five-attempts')?.status, 'queued');
+    assert.equal(store.getEvent('five-attempts')?.maxAttempts, 5);
   } finally {
     store.close();
   }
@@ -1200,7 +1320,7 @@ test('new stores use the minimal open-permission schema', async () => {
   const database = new DatabaseSync(file, { readOnly: true });
   try {
     const version = database.prepare('PRAGMA user_version').get() as { user_version: number };
-    assert.equal(version.user_version, 9);
+    assert.equal(version.user_version, 11);
     const eventColumns = new Set((database.prepare('PRAGMA table_info(events)').all() as Array<{ name: string }>)
       .map((column) => column.name));
     assert.equal(eventColumns.has('task_control'), true);
@@ -1220,7 +1340,7 @@ test('new stores use the minimal open-permission schema', async () => {
   }
 });
 
-test('legacy databases migrate to v9 without dropping historical tables', async () => {
+test('legacy databases migrate to v11 without dropping historical tables', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-schema-legacy-'));
   const file = path.join(root, 'mimi.db');
   const legacy = new DatabaseSync(file);
@@ -1235,7 +1355,7 @@ test('legacy databases migrate to v9 without dropping historical tables', async 
   store.close();
   const migrated = new DatabaseSync(file, { readOnly: true });
   try {
-    assert.equal((migrated.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 9);
+    assert.equal((migrated.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 11);
     assert.ok(migrated.prepare("SELECT name FROM sqlite_master WHERE name = 'events'").get());
     assert.equal((migrated.prepare('SELECT id FROM approvals').get() as { id: string }).id, 'historical-approval');
   } finally {
@@ -1300,7 +1420,7 @@ test('v8 owner/system schedules gain durable roots while unrooted external sched
   }
   const migrated = new DatabaseSync(file, { readOnly: true });
   try {
-    assert.equal((migrated.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 9);
+    assert.equal((migrated.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 11);
     const columns = new Set((migrated.prepare('PRAGMA table_info(schedules)').all() as Array<{ name: string }>)
       .map((column) => column.name));
     assert.equal(columns.has('authority_event_id'), true);
@@ -1322,7 +1442,7 @@ test('v1 databases receive current digest tables without legacy permission migra
   store.close();
   const migrated = new DatabaseSync(file, { readOnly: true });
   try {
-    assert.equal((migrated.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 9);
+    assert.equal((migrated.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 11);
     assert.ok(migrated.prepare("SELECT name FROM sqlite_master WHERE name = 'digest_retention_idx'").get());
     assert.ok(migrated.prepare("SELECT name FROM sqlite_master WHERE name = 'digest_items'").get());
     assert.ok(migrated.prepare("SELECT name FROM sqlite_master WHERE name = 'attention_state'").get());
@@ -1356,7 +1476,7 @@ test('v5 stores gain every retention index without changing data', async () => {
   migratedStore.close();
   const migrated = new DatabaseSync(file, { readOnly: true });
   try {
-    assert.equal((migrated.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 9);
+    assert.equal((migrated.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 11);
     for (const index of [
       'events_retention_idx', 'runs_event_status_idx', 'outbox_retention_idx', 'audit_retention_idx',
       'schedules_retention_idx', 'digest_retention_idx', 'attention_retention_idx',

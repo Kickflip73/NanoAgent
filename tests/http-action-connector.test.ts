@@ -106,12 +106,19 @@ test('generic HTTP action connector pulls cursor events and forwards deliveries 
   const next = outputReader(child);
   try {
     assert.deepEqual(await next(), {
+      type: 'status', inbound: 'ready', outbound: 'ready',
+      deliveryConfirmed: true, eventAcknowledgement: true,
+    });
+    assert.deepEqual(await next(), {
       type: 'event', externalId: 'wechat-message-1', kind: 'command', payload: { text: '帮我处理' },
       occurredAt: '2026-07-15T00:00:00.000Z', priority: 88,
       actor: { id: 'person-1', displayName: 'Alice' },
       conversation: { id: 'chat-7', threadId: 'thread-2' },
       replyTarget: 'wechat:chat-7',
     });
+    child.stdin.write(`${JSON.stringify({
+      type: 'event_ack', externalId: 'wechat-message-1', ok: true, eventId: 'host-event-1',
+    })}\n`);
     assert.equal(eventRequests[0]?.authorization, 'Bearer relay-secret');
     assert.match(eventRequests[0]?.url ?? '', /limit=100/);
     await waitUntil(() => eventRequests.length >= 2);
@@ -191,6 +198,7 @@ test('generic HTTP event polling reports one outage and recovery while continuin
   });
   const next = outputReader(child);
   try {
+    assert.equal((await next()).type, 'status');
     const offline = await next();
     assert.equal(offline.type, 'event');
     assert.equal(offline.kind, 'alert');

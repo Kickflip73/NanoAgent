@@ -977,13 +977,32 @@ test('briefings leave excess digest rows for later bounded batches', async () =>
     }
     const briefing = attention.forceBriefing(new Date('2026-07-15T08:30:00Z'))!;
     const payload = briefing.payload as { prompt: string; digestItemIds: string[] };
-    assert.equal(payload.digestItemIds.length, 20);
-    assert.ok(payload.prompt.length < 45_000);
+    assert.ok(payload.digestItemIds.length > 0 && payload.digestItemIds.length < 25);
+    assert.ok(payload.prompt.length <= 48_000);
     assert.equal(store.pendingDigestCount(), 25);
 
     const claimed = store.claimEventById(briefing.id, 'briefing-worker')!;
     store.completeEvent(claimed.id, 'briefing-worker', { answer: 'done' });
-    assert.equal(store.pendingDigestCount(), 5);
+    assert.equal(store.pendingDigestCount(), 25 - payload.digestItemIds.length);
+  } finally {
+    store.close();
+  }
+});
+
+test('briefings take the configured item count when short entries fit the prompt budget', async () => {
+  const { store, attention } = await setup(config({
+    briefings: { enabled: true, times: ['08:30'], maxItems: 100 },
+  }));
+  try {
+    for (let index = 0; index < 100; index += 1) {
+      const id = `short-${index}`;
+      store.enqueueEvent(envelope(id, { payload: { text: `short item ${index}` } }));
+      store.digestEvent(store.claimEventById(id, 'worker')!.id, 'worker', 'later');
+    }
+    const briefing = attention.forceBriefing(new Date('2026-07-15T08:30:00Z'))!;
+    const payload = briefing.payload as { prompt: string; digestItemIds: string[] };
+    assert.equal(payload.digestItemIds.length, 100);
+    assert.ok(payload.prompt.length <= 48_000);
   } finally {
     store.close();
   }

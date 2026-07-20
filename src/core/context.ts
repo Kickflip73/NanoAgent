@@ -33,6 +33,10 @@ export interface RequestBudget {
   inputBudget: number;
 }
 
+export class ContextProtocolBudgetError extends Error {
+  readonly name = 'ContextProtocolBudgetError';
+}
+
 export function estimateTokens(value: unknown): number {
   const text = typeof value === 'string' ? value : JSON.stringify(value);
   if (!text) return 0;
@@ -260,20 +264,57 @@ export class ContextManager {
       }
     }
     const currentTurn = input.slice(Math.max(0, currentTurnStart));
-    const compacted = currentTurn.map((item) => {
+    const fields: Array<{ index: number; key: 'content' | 'output'; text: string }> = [];
+    currentTurn.forEach((item, index) => {
       const value = item as unknown as Record<string, unknown>;
-      if (value.type !== 'function_call_result') return item;
-      const output = typeof value.output === 'string' ? value.output : JSON.stringify(value.output ?? '');
-      return { ...value, output: this.fitTokens(output, Math.max(64, Math.floor(tokenBudget / 3))) } as AgentInputItem;
+      if ('role' in item && item.role === 'user' && typeof value.content === 'string') {
+        fields.push({ index, key: 'content', text: value.content });
+        return;
+      }
+      if (value.type === 'function_call_result') {
+        const output = typeof value.output === 'string' ? value.output : JSON.stringify(value.output ?? '');
+        fields.push({ index, key: 'output', text: output });
+      }
     });
-    if (estimateTokens(compacted) <= tokenBudget) return compacted;
-    const user = currentTurn.find((item) => 'role' in item && item.role === 'user');
-    if (user && 'content' in user && typeof user.content === 'string') {
-      const empty = { ...user, content: '' } as AgentInputItem;
-      const contentBudget = Math.max(0, tokenBudget - estimateTokens([empty]));
-      return [{ ...user, content: this.fitTokens(user.content, contentBudget) } as AgentInputItem];
+    const skeleton = currentTurn.map((item, index) => {
+      const field = fields.find((candidate) => candidate.index === index);
+      return field
+        ? { ...(item as unknown as Record<string, unknown>), [field.key]: '' } as AgentInputItem
+        : item;
+    });
+    if (estimateTokens(skeleton) > tokenBudget) {
+      throw new ContextProtocolBudgetError(
+        '当前工具调用协议单元即使压缩结果后仍超过上下文预算；已停止而不是删除调用结果后重做工具',
+      );
     }
-    return [];
+    if (!fields.length) return skeleton;
+    const available = Math.max(0, tokenBudget - estimateTokens(skeleton));
+    const build = (scale: number): AgentInputItem[] => {
+      const perField = Math.floor((available * scale) / fields.length);
+      return currentTurn.map((item, index) => {
+        const field = fields.find((candidate) => candidate.index === index);
+        return field
+          ? {
+              ...(item as unknown as Record<string, unknown>),
+              [field.key]: this.fitTokens(field.text, perField),
+            } as AgentInputItem
+          : item;
+      });
+    };
+    let low = 0;
+    let high = 1;
+    let fitted = skeleton;
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const middle = (low + high) / 2;
+      const candidate = build(middle);
+      if (estimateTokens(candidate) <= tokenBudget) {
+        fitted = candidate;
+        low = middle;
+      } else {
+        high = middle;
+      }
+    }
+    return fitted;
   }
 
   private compactItem(item: AgentInputItem): string {

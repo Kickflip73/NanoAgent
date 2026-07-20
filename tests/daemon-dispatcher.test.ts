@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import { RunContext, type RunStreamEvent, type Tool } from '@openai/agents';
+import { CompletionGateError } from '../src/core/completion.js';
 import { AttentionEngine } from '../src/daemon/attention.js';
 import type { ConnectorManager } from '../src/daemon/connectors.js';
 import { eventFailureAttemptLimit, MimiDispatcher } from '../src/daemon/dispatcher.js';
@@ -39,12 +40,12 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
   return { promise, resolve };
 }
 
-function enqueueOutbox(store: MimiStore, id: string, channel: string): string {
+function enqueueOutbox(store: MimiStore, id: string, channel: string, target = 'owner'): string {
   const eventId = `${id}-event`;
   store.enqueueEvent(event(eventId, `prepare ${id}`, 90));
   const claimed = store.claimEventById(eventId, `setup-${id}`)!;
   store.completeEvent(claimed.id, `setup-${id}`, { answer: 'prepared' }, 'completed', {
-    route: { channel, target: 'owner' },
+    route: { channel, target },
     payload: { text: id },
   });
   const outgoing = store.listOutbox().find((message) => message.eventId === eventId);
@@ -194,7 +195,7 @@ test('daemon loop keeps one writer per Session without starving another Session'
     const fifoDeferrals = store.activitySnapshot(100).recentTransitions.filter((transition) => (
       transition.type === 'event.preempted' && transition.entityId === 'fair-a-2'
     ));
-    assert.equal(fifoDeferrals.length, 1);
+    assert.equal(fifoDeferrals.length, 0);
 
     releaseB();
     releaseFirstA();
@@ -614,7 +615,7 @@ test('a slow Outbox delivery does not block admission of a new Conversation Even
   }
 });
 
-test('the daemon loop runs at most one Outbox delivery concurrently', async () => {
+test('the daemon loop runs at most one Outbox delivery per route', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-dispatcher-delivery-slot-'));
   const store = new MimiStore(path.join(root, 'mimi.db'));
   const attention = await AttentionEngine.load(path.join(root, 'assistant.json'), store);
@@ -678,6 +679,41 @@ test('a blocked connector channel does not hold up another Outbox channel', asyn
   });
   const slowId = enqueueOutbox(store, 'delivery-lane-qq', 'connector:qq');
   const fastId = enqueueOutbox(store, 'delivery-lane-wechat', 'connector:wechat');
+  const dispatcher = new MimiDispatcher(store, {} as MimiAgent, attention, notifier, undefined, { pollMs: 1 });
+  try {
+    dispatcher.start();
+    await waitUntil(() => slowStarted && fastDelivered);
+    assert.equal(store.getOutbox(slowId)?.status, 'sending');
+    assert.equal(store.getOutbox(fastId)?.status, 'sent');
+    slowGate.resolve();
+    await waitUntil(() => store.getOutbox(slowId)?.status === 'sent');
+  } finally {
+    slowGate.resolve();
+    await dispatcher.stop();
+    store.close();
+  }
+});
+
+test('a blocked Connector target does not hold up another target on the same channel', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-dispatcher-delivery-target-lanes-'));
+  const store = new MimiStore(path.join(root, 'mimi.db'));
+  const attention = await AttentionEngine.load(path.join(root, 'assistant.json'), store);
+  const notifier = new NotifierRegistry();
+  const slowGate = deferred();
+  let slowStarted = false;
+  let fastDelivered = false;
+  notifier.register('connector:qq', {
+    deliver: async (message) => {
+      if (message.target === 'group:slow') {
+        slowStarted = true;
+        await slowGate.promise;
+      } else {
+        fastDelivered = true;
+      }
+    },
+  });
+  const slowId = enqueueOutbox(store, 'delivery-target-slow', 'connector:qq', 'group:slow');
+  const fastId = enqueueOutbox(store, 'delivery-target-fast', 'connector:qq', 'single:fast');
   const dispatcher = new MimiDispatcher(store, {} as MimiAgent, attention, notifier, undefined, { pollMs: 1 });
   try {
     dispatcher.start();
@@ -1988,6 +2024,155 @@ test('background input request atomically blocks the task and creates a notifica
     assert.equal(notification?.eventId, 'block-for-input');
     assert.match(JSON.stringify(notification?.payload), /background_task_blocked/);
     assert.match(JSON.stringify(notification?.payload), /测试环境的访问地址/);
+  } finally {
+    await host.close();
+    store.close();
+  }
+});
+
+test('an uncertain Completion Gate result is terminal and never automatically replayed', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-dispatcher-uncertain-gate-'));
+  const store = new MimiStore(path.join(root, 'mimi.db'));
+  const attention = await AttentionEngine.load(path.join(root, 'assistant.json'), store);
+  let runs = 0;
+  const agent = {
+    currentSessionId: ownerSessionId(), switchSession: async () => undefined,
+    sessionSnapshot: async () => { throw new Error('unused'); }, listSessionSummaries: async () => [],
+    close: async () => undefined,
+  } as unknown as MimiAgent;
+  const host = new MimiHost(agent, {
+    execute: async () => {
+      runs += 1;
+      throw new CompletionGateError({
+        decision: 'uncertain', reason: 'connector outcome uncertain', unmetCriteria: ['sent'],
+      }, 'same-evidence');
+    },
+  });
+  const dispatcher = new MimiDispatcher(store, host, attention);
+  try {
+    store.enqueueEvent(event('uncertain-gate', '发送消息', 100));
+    await dispatcher.processOnce();
+    assert.equal(runs, 1);
+    assert.equal(store.getEvent('uncertain-gate')?.status, 'dead_letter');
+    assert.equal(store.getEvent('uncertain-gate')?.completionDeferrals, 1);
+  } finally {
+    await host.close();
+    store.close();
+  }
+});
+
+test('three identical tool calls and results terminate one run as a no-progress loop', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-dispatcher-tool-loop-'));
+  const store = new MimiStore(path.join(root, 'mimi.db'));
+  const attention = await AttentionEngine.load(path.join(root, 'assistant.json'), store);
+  const agent = {
+    currentSessionId: ownerSessionId(), switchSession: async () => undefined,
+    sessionSnapshot: async () => { throw new Error('unused'); }, listSessionSummaries: async () => [],
+    close: async () => undefined,
+  } as unknown as MimiAgent;
+  const host = new MimiHost(agent, {
+    execute: async (request, observer) => {
+      for (let index = 0; index < 3; index += 1) {
+        await observer?.onStreamEvent?.({
+          type: 'run_item_stream_event', name: 'tool_called',
+          item: { rawItem: { name: 'connector_action', arguments: '{"same":true}' } },
+        } as RunStreamEvent);
+        await observer?.onStreamEvent?.({
+          type: 'run_item_stream_event', name: 'tool_output',
+          item: { rawItem: { name: 'connector_action' }, output: { outcome: 'confirmed', messageId: 'one' } },
+        } as RunStreamEvent);
+      }
+      request.signal?.throwIfAborted();
+      return { answer: 'should not complete', effects: [] };
+    },
+  });
+  const dispatcher = new MimiDispatcher(store, host, attention);
+  try {
+    store.enqueueEvent(event('tool-loop', '发送消息', 100));
+    await dispatcher.processOnce();
+    assert.equal(store.getEvent('tool-loop')?.status, 'dead_letter');
+    assert.equal(store.getEvent('tool-loop')?.attempts, 1);
+    assert.match(store.getEvent('tool-loop')?.error ?? '', /无进展循环/);
+  } finally {
+    await host.close();
+    store.close();
+  }
+});
+
+test('three repeated five-tool cycles terminate one run as a no-progress loop', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-dispatcher-long-tool-loop-'));
+  const store = new MimiStore(path.join(root, 'mimi.db'));
+  const attention = await AttentionEngine.load(path.join(root, 'assistant.json'), store);
+  const agent = {
+    currentSessionId: ownerSessionId(), switchSession: async () => undefined,
+    sessionSnapshot: async () => { throw new Error('unused'); }, listSessionSummaries: async () => [],
+    close: async () => undefined,
+  } as unknown as MimiAgent;
+  const host = new MimiHost(agent, {
+    execute: async (request, observer) => {
+      for (let cycle = 0; cycle < 3; cycle += 1) {
+        for (let index = 0; index < 5; index += 1) {
+          await observer?.onStreamEvent?.({
+            type: 'run_item_stream_event', name: 'tool_called',
+            item: { rawItem: { name: `tool_${index}`, arguments: `{"index":${index}}` } },
+          } as RunStreamEvent);
+          await observer?.onStreamEvent?.({
+            type: 'run_item_stream_event', name: 'tool_output',
+            item: { rawItem: { name: `tool_${index}` }, output: { ok: true, index } },
+          } as RunStreamEvent);
+        }
+      }
+      request.signal?.throwIfAborted();
+      return { answer: 'should not complete', effects: [] };
+    },
+  });
+  const dispatcher = new MimiDispatcher(store, host, attention);
+  try {
+    store.enqueueEvent(event('long-tool-loop', '重复五工具链', 100));
+    await dispatcher.processOnce();
+    assert.equal(store.getEvent('long-tool-loop')?.status, 'dead_letter');
+    assert.match(store.getEvent('long-tool-loop')?.error ?? '', /无进展循环/);
+  } finally {
+    await host.close();
+    store.close();
+  }
+});
+
+test('persisted confirmed Connector evidence suppresses final delivery after a pre-receipt crash', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-dispatcher-ledger-delivery-'));
+  const store = new MimiStore(path.join(root, 'mimi.db'));
+  const attention = await AttentionEngine.load(path.join(root, 'assistant.json'), store);
+  const agent = {
+    currentSessionId: ownerSessionId(), switchSession: async () => undefined,
+    sessionSnapshot: async () => { throw new Error('unused'); }, listSessionSummaries: async () => [],
+    finalizeExecutionLedger: async () => undefined, close: async () => undefined,
+  } as unknown as MimiAgent;
+  const host = new MimiHost(agent, {
+    execute: async (request) => {
+      const delivery = await request.options?.completionDelivery?.([{
+        sessionId: ownerSessionId(), runId: 'event:ledger-send', toolName: 'connector_action',
+        callId: 'semantic-send', argumentsJson: '{}', status: 'succeeded',
+        output: {
+          tool: 'connector_action', connector: 'qq', action: 'send_message', target: 'single:42',
+          outcome: 'confirmed', operationId: 'message-1', occurredAt: new Date().toISOString(),
+        },
+      }]);
+      return { answer: 'sent already', effects: [], delivery };
+    },
+  });
+  const dispatcher = new MimiDispatcher(store, host, attention);
+  try {
+    store.enqueueEvent({
+      ...event('ledger-send', '发送QQ消息', 100),
+      replyRoute: { channel: 'connector:qq', target: 'single:42' },
+    });
+    await dispatcher.processOnce();
+    assert.equal(store.getEvent('ledger-send')?.status, 'completed');
+    assert.deepEqual((store.getEvent('ledger-send')?.result as { delivery?: unknown }).delivery, {
+      suppressed: true,
+      reason: '执行账本确认已通过同一 Connector 会话发送，抑制重复最终投递',
+    });
+    assert.equal(store.listOutbox().some((message) => message.eventId === 'ledger-send'), false);
   } finally {
     await host.close();
     store.close();

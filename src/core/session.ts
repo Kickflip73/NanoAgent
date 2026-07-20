@@ -29,6 +29,7 @@ export interface RunCheckpoint {
     reason: string;
     unmetCriteria: string[];
   };
+  goalCreatedAt?: string;
   ownerId?: string;
   ownerPid?: number;
   historyStart?: number;
@@ -47,6 +48,7 @@ export interface ContextArchive {
 
 export interface SessionPreferences {
   mode?: string;
+  provider?: 'openai' | 'deepseek';
   model?: string;
   outputLevel?: string;
 }
@@ -82,6 +84,7 @@ const sessionFileSchema = z.object({
       reason: z.string(),
       unmetCriteria: z.array(z.string()),
     }).strict().optional(),
+    goalCreatedAt: z.string().optional(),
     ownerId: z.string().optional(),
     ownerPid: z.number().int().positive().optional(),
     historyStart: z.number().int().nonnegative().optional(),
@@ -98,6 +101,7 @@ const sessionFileSchema = z.object({
   }).optional(),
   preferences: z.object({
     mode: z.string().optional(),
+    provider: z.enum(['openai', 'deepseek']).optional(),
     model: z.string().optional(),
     outputLevel: z.string().optional(),
   }).optional(),
@@ -300,6 +304,26 @@ export class FileSession implements Session {
         ...session.checkpoint,
         ...update,
         phase: update.completionGate ? '验收检查' : session.checkpoint.phase,
+        updatedAt: new Date().toISOString(),
+      };
+      session.updatedAt = session.checkpoint.updatedAt;
+      return { result: { ...session.checkpoint }, changed: true };
+    });
+  }
+
+  async updateRunGoalOwnership(
+    goalCreatedAt: string | undefined,
+    expectedRunId?: string,
+  ): Promise<RunCheckpoint | undefined> {
+    return this.mutateWhen((session) => {
+      if (!session.checkpoint
+        || session.checkpoint.status !== 'running'
+        || (expectedRunId && session.checkpoint.runId !== expectedRunId)) {
+        return { result: session.checkpoint ? { ...session.checkpoint } : undefined, changed: false };
+      }
+      session.checkpoint = {
+        ...session.checkpoint,
+        goalCreatedAt,
         updatedAt: new Date().toISOString(),
       };
       session.updatedAt = session.checkpoint.updatedAt;

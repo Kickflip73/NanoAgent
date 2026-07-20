@@ -32,13 +32,13 @@ owner 也可先调用 `get_mimi_settings` 读取完整快照，再用 `update_mi
 
 抢占只发生在模型思考阶段。任何 Function Tool、MCP Tool、Connector action、Outbox delivery 或 SQLite 事务在途时都不会被中断；工具输出后若紧急事件仍在队列，下一次检查立即中止模型 Run。原 Event 原子恢复为 queued，本次 claim 不计失败 attempt，关联 Host Run 记为 interrupted。它之后使用相同 Event ID 和 execution ledger 续跑，因此已经成功记录的相同副作用不会重复执行。
 
-系统仍只有一个 Dispatcher 和一个 MimiAgent。抢占不会并发运行两个 Session，也没有第二条紧急队列；紧急 Event 只是由既有 `priority DESC, received_at ASC` 顺序先执行。相同或更低 priority 不互相抢占，避免同等级事件抖动。
+系统仍只有一个 Dispatcher 和一个 MimiAgent。Event 第一次通过策略解析出实际 Session 后，会在持有事件租约时把该 Session 原子绑定到 Event；后续重试、配置热更新和进程重启都不能把同一 Event 切到另一 Session，从而保持 transcript、Goal 和 execution ledger 的幂等边界。同 Session 的排队项在 claim SQL 中直接避开活动 Session，不再靠反复 claim/requeue 制造 SQLite 状态抖动。抢占不会并发运行两个相同 Session，也没有第二条紧急队列；紧急 Event 只是由既有 `priority DESC, received_at ASC` 顺序先执行。相同或更低 priority 不互相抢占，避免同等级事件抖动。
 
 ## 无进展回收与优雅停机
 
 `execution.runIdleTimeoutMs` 限制一次 Agent Run 连续没有模型流事件或 Runtime Event 的时间，默认 1200000ms（20 分钟），可配置 60000ms 至 86400000ms。它不是任务总时长：仍在输出、调用工具或记录运行进展的长任务可以继续工作。修改后执行 `daemon attention reload`，下一次 Run 使用新值，`daemon attention` 的 `execution` 字段可核对当前值。
 
-最后一个 Tool 执行期间 watchdog 暂停，输出返回后才重新计时，避免中途切断结果不确定的文件、Shell、MCP 或 Connector 事务。Tool 自身仍使用各自的 timeout/cancel 边界。模型无进展超时则通过现有 AbortSignal 进入普通 retry/dead-letter/最终失败通知流程；Daemon 正常停止会先等待在途 Tool 返回，再中止模型，且不计失败 attempt，Event 立即恢复 queued，Host Run 记为 interrupted。
+最后一个 Tool 执行期间 watchdog 暂停，输出返回后才重新计时，避免中途切断结果不确定的文件、Shell、MCP 或 Connector 事务。Tool 自身仍使用各自的 timeout/cancel 边界。除此之外，Dispatcher 会规范化并记录工具名、参数和结果；同一调用重复得到同一结果三次时，在工具安全边界终止该 Run，并把它视为不可自动重试的无进展循环。模型无流量超时仍通过现有 AbortSignal 进入普通 retry/dead-letter/最终失败通知流程；Daemon 正常停止会先等待在途 Tool 返回，再中止模型，且不计失败 attempt，Event 立即恢复 queued，Host Run 记为 interrupted。
 
 ## 长期历史保留
 
@@ -264,7 +264,7 @@ mimi daemon digest 50
 mimi daemon brief
 ```
 
-到达配置时间后，Daemon 会把尚未归档的摘要合并成一个内部 briefing 事件。简报成功完成后才会把这些摘要标为已归档；如果运行最终进入 dead letter，下一次简报会自动重新领取它们。每个计划简报时点有持久 checkpoint，重启不会重复生成同一批简报。
+到达配置时间后，Daemon 会把尚未归档的摘要合并成一个内部 briefing 事件。批次按实际序列化 prompt 的字符预算动态选择：短项可取满 `maxItems`，大项只取能完整放入预算的前缀，剩余项继续保持未领取。简报成功完成后才会把这些摘要标为已归档；如果运行最终进入 dead letter，下一次简报会自动重新领取它们。每个计划简报时点有持久 checkpoint，重启不会重复生成同一批简报。
 
 owner 也可以直接说“现在给我汇总一下”。`request_mimi_briefing` 会原子领取当前待处理摘要并创建同样的普通 briefing Event；工具结果只包含创建状态和路由元数据，不返回其他 Event 正文。
 

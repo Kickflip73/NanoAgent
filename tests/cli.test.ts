@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { MimiIpcServer } from '../src/daemon/ipc.js';
+import { MIMI_BUILD_VERSION } from '../src/daemon/client-runtime.js';
 import { DAEMON_PROTOCOL_VERSION, type StoredEvent } from '../src/daemon/types.js';
 
 test('prints MimiAgent help and version without requiring an API key', () => {
@@ -77,6 +78,7 @@ test('default one-shot CLI talks to the running MimiHost instead of creating a s
     methods.push(method);
     if (method === 'status') return {
       protocolVersion: DAEMON_PROTOCOL_VERSION,
+      buildVersion: MIMI_BUILD_VERSION,
       permissionMode: 'trusted',
       pid: 123, startedAt: now, workerId: 'worker',
       workspaceRoot: process.cwd(),

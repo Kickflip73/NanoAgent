@@ -54,10 +54,16 @@ test('completion gate requires a contract and an explicit completion report', ()
 });
 
 test('completion gate stays off for pure answers and goals stay explicit', () => {
-  for (const input of ['请问今天天气怎么样', '帮我解释闭包', '翻译 hello', '分析这段错误日志', '检查这份方案']) {
+  for (const input of [
+    '请问今天天气怎么样', '帮我解释闭包', '翻译 hello', '分析这段错误日志', '检查这份方案',
+    '这是链路测试。不要调用任何工具，仅回复：MIMI_AUDIT_OK',
+  ]) {
     assert.equal(requiresCompletionContract(input), false, input);
   }
-  for (const input of ['发送微信消息', '修复登录页', '运行测试', '导出报告']) {
+  for (const input of [
+    '发送微信消息', '修复登录页', '运行测试', '导出报告', 'Move report.md to docs',
+    'Copy a.txt to b.txt', 'Commit and push the current changes',
+  ]) {
     assert.equal(requiresCompletionContract(input), true, input);
   }
   assert.equal(requiresPersistentGoal('修复登录页'), false);
@@ -74,22 +80,42 @@ test('completion gate accepts verified external action receipts', () => {
   assert.equal(evaluateCompletion(contract, report, actionEvidence('accepted')).decision, 'uncertain');
 });
 
-test('artifact evidence accepts a successful shell-generated artifact', () => {
+test('artifact evidence requires a structured mutation from the current run', () => {
   const artifact: CompletionContract = {
     objective: 'generate report',
     kind: 'artifact',
     criteria: [{
       id: 'report', description: 'report exists', requiredEvidence: 'artifact',
-      expectedTool: 'run_shell', expectedArgumentsContain: ['report.md'],
+      expectedTool: 'read_file', expectedArgumentsContain: ['report.md'],
     }],
   };
   assert.equal(evaluateCompletion(artifact, {
     status: 'completed',
     proofs: [{ criterionId: 'report', evidence: 'generated', toolCallIds: ['shell-1'] }],
   }, [{
-    toolName: 'run_shell', callId: 'shell-1', argumentsJson: 'touch report.md',
-    status: 'succeeded', output: { exitCode: 0 },
+    toolName: 'read_file', callId: 'shell-1', argumentsJson: '{"path":"report.md"}',
+    status: 'succeeded', output: '# report',
+  }]).decision, 'continue');
+  assert.equal(evaluateCompletion({
+    ...artifact,
+    criteria: [{ ...artifact.criteria[0]!, expectedTool: 'write_file' }],
+  }, {
+    status: 'completed',
+    proofs: [{ criterionId: 'report', evidence: 'generated', toolCallIds: ['write-1'] }],
+  }, [{
+    toolName: 'write_file', callId: 'write-1', argumentsJson: '{"path":"report.md"}',
+    status: 'succeeded', output: { path: 'report.md' },
   }]).decision, 'pass');
+  assert.equal(evaluateCompletion({
+    ...artifact,
+    criteria: [{ ...artifact.criteria[0]!, expectedTool: 'run_shell' }],
+  }, {
+    status: 'completed',
+    proofs: [{ criterionId: 'report', evidence: 'claimed', toolCallIds: ['shell-1'] }],
+  }, [{
+    toolName: 'run_shell', callId: 'shell-1', argumentsJson: 'echo report.md',
+    status: 'succeeded', output: { exitCode: 0 },
+  }]).decision, 'continue');
 });
 
 test('completion contract requires objective evidence for side effects and artifacts', () => {
@@ -113,6 +139,19 @@ test('completion gate never accepts uncertain or failed external actions', () =>
   const failed = evaluateCompletion(contract, report, actionEvidence('failed'));
   assert.equal(failed.decision, 'continue');
   assert.deepEqual(failed.unmetCriteria, ['message-sent']);
+});
+
+test('completion gate waits for every owned Plan and Team task', () => {
+  const gate = evaluateCompletion(
+    contract,
+    report,
+    actionEvidence('confirmed'),
+    ['verify'],
+    false,
+    ['review'],
+  );
+  assert.equal(gate.decision, 'continue');
+  assert.deepEqual(gate.unmetCriteria, ['plan:verify', 'team:review']);
 });
 
 test('completion gate rejects unstructured or forged external receipts', () => {

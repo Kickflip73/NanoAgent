@@ -61,6 +61,10 @@ export interface StoredEvent extends EventEnvelope {
   taskControlReason?: string;
   status: EventStatus;
   attempts: number;
+  maxAttempts?: number;
+  completionDeferrals?: number;
+  completionNoProgressDeferrals?: number;
+  completionProgressFingerprint?: string;
   notBefore: string;
   leaseOwner?: string;
   leaseUntil?: string;
@@ -185,7 +189,7 @@ export interface MimiSchedulePage {
   total: number;
 }
 
-export const DAEMON_PROTOCOL_VERSION = 5;
+export const DAEMON_PROTOCOL_VERSION = 6;
 
 export interface DaemonTaskWorkerStatus {
   taskId: string;
@@ -196,6 +200,7 @@ export interface DaemonTaskWorkerStatus {
 
 export interface DaemonStatus {
   protocolVersion: number;
+  buildVersion?: string;
   permissionMode?: AgentPermissionMode;
   pid: number;
   startedAt: string;

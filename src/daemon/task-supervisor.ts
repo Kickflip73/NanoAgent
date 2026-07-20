@@ -68,7 +68,11 @@ export function taskWorkerEnvironment(
   redactEnvironmentKeys: readonly string[] = [],
 ): NodeJS.ProcessEnv {
   const redacted = new Set(redactEnvironmentKeys.map((key) => key.toUpperCase()));
-  return Object.fromEntries(Object.entries(restrictedTaskShellEnvironment(source))
+  const bounded = {
+    ...restrictedTaskShellEnvironment(source),
+    ...Object.fromEntries(Object.entries(source).filter(([name]) => name.startsWith('TASK_WORKER_'))),
+  };
+  return Object.fromEntries(Object.entries(bounded)
     .filter(([name]) => !redacted.has(name.toUpperCase())));
 }
 

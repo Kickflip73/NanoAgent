@@ -57,6 +57,7 @@ import {
   daemonHasActiveWork,
   daemonProtocolAction,
   daemonProtocolState,
+  MIMI_BUILD_VERSION,
   migrateLegacyMimiDaemon,
   mimiPaths,
   type DaemonStatusWire,
@@ -83,6 +84,7 @@ export {
   daemonHasActiveWork,
   daemonProtocolAction,
   daemonProtocolState,
+  MIMI_BUILD_VERSION,
   mimiPaths,
 } from './client-runtime.js';
 export type { DaemonProtocolState, MimiPaths } from './client-runtime.js';
@@ -1148,6 +1150,7 @@ export async function runMimiDaemon(config: AppConfig): Promise<void> {
       assertDaemonControlAuth(controlToken, auth);
       if (method === 'ping' || method === 'status') return {
         protocolVersion: DAEMON_PROTOCOL_VERSION,
+        buildVersion: MIMI_BUILD_VERSION,
         permissionMode: config.permissionMode ?? 'trusted',
         ...activeStatus(), connectorCount: activeConnectors.size, webhookAddress: activeWebhook?.address,
         attention: activeAttention.status(), workspaceRoot: config.workspaceRoot,
@@ -1520,7 +1523,9 @@ export async function startMimiDaemon(config: AppConfig): Promise<DaemonStatus> 
     }
     assertDaemonWorkspace(status.workspaceRoot, config.workspaceRoot);
     const state = daemonProtocolState(status);
-    if (state === 'current' && status.permissionMode === expectedPermissionMode) return status as DaemonStatus;
+    if (state === 'current'
+      && status.permissionMode === expectedPermissionMode
+      && status.buildVersion === MIMI_BUILD_VERSION) return status as DaemonStatus;
     if (state === 'current') {
       lastError = new Error(
         `新启动的 MimiAgent 执行档位 ${String(status.permissionMode ?? 'unknown')} 与当前配置 ${expectedPermissionMode} 不一致`,
@@ -1533,7 +1538,9 @@ export async function startMimiDaemon(config: AppConfig): Promise<DaemonStatus> 
         `新启动的 MimiAgent 协议版本 ${String(status.protocolVersion)} 高于当前 CLI ${DAEMON_PROTOCOL_VERSION}。`,
       );
     }
-    lastError = new Error(`新启动的 MimiAgent 未返回当前协议版本 ${DAEMON_PROTOCOL_VERSION}`);
+    lastError = new Error(
+      `新启动的 MimiAgent 未返回当前协议/构建 ${DAEMON_PROTOCOL_VERSION}/${MIMI_BUILD_VERSION}`,
+    );
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   throw new Error(`MimiAgent 启动失败，请查看 ${paths.stderrLog}：${lastError instanceof Error ? lastError.message : String(lastError)}`);

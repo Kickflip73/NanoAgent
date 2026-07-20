@@ -57,6 +57,14 @@ interface ConnectorEventMessage {
   replyTarget?: string;
 }
 
+interface EventAckMessage {
+  type: 'event_ack';
+  externalId: string;
+  ok: boolean;
+  eventId?: string;
+  error?: string;
+}
+
 interface DeliveryAckMessage {
   type: 'delivery_ack';
   id: string;
@@ -81,6 +89,7 @@ interface ConnectorStatusMessage {
   inbound: ConnectorReadiness;
   outbound: ConnectorReadiness;
   deliveryConfirmed?: boolean;
+  eventAcknowledgement?: boolean;
 }
 
 interface PendingDelivery {
@@ -157,6 +166,7 @@ class ConnectorProcess implements NotificationSink {
   private readonly pending = new Map<string, PendingDelivery>();
   private readonly pendingActions = new Map<string, PendingAction>();
   private readiness: ConnectorCapability['readiness'] = { inbound: 'unknown', outbound: 'unknown' };
+  private supportsEventAcknowledgement = false;
 
   constructor(
     readonly id: string,
@@ -372,26 +382,46 @@ class ConnectorProcess implements NotificationSink {
     if (message.type !== 'event') throw new Error(`未知消息类型：${String(message.type)}`);
     const event = message as unknown as ConnectorEventMessage;
     if (typeof event.externalId !== 'string' || !event.externalId.trim()) throw new Error('event.externalId 不能为空');
-    const now = new Date().toISOString();
-    const source = this.config.source ?? `connector:${this.id}`;
-    const kind = isEventKind(event.kind) ? event.kind : 'webhook';
-    const trust = this.config.trust as EventTrust;
-    this.store.enqueueEvent({
-      id: randomUUID(),
-      externalId: event.externalId,
-      source,
-      kind,
-      trust,
-      actor: event.actor,
-      conversation: event.conversation,
-      payload: event.payload,
-      occurredAt: validDate(event.occurredAt) ?? now,
-      receivedAt: now,
-      priority: connectorEventPriority(trust, kind, event.priority),
-      profileId: this.config.profileId,
-      replyRoute: event.replyTarget
-        ? { channel: `connector:${this.id}`, target: event.replyTarget }
-        : undefined,
+    try {
+      const now = new Date().toISOString();
+      const source = this.config.source ?? `connector:${this.id}`;
+      const kind = isEventKind(event.kind) ? event.kind : 'webhook';
+      const trust = this.config.trust as EventTrust;
+      const stored = this.store.enqueueEvent({
+        id: randomUUID(),
+        externalId: event.externalId,
+        source,
+        kind,
+        trust,
+        actor: event.actor,
+        conversation: event.conversation,
+        payload: event.payload,
+        occurredAt: validDate(event.occurredAt) ?? now,
+        receivedAt: now,
+        priority: connectorEventPriority(trust, kind, event.priority),
+        profileId: this.config.profileId,
+        replyRoute: event.replyTarget
+          ? { channel: `connector:${this.id}`, target: event.replyTarget }
+          : undefined,
+      });
+      this.writeEventAck({
+        type: 'event_ack', externalId: event.externalId, ok: true, eventId: stored.event.id,
+      });
+    } catch (error) {
+      this.writeEventAck({
+        type: 'event_ack', externalId: event.externalId, ok: false,
+        error: (error instanceof Error ? error.message : String(error)).slice(0, 500),
+      });
+      throw error;
+    }
+  }
+
+  private writeEventAck(message: EventAckMessage): void {
+    if (!this.supportsEventAcknowledgement) return;
+    const child = this.child;
+    if (!child || child.stdin.destroyed) return;
+    child.stdin.write(`${JSON.stringify(message)}\n`, (error) => {
+      if (error) process.stderr.write(`[MimiAgent connector:${this.id}] event ACK 写入失败：${error.message}\n`);
     });
   }
 
@@ -403,6 +433,10 @@ class ConnectorProcess implements NotificationSink {
     if (message.deliveryConfirmed !== undefined && typeof message.deliveryConfirmed !== 'boolean') {
       throw new Error('status.deliveryConfirmed 必须是 boolean');
     }
+    if (message.eventAcknowledgement !== undefined && typeof message.eventAcknowledgement !== 'boolean') {
+      throw new Error('status.eventAcknowledgement 必须是 boolean');
+    }
+    this.supportsEventAcknowledgement = message.eventAcknowledgement === true;
     this.readiness = {
       inbound: message.inbound,
       outbound: message.outbound,

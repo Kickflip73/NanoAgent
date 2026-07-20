@@ -1,4 +1,8 @@
 process.stdout.write(`${JSON.stringify({
+  type: 'status', inbound: 'unknown', outbound: 'ready', deliveryConfirmed: true,
+  eventAcknowledgement: true,
+})}\n`);
+process.stdout.write(`${JSON.stringify({
   type: 'event',
   externalId: 'fixture-event-1',
   kind: 'webhook',
@@ -8,9 +12,6 @@ process.stdout.write(`${JSON.stringify({
   },
   priority: 70,
   replyTarget: 'fixture-user',
-})}\n`);
-process.stdout.write(`${JSON.stringify({
-  type: 'status', inbound: 'ready', outbound: 'ready', deliveryConfirmed: true,
 })}\n`);
 
 process.stdin.setEncoding('utf8');
@@ -23,7 +24,12 @@ process.stdin.on('data', (chunk) => {
     input = input.slice(newline + 1);
     if (!line.trim()) continue;
     const message = JSON.parse(line);
-    if (message.type === 'deliver') {
+    if (message.type === 'event_ack') {
+      process.stdout.write(`${JSON.stringify({
+        type: 'status', inbound: message.ok ? 'ready' : 'unavailable',
+        outbound: 'ready', deliveryConfirmed: true, eventAcknowledgement: true,
+      })}\n`);
+    } else if (message.type === 'deliver') {
       process.stdout.write(`${JSON.stringify({
         type: 'delivery_ack', id: message.id, ok: message.target !== 'uncertain',
         ...(message.target === 'uncertain' ? { uncertain: true, error: 'fixture result uncertain' } : {}),

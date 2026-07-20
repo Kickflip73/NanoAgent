@@ -114,7 +114,9 @@ test('reads a requested Session snapshot without changing the active Session', a
     { role: 'assistant', content: 'REQUESTED_SESSION_ANSWER' },
   ] as AgentInputItem[];
   await requested.addItems(items);
-  await requested.setPreferences({ mode: 'plan', model: 'gpt-5-mini', outputLevel: 'trace' });
+  await requested.setPreferences({
+    mode: 'plan', provider: 'openai', model: 'gpt-5-mini', outputLevel: 'trace',
+  });
   const checkpoint = await requested.beginRun('REQUESTED_INTERRUPTED_INPUT', 'requested-run');
   await requested.failRun('interrupted for snapshot', true, checkpoint.runId);
 
@@ -902,7 +904,8 @@ test('oversized current input never leaves an orphaned function result', () => {
   const effective = manager.effectiveHistory([], input, undefined, 500);
   const serialized = JSON.stringify(effective);
 
-  if (serialized.includes('function_call_result')) assert.match(serialized, /"type":"function_call"/);
+  assert.match(serialized, /"type":"function_call"/);
+  assert.match(serialized, /"type":"function_call_result"/);
   assert.ok(estimateTokens(effective) <= 500);
 });
 
@@ -1149,6 +1152,52 @@ test('serializes concurrent plan and goal mutations', async () => {
 
   assert.equal((await plans.get())[0]?.description, 'build');
   assert.equal((await plans.getGoal())?.checkpoint, 'started');
+});
+
+test('persists and locks a Goal Completion Contract beyond the latest run checkpoint', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-goal-contract-'));
+  const plans = new PlanStore(path.join(root, 'plans.json'), 'goal-contract');
+  const contract = {
+    objective: 'ship report',
+    kind: 'artifact' as const,
+    criteria: [{
+      id: 'report', description: 'report exists', requiredEvidence: 'artifact' as const,
+      expectedTool: 'read_file', expectedArgumentsContain: ['report.md'],
+    }],
+  };
+  await plans.setGoal(contract.objective, contract.criteria, contract);
+  assert.deepEqual((await plans.getGoal())?.completionContract, contract);
+  await plans.setGoalCompletionContract(contract);
+  await assert.rejects(plans.setGoalCompletionContract({
+    ...contract,
+    criteria: [{ ...contract.criteria[0]!, description: 'weaker replacement' }],
+  }), /已锁定/);
+});
+
+test('set_goal preserves the prepared Completion Contract and runs state isolation first', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-set-goal-contract-'));
+  const plans = new PlanStore(path.join(root, 'plans.json'), 'goal-contract');
+  const contract = {
+    objective: 'ship report',
+    kind: 'artifact' as const,
+    criteria: [{
+      id: 'report', description: 'report written', requiredEvidence: 'artifact' as const,
+      expectedTool: 'write_file', expectedArgumentsContain: ['report.md'],
+    }],
+  };
+  let isolated = false;
+  const setGoal = plans.createTools({
+    beforeGoalSet: () => { isolated = true; },
+    completionContract: () => contract,
+  }).find((candidate) => candidate.name === 'set_goal');
+  assert.ok(setGoal && 'invoke' in setGoal);
+  await setGoal.invoke(new RunContext({}), JSON.stringify({
+    objective: contract.objective,
+    acceptanceCriteria: contract.criteria,
+  }));
+
+  assert.equal(isolated, true);
+  assert.deepEqual((await plans.getGoal())?.completionContract, contract);
 });
 
 test('emits plan snapshots after task updates', async () => {

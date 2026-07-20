@@ -1,8 +1,12 @@
 import { spawn } from 'node:child_process';
+import { lookup as dnsLookup } from 'node:dns';
+import { lookup } from 'node:dns/promises';
 import { constants } from 'node:fs';
 import { lstat, mkdir, open, readFile, readdir, realpath, rename, stat, writeFile } from 'node:fs/promises';
+import { isIP, type LookupFunction } from 'node:net';
 import path from 'node:path';
 import { codeInterpreterTool, tool, webSearchTool } from '@openai/agents';
+import { Agent as HttpAgent, fetch } from 'undici';
 import { z } from 'zod';
 import { PRE_MIMI_DATA_DIRECTORY } from './core/mimi-legacy.js';
 import { withExclusiveFileLock } from './core/state-file.js';
@@ -10,6 +14,7 @@ import { withExclusiveFileLock } from './core/state-file.js';
 const MAX_TEXT_BYTES = 200_000;
 const MAX_SHELL_OUTPUT = 100_000;
 const MAX_HTTP_BYTES = 200_000;
+const MAX_HTTP_REDIRECTS = 5;
 const SKIPPED_DIRECTORIES = new Set([
   '.git', '.mimi-agent', PRE_MIMI_DATA_DIRECTORY, 'node_modules', 'dist',
 ]);
@@ -361,24 +366,142 @@ export async function requestUrl(
   body: string | undefined,
   timeoutSeconds: number,
   signal?: AbortSignal,
+  allowPrivateNetwork = false,
 ) {
-  const target = new URL(url);
-  if (!['http:', 'https:'].includes(target.protocol)) throw new Error('只支持 HTTP 和 HTTPS URL');
+  let target = new URL(url);
   const requestSignal = signal
     ? AbortSignal.any([signal, AbortSignal.timeout(timeoutSeconds * 1_000)])
     : AbortSignal.timeout(timeoutSeconds * 1_000);
-  const response = await fetch(target, {
-    method,
-    headers,
-    body: method === 'GET' || method === 'HEAD' ? undefined : body,
-    signal: requestSignal,
+  let requestMethod = method;
+  let requestBody = body;
+  let requestHeaders = { ...headers };
+  const dispatcher = allowPrivateNetwork ? undefined : new HttpAgent({
+    connect: { lookup: guardedPublicLookup },
   });
-  return {
-    status: response.status,
-    ok: response.ok,
-    headers: Object.fromEntries(response.headers),
-    body: await readBoundedResponse(response, requestSignal),
-  };
+  try {
+    for (let redirects = 0; redirects <= MAX_HTTP_REDIRECTS; redirects += 1) {
+      await assertPublicHttpTarget(target, allowPrivateNetwork);
+      const response = await fetch(target, {
+        method: requestMethod,
+        headers: requestHeaders,
+        body: requestMethod === 'GET' || requestMethod === 'HEAD' ? undefined : requestBody,
+        signal: requestSignal,
+        redirect: 'manual',
+        ...(dispatcher ? { dispatcher } : {}),
+      });
+      const location = response.headers.get('location');
+      if (![301, 302, 303, 307, 308].includes(response.status) || !location) {
+        return {
+          status: response.status,
+          ok: response.ok,
+          headers: Object.fromEntries(response.headers),
+          body: await readBoundedResponse(response as unknown as Response, requestSignal),
+        };
+      }
+      if (redirects === MAX_HTTP_REDIRECTS) throw new Error(`HTTP 重定向超过 ${MAX_HTTP_REDIRECTS} 次限制`);
+      await response.body?.cancel();
+      const next = new URL(location, target);
+      if (target.protocol === 'https:' && next.protocol === 'http:') {
+        throw new Error('HTTP 重定向不允许从 HTTPS 降级到 HTTP');
+      }
+      if (next.origin !== target.origin) {
+        if (!['GET', 'HEAD'].includes(requestMethod.toUpperCase()) || requestBody !== undefined) {
+          throw new Error('HTTP 工具拒绝跨源重定向写请求或请求正文');
+        }
+        requestHeaders = Object.fromEntries(Object.entries(requestHeaders).filter(([name]) => (
+          ['accept', 'accept-language'].includes(name.toLowerCase())
+        )));
+      }
+      if (response.status === 303 || ((response.status === 301 || response.status === 302) && requestMethod === 'POST')) {
+        requestMethod = 'GET';
+        requestBody = undefined;
+        for (const name of Object.keys(requestHeaders)) {
+          if (['content-length', 'content-type', 'transfer-encoding'].includes(name.toLowerCase())) {
+            delete requestHeaders[name];
+          }
+        }
+      }
+      target = next;
+    }
+    throw new Error('HTTP 请求未能完成');
+  } finally {
+    await dispatcher?.close();
+  }
+}
+
+const guardedPublicLookup: LookupFunction = (hostname, options, callback) => {
+  dnsLookup(hostname, { ...options, all: true, verbatim: true }, (error, addresses) => {
+    if (error) {
+      callback(error, '', 0);
+      return;
+    }
+    const selected = addresses.find(({ address }) => isPublicAddress(address));
+    if (!selected || addresses.some(({ address }) => !isPublicAddress(address))) {
+      const denied = Object.assign(new Error('DNS 解析包含非公网地址，HTTP 请求已拒绝'), { code: 'EACCES' });
+      callback(denied, '', 0);
+      return;
+    }
+    callback(null, selected.address, selected.family);
+  });
+};
+
+async function assertPublicHttpTarget(target: URL, allowPrivateNetwork: boolean): Promise<void> {
+  if (!['http:', 'https:'].includes(target.protocol)) throw new Error('只支持 HTTP 和 HTTPS URL');
+  if (target.username || target.password) throw new Error('HTTP URL 不允许包含用户名或密码');
+  if (allowPrivateNetwork) return;
+  const hostname = target.hostname.replace(/^\[|\]$/g, '');
+  const addresses = isIP(hostname)
+    ? [{ address: hostname }]
+    : await lookup(hostname, { all: true, verbatim: true });
+  if (!addresses.length || addresses.some(({ address }) => !isPublicAddress(address))) {
+    throw new Error('HTTP 工具只允许访问公网地址；loopback、内网、link-local 和 metadata 地址已拒绝');
+  }
+}
+
+function isPublicAddress(address: string): boolean {
+  if (isIP(address) === 4) {
+    const parts = address.split('.').map(Number);
+    const [a = 0, b = 0] = parts;
+    return !(a === 0 || a === 10 || a === 127 || a >= 224
+      || (a === 100 && b >= 64 && b <= 127)
+      || (a === 169 && b === 254)
+      || (a === 172 && b >= 16 && b <= 31)
+      || (a === 192 && b === 168)
+      || (a === 198 && (b === 18 || b === 19)));
+  }
+  if (isIP(address) !== 6) return false;
+  const normalized = address.toLowerCase();
+  const groups = expandIpv6(normalized);
+  if (!groups) return false;
+  if (groups.slice(0, 5).every((group) => group === 0) && groups[5] === 0xffff) {
+    return isPublicAddress(`${groups[6]! >>> 8}.${groups[6]! & 0xff}.${groups[7]! >>> 8}.${groups[7]! & 0xff}`);
+  }
+  return normalized !== '::' && normalized !== '::1'
+    && !normalized.startsWith('fc') && !normalized.startsWith('fd')
+    && !normalized.startsWith('fe8') && !normalized.startsWith('fe9')
+    && !normalized.startsWith('fea') && !normalized.startsWith('feb')
+    && !normalized.startsWith('ff');
+}
+
+function expandIpv6(address: string): number[] | undefined {
+  let normalized = address;
+  const dotted = normalized.match(/(?:^|:)(\d+\.\d+\.\d+\.\d+)$/)?.[1];
+  if (dotted) {
+    const bytes = dotted.split('.').map(Number);
+    if (bytes.length !== 4 || bytes.some((byte) => !Number.isInteger(byte) || byte < 0 || byte > 255)) return undefined;
+    normalized = `${normalized.slice(0, -dotted.length)}${((bytes[0]! << 8) | bytes[1]!).toString(16)}:${((bytes[2]! << 8) | bytes[3]!).toString(16)}`;
+  }
+  const halves = normalized.split('::');
+  if (halves.length > 2) return undefined;
+  const left = halves[0] ? halves[0].split(':') : [];
+  const right = halves[1] ? halves[1].split(':') : [];
+  const zeros = halves.length === 2 ? 8 - left.length - right.length : 0;
+  if (zeros < 0 || (halves.length === 1 && left.length !== 8)) return undefined;
+  const values = [...left, ...Array.from({ length: zeros }, () => '0'), ...right]
+    .map((group) => Number.parseInt(group, 16));
+  return values.length === 8 && values.every((value) => Number.isInteger(value) && value >= 0 && value <= 0xffff)
+    ? values
+    : undefined;
 }
 
 export async function runShellCommand(
@@ -445,7 +568,7 @@ export async function runShellCommand(
     });
 
     const finish = (): void => {
-      if (settled || !closed || (terminating && !killFinished)) return;
+      if (settled || !closed || !killFinished) return;
       settled = true;
       clearTimeout(timeoutTimer);
       signal?.removeEventListener('abort', abort);
@@ -458,14 +581,19 @@ export async function runShellCommand(
       });
     };
 
-    const kill = (force = false): void => {
-      if (!child.pid) return;
+    const kill = (force = false): boolean => {
+      if (!child.pid) return false;
       const signalName = force ? 'SIGKILL' : 'SIGTERM';
       try {
         if (process.platform === 'win32' || !detachedProcessGroup) child.kill(signalName);
         else process.kill(-child.pid, signalName);
+        return true;
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'ESRCH') child.kill(signalName);
+        if ((error as NodeJS.ErrnoException).code !== 'ESRCH') {
+          child.kill(signalName);
+          return true;
+        }
+        return false;
       }
     };
     const terminate = (message: string): void => {
@@ -509,7 +637,17 @@ export async function runShellCommand(
     child.once('close', (code) => {
       closed = true;
       closeCode = code;
-      if (!terminating) killFinished = true;
+      if (!terminating && process.platform !== 'win32' && detachedProcessGroup && kill(false)) {
+        // A successful shell may still have background descendants in its
+        // process group. The Run owns that group until every descendant exits.
+        hardKillTimer = setTimeout(() => {
+          kill(true);
+          killFinished = true;
+          finish();
+        }, 150);
+      } else if (!terminating) {
+        killFinished = true;
+      }
       finish();
     });
   });

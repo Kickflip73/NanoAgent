@@ -22,6 +22,7 @@ import {
   initializeMimi,
   launchAgentProviderConfigured,
   launchAgentPlist,
+  MIMI_BUILD_VERSION,
   waitForAbort,
 } from '../src/daemon/service.js';
 import {
@@ -80,9 +81,10 @@ async function rawRpc(
 }
 
 test('daemon protocol decisions upgrade only idle legacy workers', () => {
-  assert.equal(DAEMON_PROTOCOL_VERSION, 5);
+  assert.equal(DAEMON_PROTOCOL_VERSION, 6);
   const current: DaemonStatus = {
     protocolVersion: DAEMON_PROTOCOL_VERSION,
+    buildVersion: MIMI_BUILD_VERSION,
     pid: 123, startedAt: '2026-07-16T00:00:00.000Z', workerId: 'worker', workspaceRoot: '/workspace',
     permissionMode: 'trusted',
     activeHostMutations: 0,
@@ -102,6 +104,8 @@ test('daemon protocol decisions upgrade only idle legacy workers', () => {
   assert.equal(daemonProtocolState(previousOwnerPolicy), 'legacy');
   assert.equal(daemonProtocolState({ protocolVersion: DAEMON_PROTOCOL_VERSION + 1 }), 'newer');
   assert.equal(daemonProtocolAction(current, 'trusted'), 'reuse');
+  assert.equal(daemonProtocolAction({ ...current, buildVersion: undefined }, 'trusted'), 'upgrade');
+  assert.equal(daemonProtocolAction({ ...current, buildVersion: 'older-build' }, 'trusted'), 'upgrade');
   assert.equal(daemonProtocolAction(legacy, 'trusted'), 'upgrade');
   assert.equal(daemonProtocolAction(previousOwnerPolicy, 'trusted'), 'upgrade');
   assert.equal(daemonProtocolAction({ ...current, permissionMode: 'workspace' }, 'trusted'), 'upgrade');

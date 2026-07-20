@@ -1,9 +1,9 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import type { RunStreamEvent } from '@openai/agents';
 import type { MimiAgent } from '../runtime/mimi-agent.js';
 import { MimiHost } from '../runtime/mimi-host.js';
 import type { RuntimeEvent } from '../runtime/hooks.js';
-import { TerminalRunInterruptedError } from '../runtime/run-outcome.js';
+import { isTerminalRunInterruption, TerminalRunInterruptedError } from '../runtime/run-outcome.js';
 import { CompletionGateError } from '../core/completion.js';
 import {
   isPermanentDeliveryError,
@@ -51,6 +51,8 @@ interface ActiveExecution {
   sessionId?: string;
   runController?: AbortController;
   promise?: Promise<void>;
+  pendingToolCalls: Map<string, { name: string; argumentsJson: string }>;
+  toolResultHistory: string[];
 }
 
 export type EventCancelResult =
@@ -69,7 +71,10 @@ export function eventFailureAttemptLimit(
   const status = typeof value.status === 'number'
     ? value.status
     : messageStatus ? Number(messageStatus) : undefined;
-  if (value.name === 'MaxTurnsExceededError' || /^Max turns \(\d+\) exceeded$/i.test(message)) {
+  if (isTerminalRunInterruption(error)
+    || value.name === 'ContextProtocolBudgetError'
+    || value.name === 'MaxTurnsExceededError'
+    || /^Max turns \(\d+\) exceeded$/i.test(message)) {
     return Math.max(1, claimedAttempts);
   }
   // Background conversation retries happen within seconds. Retrying a rejected
@@ -98,6 +103,17 @@ function delay(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
+function repeatedToolCycle(history: readonly string[]): boolean {
+  for (let period = 1; period <= Math.min(8, Math.floor(history.length / 3)); period += 1) {
+    if (history.length < period * 3) continue;
+    const tail = history.slice(-period);
+    const previous = history.slice(-period * 2, -period);
+    const earlier = history.slice(-period * 3, -period * 2);
+    if (tail.every((value, index) => value === previous[index] && value === earlier[index])) return true;
+  }
+  return false;
+}
+
 export class MimiDispatcher {
   readonly workerId = `${process.pid}-${randomUUID().slice(0, 8)}`;
   readonly startedAt = new Date().toISOString();
@@ -106,11 +122,10 @@ export class MimiDispatcher {
   private loopPromise?: Promise<void>;
   private readonly active = new Map<string, ActiveExecution>();
   private readonly activeSessions = new Set<string>();
-  private readonly deferredForActiveSession = new Map<string, string>();
   private stopRequested = false;
   private forceStopReason?: Error;
   private preferOutbox = true;
-  private readonly deliveryPromises = new Map<string, Promise<void>>();
+  private readonly deliveryPromises = new Map<string, { route: ReplyRoute; promise: Promise<void> }>();
   private nextMaintenanceAt = 0;
 
   constructor(
@@ -135,7 +150,7 @@ export class MimiDispatcher {
     for (const execution of this.active.values()) this.abortForStopWhenSafe(execution);
     await this.loopPromise;
     await Promise.all([...this.active.values()].map((execution) => execution.promise).filter(Boolean));
-    await Promise.all(this.deliveryPromises.values());
+    await Promise.all([...this.deliveryPromises.values()].map((delivery) => delivery.promise));
   }
 
   forceStop(reason = 'MimiAgent Dispatcher 被强制停止'): void {
@@ -258,9 +273,11 @@ export class MimiDispatcher {
       await delivery;
       return true;
     }
-    const inFlight = this.deliveryPromises.values().next().value as Promise<void> | undefined;
+    const inFlight = this.deliveryPromises.values().next().value as
+      | { route: ReplyRoute; promise: Promise<void> }
+      | undefined;
     if (!inFlight) return false;
-    await inFlight;
+    await inFlight.promise;
     return true;
   }
 
@@ -270,7 +287,7 @@ export class MimiDispatcher {
       this.workerId,
       undefined,
       undefined,
-      [...this.deliveryPromises.keys()],
+      [...this.deliveryPromises.values()].map((delivery) => delivery.route),
     );
     if (!outgoing) return undefined;
     let tracked!: Promise<void>;
@@ -281,11 +298,13 @@ export class MimiDispatcher {
         );
       })
       .finally(() => {
-        if (this.deliveryPromises.get(outgoing.channel) === tracked) {
-          this.deliveryPromises.delete(outgoing.channel);
+        const routeKey = JSON.stringify([outgoing.channel, outgoing.target ?? '']);
+        if (this.deliveryPromises.get(routeKey)?.promise === tracked) {
+          this.deliveryPromises.delete(routeKey);
         }
       });
-    this.deliveryPromises.set(outgoing.channel, tracked);
+    const route = { channel: outgoing.channel, ...(outgoing.target ? { target: outgoing.target } : {}) };
+    this.deliveryPromises.set(JSON.stringify([outgoing.channel, outgoing.target ?? '']), { route, promise: tracked });
     return tracked;
   }
 
@@ -343,7 +362,7 @@ export class MimiDispatcher {
         new Date(),
         this.options.claimExecutionLane,
         this.options.maxAttempts ?? 5,
-        [...this.deferredForActiveSession.keys()],
+        [...this.activeSessions],
       );
       if (!event) break;
       worked = true;
@@ -361,7 +380,12 @@ export class MimiDispatcher {
 
   private runEvent(event: StoredEvent): Promise<void> {
     if (this.active.has(event.id)) throw new Error(`事件 ${event.id} 已在执行`);
-    const active: ActiveExecution = { event, tools: 0 };
+    const active: ActiveExecution = {
+      event,
+      tools: 0,
+      pendingToolCalls: new Map(),
+      toolResultHistory: [],
+    };
     this.active.set(event.id, active);
     const promise = this.processEvent(active);
     active.promise = promise;
@@ -426,6 +450,7 @@ export class MimiDispatcher {
         return;
       }
       const sessionId = decision.sessionId!;
+      this.store.bindRunningEventSession(event.id, this.workerId, sessionId);
       if (this.activeSessions.has(sessionId)) {
         const now = new Date();
         this.store.preemptEvent(
@@ -436,7 +461,6 @@ export class MimiDispatcher {
           undefined,
           new Date(now.getTime() + Math.max(25, this.options.pollMs ?? 250)),
         );
-        this.deferredForActiveSession.set(event.id, sessionId);
         return;
       }
       active.sessionId = sessionId;
@@ -504,6 +528,7 @@ export class MimiDispatcher {
       const executionKey = `event:${event.id}`;
       execution = { sessionId: decision.sessionId!, key: executionKey };
       const deliveryControl: MimiDeliveryControl = { suppressed: false };
+      let completionDelivery: { suppressed: true; reason?: string } | undefined;
       refreshRunIdleWatchdog();
       const hostedRun = this.host.execute({
         executionId: event.id,
@@ -514,9 +539,29 @@ export class MimiDispatcher {
           ...decision.options,
           executionKey,
           retainExecutionLedger: true,
-          completionDelivery: () => deliveryControl.suppressed
-            ? { suppressed: true, reason: deliveryControl.reason }
-            : undefined,
+          completionDelivery: (calls) => {
+            if (completionDelivery) return completionDelivery;
+            if (deliveryControl.suppressed) {
+              completionDelivery = { suppressed: true, reason: deliveryControl.reason };
+              return completionDelivery;
+            }
+            const matchingReceipt = calls?.find((call) => {
+              if (call.toolName !== 'connector_action' || call.status !== 'succeeded') return false;
+              const receipt = call.output && typeof call.output === 'object' && !Array.isArray(call.output)
+                ? call.output as Record<string, unknown>
+                : undefined;
+              return receipt?.outcome === 'confirmed'
+                && receipt.action === 'send_message'
+                && replyRoute?.channel === `connector:${String(receipt.connector)}`
+                && replyRoute.target === receipt.target;
+            });
+            if (!matchingReceipt) return undefined;
+            completionDelivery = {
+              suppressed: true,
+              reason: '执行账本确认已通过同一 Connector 会话发送，抑制重复最终投递',
+            };
+            return completionDelivery;
+          },
           hostTools: createMimiHostTools({
             store: this.store,
             attention: this.attention,
@@ -540,11 +585,52 @@ export class MimiDispatcher {
           this.options.onStreamEvent?.(event.id, streamEvent);
           if (streamEvent.type === 'run_item_stream_event' && streamEvent.name === 'tool_called') {
             active.tools += 1;
+            const item = streamEvent.item as unknown as Record<string, unknown>;
+            const raw = item.rawItem && typeof item.rawItem === 'object'
+              ? item.rawItem as Record<string, unknown>
+              : {};
+            const callId = typeof raw.callId === 'string'
+              ? raw.callId
+              : `legacy:${active.pendingToolCalls.size}:${typeof raw.name === 'string' ? raw.name : 'unknown'}`;
+            active.pendingToolCalls.set(callId, {
+              name: typeof raw.name === 'string' ? raw.name : 'unknown',
+              argumentsJson: typeof raw.arguments === 'string'
+                ? raw.arguments
+                : JSON.stringify(raw.arguments ?? null),
+            });
             pauseRunIdleWatchdog();
             return;
           }
           if (streamEvent.type === 'run_item_stream_event' && streamEvent.name === 'tool_output') {
             active.tools = Math.max(0, active.tools - 1);
+            const item = streamEvent.item as unknown as Record<string, unknown>;
+            const raw = item.rawItem && typeof item.rawItem === 'object'
+              ? item.rawItem as Record<string, unknown>
+              : {};
+            const callId = typeof raw.callId === 'string' ? raw.callId : undefined;
+            const fallback = callId ? undefined : [...active.pendingToolCalls.entries()]
+              .find(([, pending]) => pending.name === raw.name);
+            const resolvedCallId = callId ?? fallback?.[0];
+            const call = resolvedCallId ? active.pendingToolCalls.get(resolvedCallId) : undefined;
+            if (resolvedCallId) active.pendingToolCalls.delete(resolvedCallId);
+            if (call) {
+              let outputJson: string;
+              try {
+                outputJson = JSON.stringify(item.output ?? null);
+              } catch {
+                outputJson = String(item.output);
+              }
+              const fingerprint = createHash('sha256')
+                .update(`${call.name}\0${call.argumentsJson}\0${outputJson}`)
+                .digest('hex');
+              active.toolResultHistory.push(fingerprint);
+              if (active.toolResultHistory.length > 24) active.toolResultHistory.shift();
+              if (repeatedToolCycle(active.toolResultHistory) && !runSignal.aborted) {
+                runController.abort(new TerminalRunInterruptedError(
+                  `工具调用序列重复获得相同结果，判定为无进展循环并停止自动重试（最近工具：${call.name}）`,
+                ));
+              }
+            }
             this.synchronizeDurableTaskControl(active);
             if (active.cancelRequested && active.tools === 0) {
               pauseRunIdleWatchdog();
@@ -721,6 +807,8 @@ export class MimiDispatcher {
           `Completion Gate 未通过：${error.message}`,
           new Date(),
           hostRunId,
+          error.progressFingerprint,
+          error.gate.decision === 'uncertain',
         );
       } else if (this.stopRequested && active.runController?.signal.aborted) {
         this.store.preemptEvent(
@@ -749,9 +837,6 @@ export class MimiDispatcher {
       this.active.delete(event.id);
       if (active.sessionId) {
         this.activeSessions.delete(active.sessionId);
-        for (const [eventId, sessionId] of this.deferredForActiveSession) {
-          if (sessionId === active.sessionId) this.deferredForActiveSession.delete(eventId);
-        }
       }
     }
   }

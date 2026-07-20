@@ -121,7 +121,7 @@ export class AgentRunService {
         answer,
         effects,
         usage,
-        delivery: request.options?.completionDelivery?.(),
+        delivery: await request.options?.completionDelivery?.(),
       } satisfies AgentRunResult;
       await observe(observer.onComplete, result);
       return result;

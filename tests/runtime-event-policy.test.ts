@@ -3,10 +3,11 @@ import { mkdtemp, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { tool, type AgentInputItem, type SessionInputCallback, type Tool } from '@openai/agents';
+import { RunContext, tool, type AgentInputItem, type SessionInputCallback, type Tool } from '@openai/agents';
 import { z } from 'zod';
 import { MemoryStore } from '../src/core/memory.js';
 import { PlanStore } from '../src/core/plan.js';
+import { TeamTaskStore } from '../src/core/team.js';
 import { FileSession } from '../src/core/session.js';
 import { decideEvent } from '../src/daemon/policy.js';
 import type { StoredEvent } from '../src/daemon/types.js';
@@ -129,17 +130,27 @@ test('external runs inject host instructions without exposing private Session co
 test('default owner General runs expose Shell while Plan remains read-only', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-default-owner-shell-'));
   const previousSession = process.env.AGENT_SESSION;
+  const previousSecret = process.env.OPENAI_API_KEY;
   process.env.AGENT_SESSION = 'default-owner-shell';
+  process.env.OPENAI_API_KEY = 'DO_NOT_EXPOSE_TO_SHELL';
   const agent = await MimiAgent.create({
     provider: 'openai', workspaceRoot: root, dataRoot: path.join(root, '.mimi-agent'),
     skillsRoot: path.join(root, 'skills'), mcpConfig: path.join(root, 'mcp.json'),
     historyLimit: 40, contextWindow: 128_000, maxTurns: 20,
   });
   let capturedTools: string[] = [];
+  let shellOutput = '';
   let completed = false;
   const runner = (agent as unknown as { runner: { run: (...args: unknown[]) => Promise<unknown> } }).runner;
   runner.run = async (runtimeAgent) => {
-    capturedTools = ((runtimeAgent as { tools: Array<{ name: string }> }).tools).map((item) => item.name);
+    const runtimeTools = (runtimeAgent as { tools: Array<Tool> }).tools;
+    capturedTools = runtimeTools.map((item) => item.name);
+    const shell = runtimeTools.find((item) => item.name === 'run_shell');
+    assert.ok(shell && 'invoke' in shell);
+    shellOutput = JSON.stringify(await shell.invoke(
+      new RunContext({}),
+      JSON.stringify({ command: 'printf %s "$OPENAI_API_KEY"', timeoutSeconds: 5 }),
+    ));
     return {};
   };
 
@@ -150,6 +161,7 @@ test('default owner General runs expose Shell while Plan remains read-only', asy
       requireCompletionGate: false,
     });
     assert.ok(capturedTools.includes('run_shell'));
+    assert.doesNotMatch(shellOutput, /DO_NOT_EXPOSE_TO_SHELL/);
     await agent.completeRun('done');
     completed = true;
 
@@ -160,6 +172,8 @@ test('default owner General runs expose Shell while Plan remains read-only', asy
     await agent.close();
     if (previousSession === undefined) delete process.env.AGENT_SESSION;
     else process.env.AGENT_SESSION = previousSession;
+    if (previousSecret === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = previousSecret;
   }
 });
 
@@ -187,6 +201,104 @@ test('restricted reply-only runs do not enable an impossible completion gate', a
     await agent.completeRun('briefed');
   } finally {
     await agent.close();
+  }
+});
+
+test('Plan mode describes requested changes without requiring impossible artifact evidence', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-plan-completion-'));
+  const agent = await MimiAgent.create({
+    provider: 'openai', workspaceRoot: root, dataRoot: path.join(root, '.mimi-agent'), permissionMode: 'trusted',
+    skillsRoot: path.join(root, 'skills'), mcpConfig: path.join(root, 'mcp.json'),
+    historyLimit: 40, contextWindow: 128_000, maxTurns: 20,
+  });
+  const runner = (agent as unknown as { runner: { run: (...args: unknown[]) => Promise<unknown> } }).runner;
+  runner.run = async () => ({});
+  try {
+    await agent.switchMode('plan');
+    await agent.stream('修改登录页并生成报告');
+    assert.equal(agent.completionGateRequired, false);
+    await agent.completeRun('只读实施方案');
+  } finally {
+    await agent.close();
+  }
+});
+
+test('an unrelated long task cannot replace an unfinished Goal or inherit its Team', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-goal-ownership-'));
+  const dataRoot = path.join(root, '.mimi-agent');
+  const sessionId = 'goal-ownership';
+  const previousSession = process.env.AGENT_SESSION;
+  process.env.AGENT_SESSION = sessionId;
+  const plans = new PlanStore(path.join(dataRoot, 'plans.json'), sessionId);
+  const team = new TeamTaskStore(path.join(dataRoot, 'teams.json'), sessionId);
+  const existing = await plans.setGoal('EXISTING_UNFINISHED_GOAL');
+  await team.set([{
+    id: 'old-task', description: 'old work', role: 'builder', dependencies: [], paths: ['src/old.ts'],
+  }, {
+    id: 'old-test', description: 'old test', role: 'tester', dependencies: ['old-task'], paths: [],
+  }, {
+    id: 'old-review', description: 'old review', role: 'reviewer', dependencies: ['old-test'], paths: [],
+  }]);
+  const agent = await MimiAgent.create({
+    provider: 'openai', workspaceRoot: root, dataRoot, permissionMode: 'trusted',
+    skillsRoot: path.join(root, 'skills'), mcpConfig: path.join(root, 'mcp.json'),
+    historyLimit: 40, contextWindow: 128_000, maxTurns: 20,
+  });
+  const runner = (agent as unknown as { runner: { run: () => Promise<unknown> } }).runner;
+  runner.run = async () => ({});
+  try {
+    await agent.stream('这是另一个需要多阶段长期执行并生成报告的新任务');
+    assert.equal((await plans.getGoal())?.createdAt, existing.createdAt);
+    assert.equal((await plans.getGoal())?.objective, 'EXISTING_UNFINISHED_GOAL');
+    assert.deepEqual((await team.list()).map((task) => task.id), ['old-task', 'old-test', 'old-review']);
+  } finally {
+    await agent.failRun(new Error('test cleanup'), true);
+    await agent.close();
+    if (previousSession === undefined) delete process.env.AGENT_SESSION;
+    else process.env.AGENT_SESSION = previousSession;
+  }
+});
+
+test('an unrelated checkpoint retry cannot inherit an active Goal plan or Team', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-checkpoint-goal-ownership-'));
+  const dataRoot = path.join(root, '.mimi-agent');
+  const sessionId = 'checkpoint-goal-ownership';
+  const previousSession = process.env.AGENT_SESSION;
+  process.env.AGENT_SESSION = sessionId;
+  const plans = new PlanStore(path.join(dataRoot, 'plans.json'), sessionId);
+  await plans.setGoal('ACTIVE_GOAL_A');
+  await plans.update([{ id: 'goal-a-step', description: 'PRIVATE_GOAL_A_PLAN', status: 'running' }]);
+  const team = new TeamTaskStore(path.join(dataRoot, 'teams.json'), sessionId);
+  await team.set([{
+    id: 'goal-a-builder', description: 'PRIVATE_GOAL_A_TEAM', role: 'builder', dependencies: [], paths: ['src/a.ts'],
+  }, {
+    id: 'goal-a-tester', description: 'test', role: 'tester', dependencies: ['goal-a-builder'], paths: [],
+  }, {
+    id: 'goal-a-reviewer', description: 'review', role: 'reviewer', dependencies: ['goal-a-tester'], paths: [],
+  }]);
+  const session = new FileSession(path.join(dataRoot, 'sessions'), sessionId);
+  const unrelated = await session.beginRun('UNRELATED_TASK_B', 'unrelated-b');
+  await session.failRun('interrupted B', true, unrelated.runId);
+  const agent = await MimiAgent.create({
+    provider: 'openai', workspaceRoot: root, dataRoot, permissionMode: 'trusted',
+    skillsRoot: path.join(root, 'skills'), mcpConfig: path.join(root, 'mcp.json'),
+    historyLimit: 40, contextWindow: 128_000, maxTurns: 20,
+  });
+  let instructions = '';
+  const runner = (agent as unknown as { runner: { run: (runtimeAgent: unknown) => Promise<unknown> } }).runner;
+  runner.run = async (runtimeAgent) => {
+    instructions = String((runtimeAgent as { instructions?: unknown }).instructions ?? '');
+    return {};
+  };
+  try {
+    await agent.stream('UNRELATED_TASK_B');
+    assert.doesNotMatch(instructions, /PRIVATE_GOAL_A_PLAN|PRIVATE_GOAL_A_TEAM|ACTIVE_GOAL_A/);
+    assert.equal((await plans.getGoal())?.objective, 'ACTIVE_GOAL_A');
+  } finally {
+    await agent.failRun(new Error('test cleanup'), true);
+    await agent.close();
+    if (previousSession === undefined) delete process.env.AGENT_SESSION;
+    else process.env.AGENT_SESSION = previousSession;
   }
 });
 

@@ -149,8 +149,7 @@ function criterionSatisfied(
   }
   if (criterion.requiredEvidence === 'artifact') {
     return {
-      satisfied: succeeded.some((item) => ['write_file', 'edit_file', 'move_file'].includes(item.toolName)
-        || (item.toolName === 'run_shell' && objectValue(item.output)?.exitCode === 0)),
+      satisfied: succeeded.some((item) => ['write_file', 'edit_file', 'move_file'].includes(item.toolName)),
       uncertain: false,
     };
   }
@@ -166,6 +165,7 @@ export function evaluateCompletion(
   evidence: readonly CompletionEvidence[],
   incompletePlanSteps: readonly string[] = [],
   requireDurableBlocker = false,
+  incompleteTeamTasks: readonly string[] = [],
 ): CompletionGateDecision {
   if (!contract) return {
     decision: 'continue', reason: '任务尚未建立 Completion Contract；必须先生成验收条件', unmetCriteria: [],
@@ -209,6 +209,7 @@ export function evaluateCompletion(
     uncertain ||= result.uncertain;
   }
   if (incompletePlanSteps.length) unmet.push(...incompletePlanSteps.map((id) => `plan:${id}`));
+  if (incompleteTeamTasks.length) unmet.push(...incompleteTeamTasks.map((id) => `team:${id}`));
   if (unmet.length) return {
     decision: uncertain ? 'uncertain' : 'continue',
     reason: uncertain
@@ -221,7 +222,10 @@ export function evaluateCompletion(
 
 export class CompletionGateError extends Error {
   readonly name = 'CompletionGateError';
-  constructor(readonly gate: CompletionGateDecision) {
+  constructor(
+    readonly gate: CompletionGateDecision,
+    readonly progressFingerprint = '',
+  ) {
     super(`${gate.reason}${gate.unmetCriteria.length ? `；未满足：${gate.unmetCriteria.join(', ')}` : ''}`);
   }
 }
@@ -229,8 +233,12 @@ export class CompletionGateError extends Error {
 export function requiresCompletionContract(input: string): boolean {
   const normalized = input.trim().toLowerCase();
   if (!normalized) return false;
-  return /(?:^\/goal\b|修复|升级|实现|创建|生成|编写|修改|发送|发给|通知|删除|清空|移动|改名|部署|安装|运行|执行|测试|验证|导出|预订|购买|提交|发布|迁移|重构|打开|关闭|关掉|把.+(?:放|移|改|写|存|关|开))/u.test(normalized)
-    || /\b(?:fix|build|create|write|edit|send|delete|deploy|install|run|test|verify|export|submit|implement|open|close|turn|notify|purchase|book|pay|publish|develop|migrate|refactor)\b/u.test(normalized);
+  if (/(?:不要|无需|不需要)(?:调用|使用)任何?工具|(?:仅|只)(?:需)?回复/u.test(normalized)
+    || /\b(?:do not|don't) (?:call|use) (?:any )?tools?\b|\bonly repl(?:y|ies)\b/u.test(normalized)) {
+    return false;
+  }
+  return /(?:^\/goal\b|修复|升级|实现|创建|生成|编写|修改|发送|发给|通知|删除|清空|复制|移动|改名|部署|安装|运行|执行|测试|验证|导出|预订|购买|提交|推送|发布|迁移|重构|打开|关闭|关掉|把.+(?:放|移|改|写|存|关|开))/u.test(normalized)
+    || /\b(?:fix|build|create|write|edit|send|delete|copy|move|rename|deploy|install|run|test|verify|export|submit|commit|push|implement|open|close|turn|notify|purchase|book|pay|publish|develop|migrate|refactor)\b/u.test(normalized);
 }
 
 export function requiresPersistentGoal(input: string): boolean {
@@ -241,12 +249,12 @@ export function requiresPersistentGoal(input: string): boolean {
 
 export function expectedCompletionKind(input: string): CompletionKind {
   const normalized = input.trim().toLowerCase();
-  if (/(?:发送|发给|告诉|说我|通知|购买|预订|下单|支付|发布|上线|部署|提交到|打开|关闭|关掉)/u.test(normalized)
-    || /\b(?:send|notify|purchase|book|pay|publish|deploy|open|close|turn)\b/u.test(normalized)) {
+  if (/(?:发送|发给|告诉|说我|通知|购买|预订|下单|支付|发布|上线|部署|提交到|推送|打开|关闭|关掉)/u.test(normalized)
+    || /\b(?:send|notify|purchase|book|pay|publish|deploy|commit|push|open|close|turn)\b/u.test(normalized)) {
     return 'external_action';
   }
-  if (/(?:修复|升级|实现|创建|生成|编写|修改|编辑|开发|构建|迁移|改造|重构)/u.test(normalized)
-    || /\b(?:fix|build|create|write|edit|implement|develop|migrate|refactor)\b/u.test(normalized)) {
+  if (/(?:修复|升级|实现|创建|生成|编写|修改|编辑|复制|移动|改名|开发|构建|迁移|改造|重构)/u.test(normalized)
+    || /\b(?:fix|build|create|write|edit|copy|move|rename|implement|develop|migrate|refactor)\b/u.test(normalized)) {
     return 'artifact';
   }
   return requiresPersistentGoal(normalized) ? 'long_running' : 'answer';
@@ -269,12 +277,12 @@ export function assertCompletionContractForTask(
   }
   const requiredEvidence = new Set<CompletionEvidenceType>();
   const normalized = input.toLowerCase();
-  if (/(?:修复|升级|实现|创建|生成|编写|修改|编辑|开发|构建|迁移|改造|重构)/u.test(normalized)
-    || /\b(?:fix|build|create|write|edit|implement|develop|migrate|refactor)\b/u.test(normalized)) {
+  if (/(?:修复|升级|实现|创建|生成|编写|修改|编辑|复制|移动|改名|开发|构建|迁移|改造|重构)/u.test(normalized)
+    || /\b(?:fix|build|create|write|edit|copy|move|rename|implement|develop|migrate|refactor)\b/u.test(normalized)) {
     requiredEvidence.add('artifact');
   }
-  if (/(?:发送|发给|告诉|说我|通知|购买|预订|下单|支付|发布|上线|部署|提交到|打开|关闭|关掉)/u.test(normalized)
-    || /\b(?:send|notify|purchase|book|pay|publish|deploy|open|close|turn)\b/u.test(normalized)) {
+  if (/(?:发送|发给|告诉|说我|通知|购买|预订|下单|支付|发布|上线|部署|提交到|推送|打开|关闭|关掉)/u.test(normalized)
+    || /\b(?:send|notify|purchase|book|pay|publish|deploy|commit|push|open|close|turn)\b/u.test(normalized)) {
     requiredEvidence.add('tool_receipt');
   }
   if (/(?:删除|清空|安装|运行|执行|导出|移动|改名)/u.test(normalized)

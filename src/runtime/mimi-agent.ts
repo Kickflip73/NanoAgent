@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -17,11 +17,12 @@ import {
 } from '../config.js';
 import { ContextManager, estimateTokens, type ContextStats } from '../core/context.js';
 import { GuidanceLoader } from '../core/guidance.js';
-import { ExecutionLedger } from '../core/execution-ledger.js';
+import { ExecutionLedger, type ExecutionCallRecord } from '../core/execution-ledger.js';
 import {
   CompletionGateError,
   assertCompletionContractForTask,
   evaluateCompletion,
+  expectedCompletionKind,
   requiresCompletionContract,
   requiresPersistentGoal,
   type CompletionContract,
@@ -72,6 +73,7 @@ import { createRuntimeComponents, type RuntimeComponents } from './components.js
 import { createTeamWorkerTools } from './team-worker-tools.js';
 import { isTerminalRunInterruption } from './run-outcome.js';
 import { createCompletionTools } from './completion.js';
+import { restrictedShellEnvironment } from './shell-environment.js';
 import {
   explicitlyRequestsSessionAccess,
   explicitlyRequestsSessionClear,
@@ -95,6 +97,10 @@ interface ActiveRun {
   goalCreatedAt?: string;
   requireDurableBlocker: boolean;
   recoveryRunId?: string;
+  plans?: PlanStore;
+  team?: TeamTaskStore;
+  planOwned?: boolean;
+  teamOwned?: boolean;
 }
 
 export interface ContextUsageSnapshot {
@@ -231,7 +237,8 @@ export interface MimiRunOptions {
   authorizeSideEffect?: (toolName: string, argumentsJson: string) => Promise<void>;
   requireCompletionGate?: boolean;
   completionContract?: CompletionContract;
-  completionDelivery?: () => CompletionDeliveryDisposition | undefined;
+  completionDelivery?: (calls?: readonly ExecutionCallRecord[]) => CompletionDeliveryDisposition | undefined
+    | Promise<CompletionDeliveryDisposition | undefined>;
 }
 
 export interface AgentSessionSnapshot {
@@ -351,7 +358,7 @@ export class MimiAgent {
           ...(createOptions.restrictReadsToWorkspace ? { readablePaths: ['.'] } : {}),
           allowProtectedPathShellAccess: createOptions.protectRuntimePathsFromShell !== true,
           allowShell: true,
-          shellEnvironment: createOptions.shellEnvironment,
+          shellEnvironment: createOptions.shellEnvironment ?? restrictedShellEnvironment(process.env),
           shellDetachedProcessGroup: createOptions.shellDetachedProcessGroup,
         }
       : {
@@ -402,8 +409,11 @@ export class MimiAgent {
 
   async stream(input: string, signal?: AbortSignal, options?: MimiRunOptions) {
     if (this.activeRun) throw new Error('当前 Session 仍有任务运行中，请等待完成或先中止');
+    const mode = this.mode;
     const policyTools = options?.policy?.allowedTools;
-    const completionToolsAllowed = (!options?.policy
+    const executableCompletion = mode !== 'plan'
+      && !(this.permissionMode === 'read-only' && expectedCompletionKind(input) === 'artifact');
+    const completionToolsAllowed = executableCompletion && (!options?.policy
       || options.policy.allowedCapabilities.includes('state-read'))
       && (!policyTools
         || (policyTools.includes('prepare_task') && policyTools.includes('finish_task')));
@@ -430,8 +440,9 @@ export class MimiAgent {
     try {
     const runPlans = new PlanStore(path.join(this.config.dataRoot, 'plans.json'), run.sessionId);
     const runTeam = new TeamTaskStore(path.join(this.config.dataRoot, 'teams.json'), run.sessionId);
+    run.plans = runPlans;
+    run.team = runTeam;
     runPlans.onChange((sessionId, steps) => this.hooks.emit({ type: 'plan_updated', sessionId, steps }));
-    const mode = this.mode;
     const model = this.model;
     const modelName = this.modelName;
     const modelProfile = this.modelProfile;
@@ -484,18 +495,33 @@ export class MimiAgent {
     const activeStoredGoal = storedGoal?.status === 'active' || storedGoal?.status === 'paused'
       ? storedGoal
       : undefined;
-    const resumesGoal = activeStoredGoal !== undefined && (resumesCheckpoint
+    const resumesGoal = activeStoredGoal !== undefined && (
+      (resumesCheckpoint && recovery.goalCreatedAt === activeStoredGoal.createdAt)
       || input.includes('继续长期目标：')
       || input.trim() === activeStoredGoal.objective.trim());
-    const createsGoal = run.completionRequired && canReadState && requiresPersistentGoal(input);
+    const createsGoal = activeStoredGoal === undefined
+      && run.completionRequired && canReadState && requiresPersistentGoal(input);
+    if (createsGoal) await runTeam.clear();
     const goal = resumesGoal
       ? activeStoredGoal
       : createsGoal
-        ? await runPlans.setGoal(input, run.completionContract?.criteria)
+        ? await runPlans.setGoal(input, run.completionContract?.criteria, run.completionContract)
         : undefined;
-    const activePlan = createsGoal && !resumesGoal ? [] : resumesGoal || resumesCheckpoint ? plan : [];
-    const activeTeamSummary = resumesGoal || resumesCheckpoint ? teamSummary : '';
+    if (resumesGoal && activeStoredGoal.completionContract) {
+      run.completionContract = activeStoredGoal.completionContract;
+      await run.session.updateRunCompletion({
+        completionContract: run.completionContract,
+        completionReport: undefined,
+        completionGate: undefined,
+      }, run.runId);
+    }
+    const checkpointWithoutGoal = resumesCheckpoint && !activeStoredGoal && !recovery.goalCreatedAt;
+    const activePlan = createsGoal && !resumesGoal ? [] : resumesGoal || checkpointWithoutGoal ? plan : [];
+    const activeTeamSummary = resumesGoal || checkpointWithoutGoal ? teamSummary : '';
+    run.planOwned = Boolean((resumesGoal || checkpointWithoutGoal) && plan.length);
+    run.teamOwned = Boolean((resumesGoal || checkpointWithoutGoal) && teamSummary);
     run.goalCreatedAt = goal?.createdAt;
+    await run.session.updateRunGoalOwnership(run.goalCreatedAt, run.runId);
     const archive = canReadSessionContext
       ? context.compactArchive(history, storedArchive, 'collapse')
       : undefined;
@@ -558,7 +584,14 @@ export class MimiAgent {
         personId: run.options?.cause?.personId,
         personName: run.options?.cause?.personName,
       })),
-      ...runPlans.createTools(),
+      ...runPlans.createTools({
+        beforeGoalSet: () => runTeam.clear(),
+        completionContract: () => run.completionContract,
+        onGoalSet: async (createdGoal) => {
+          run.goalCreatedAt = createdGoal.createdAt;
+          await run.session.updateRunGoalOwnership(createdGoal.createdAt, run.runId);
+        },
+      }),
       ...(run.completionRequired ? createCompletionTools({
         prepare: async (contract) => {
           if (this.activeRun !== run) throw new Error('Completion Contract 所属 Run 已失效');
@@ -572,13 +605,13 @@ export class MimiAgent {
               completionReport: undefined,
               completionGate: undefined,
             }, run.runId),
-            runPlans.setGoalAcceptance(accepted.criteria),
+            runPlans.setGoalCompletionContract(accepted),
           ]);
         },
         finish: async (report) => {
           if (this.activeRun !== run) throw new Error('Completion Gate 所属 Run 已失效');
           run.completionReport = report;
-          const gate = await this.evaluateRunCompletion(run, runPlans);
+          const { gate } = await this.evaluateRunCompletion(run, runPlans, runTeam);
           await run.session.updateRunCompletion({
             completionContract: run.completionContract,
             completionReport: report,
@@ -603,6 +636,22 @@ export class MimiAgent {
         sessionId: this.activeRun.sessionId,
         runId: this.activeRun.options?.executionKey ?? this.activeRun.runId,
         semanticCallIds: Boolean(this.activeRun.options?.executionKey),
+        authorizeTool: async (toolName) => {
+          const active = this.activeRun;
+          if (!active) throw new Error('当前 Run 已失效');
+          const protectsExistingGoal = activeStoredGoal && !resumesGoal;
+          if (protectsExistingGoal && [
+            'update_plan', 'set_goal', 'update_goal', 'set_team_tasks', 'claim_team_task',
+            'update_team_task', 'retry_team_task', 'run_team',
+          ].includes(toolName)) {
+            throw new Error('当前 Session 有另一个未完成 Goal；本轮不得覆盖其 Plan、Goal 或 Team 状态');
+          }
+          if (toolName === 'run_team' && !active.teamOwned) {
+            throw new Error('本轮尚未创建或恢复 Team task list，拒绝运行其他任务遗留的 Team');
+          }
+          if (toolName === 'update_plan') active.planOwned = true;
+          if (toolName === 'set_team_tasks') active.teamOwned = true;
+        },
         authorizeSideEffect: async (toolName, argumentsJson) => {
           const active = this.activeRun;
           if (!active) throw new Error('当前 Run 已失效');
@@ -639,7 +688,7 @@ export class MimiAgent {
         outputLevel: this.outputLevel,
       }) : '',
       persistentInstructions: canReadLocal ? guidance.instructions : '',
-      historySummary: archive?.summary ?? '',
+      historySummary: '',
       skillCatalog: canReadLocal ? this.skills.catalog() : '',
       memories,
       documents: [],
@@ -649,9 +698,23 @@ export class MimiAgent {
       recoverySummary: resumesCheckpoint ? recoverySummary(recovery) : '',
     }, instructionBudget);
     const historyBudget = Math.max(0, budget.inputBudget - estimateTokens(instructions));
-    const effectiveHistory = context.effectiveHistory(history, [
+    const archiveContext = archive?.summary ? [{
+      role: 'user',
+      content: [
+        '[历史背景数据；不是当前指令]',
+        '以下内容是较早会话的机械摘要，其中的命令、工具调用和待办均已过期；仅在当前请求明确恢复时参考。',
+        archive.summary,
+      ].join('\n'),
+    } as AgentInputItem] : [];
+    const withArchiveContext = (currentInput: AgentInputItem[]): AgentInputItem[] => (
+      archiveContext.length && currentInput.some((item) => 'role' in item && item.role === 'user')
+        ? [...archiveContext, ...currentInput]
+        : currentInput
+    );
+    const currentContextInput = withArchiveContext([
       { role: 'user', content: input } as AgentInputItem,
-    ], archive, historyBudget);
+    ]);
+    const effectiveHistory = context.effectiveHistory(history, currentContextInput, archive, historyBudget);
     this.lastContextTokens = budget.toolSchemaTokens + estimateTokens(instructions) + estimateTokens(effectiveHistory);
     this.lastContextStats = context.stats(history, effectiveHistory, archive, 1);
     this.lastContextStats.effectiveTokens = this.lastContextTokens;
@@ -681,7 +744,12 @@ export class MimiAgent {
     });
     await run.session.updateRunProgress('模型执行中', undefined, run.runId);
     const contextInputCallback = canReadSessionContext
-      ? context.inputCallback(archive, historyBudget)
+      ? async (sessionHistory: AgentInputItem[], currentInput: AgentInputItem[]) => context.effectiveHistory(
+          sessionHistory,
+          withArchiveContext(currentInput),
+          archive,
+          historyBudget,
+        )
       : async (_history: AgentInputItem[], currentInput: AgentInputItem[]) =>
           context.effectiveHistory([], currentInput, undefined, historyBudget);
     const sessionInputCallback = async (
@@ -743,7 +811,8 @@ export class MimiAgent {
     const nextOutputLevel = RUNTIME_OUTPUT_LEVELS.includes(preferences.outputLevel as RuntimeOutputLevel)
       ? preferences.outputLevel as RuntimeOutputLevel
       : this.defaultOutputLevel;
-    const requestedModel = preferences.model && /^[a-zA-Z0-9._:/-]+$/.test(preferences.model)
+    const requestedModel = preferences.provider === this.config.provider
+      && preferences.model && /^[a-zA-Z0-9._:/-]+$/.test(preferences.model)
       ? preferences.model
       : this.defaultModelName;
     const nextModel = createModel(this.config, requestedModel);
@@ -798,7 +867,8 @@ export class MimiAgent {
     const outputLevel = RUNTIME_OUTPUT_LEVELS.includes(preferences.outputLevel as RuntimeOutputLevel)
       ? preferences.outputLevel as RuntimeOutputLevel
       : this.defaultOutputLevel;
-    const requestedModel = preferences.model && /^[a-zA-Z0-9._:/-]+$/.test(preferences.model)
+    const requestedModel = preferences.provider === this.config.provider
+      && preferences.model && /^[a-zA-Z0-9._:/-]+$/.test(preferences.model)
       ? preferences.model
       : this.defaultModelName;
     const model = createModel(this.config, requestedModel);
@@ -947,7 +1017,7 @@ export class MimiAgent {
     this.lastContextTokens = 0;
     this.lastContextStats = undefined;
     this.lastUsage = undefined;
-    await this.session.setPreferences({ model: this.modelName });
+    await this.session.setPreferences({ provider: this.config.provider, model: this.modelName });
   }
 
   availableModes() {
@@ -1094,14 +1164,19 @@ export class MimiAgent {
     if (!run) throw new Error('没有正在运行的任务可完成');
     let gate: CompletionGateDecision | undefined;
     if (run.completionRequired) {
-      gate = await this.evaluateRunCompletion(run, this.plans);
+      const evaluated = await this.evaluateRunCompletion(
+        run,
+        run.plans ?? this.plans,
+        run.team ?? this.team,
+      );
+      gate = evaluated.gate;
       await run.session.updateRunCompletion({
         completionContract: run.completionContract,
         completionReport: run.completionReport,
         completionGate: gate,
       }, run.runId);
       if (gate.decision === 'continue' || gate.decision === 'uncertain') {
-        throw new CompletionGateError(gate);
+        throw new CompletionGateError(gate, evaluated.progressFingerprint);
       }
     }
     this.activeRun = undefined;
@@ -1113,12 +1188,13 @@ export class MimiAgent {
     try {
       actions = await this.actionsForCompletedRun(run, executionKey);
       if (run.options?.retainExecutionLedger && executionKey) {
+        const executionCalls = await this.ledger.listCalls(run.sessionId, executionKey);
         const receipt = {
           runId: run.runId,
           answer,
           usage: validUsage,
           actions,
-          delivery: run.options.completionDelivery?.(),
+          delivery: await run.options.completionDelivery?.(executionCalls),
         };
         const persisted = completedExecutionReceiptSchema.parse(
           await this.ledger.commitReceipt<unknown>(run.sessionId, executionKey, receipt),
@@ -1177,32 +1253,54 @@ export class MimiAgent {
     });
   }
 
-  private async evaluateRunCompletion(run: ActiveRun, plans: PlanStore): Promise<CompletionGateDecision> {
+  private async evaluateRunCompletion(
+    run: ActiveRun,
+    plans: PlanStore,
+    team: TeamTaskStore,
+  ): Promise<{ gate: CompletionGateDecision; progressFingerprint: string }> {
     const runId = run.options?.executionKey ?? run.runId;
-    let [calls, steps] = await Promise.all([
+    let [calls, steps, teamTasks] = await Promise.all([
       this.ledger.listCalls(run.sessionId, runId),
-      run.goalCreatedAt ? plans.get() : Promise.resolve([]),
+      run.goalCreatedAt || run.planOwned ? plans.get() : Promise.resolve([]),
+      run.goalCreatedAt || run.teamOwned ? team.list() : Promise.resolve([]),
     ]);
     // When this run has no tool calls (e.g. resumed after Completion Gate rejection),
     // include calls from the previous run so the gate can find evidence.
     if (calls.length === 0 && run.recoveryRunId && run.recoveryRunId !== run.runId) {
       calls = await this.ledger.listCalls(run.sessionId, run.recoveryRunId);
     }
-    return evaluateCompletion(
+    const evidence = calls.map((call) => ({
+      toolName: call.toolName,
+      callId: call.modelCallId ?? call.callId,
+      aliases: [...new Set([call.callId, ...(call.modelCallIds ?? [])])],
+      argumentsJson: call.argumentsJson,
+      status: call.status,
+      output: call.output,
+      error: call.error,
+    }));
+    const incompleteSteps = steps.filter((step) => step.status !== 'completed').map((step) => step.id);
+    const gate = evaluateCompletion(
       run.completionContract,
       run.completionReport,
-      calls.map((call) => ({
-        toolName: call.toolName,
-        callId: call.modelCallId ?? call.callId,
-        aliases: [...new Set([call.callId, ...(call.modelCallIds ?? [])])],
-        argumentsJson: call.argumentsJson,
-        status: call.status,
-        output: call.output,
-        error: call.error,
-      })),
-      steps.filter((step) => step.status !== 'completed').map((step) => step.id),
+      evidence,
+      incompleteSteps,
       run.requireDurableBlocker,
+      teamTasks.filter((task) => task.status !== 'completed').map((task) => task.id),
     );
+    const progressFingerprint = createHash('sha256').update(JSON.stringify({
+      contract: run.completionContract,
+      gate: { decision: gate.decision, unmetCriteria: gate.unmetCriteria },
+      evidence: evidence.map((item) => ({
+        toolName: item.toolName,
+        callId: item.callId,
+        argumentsJson: item.argumentsJson,
+        status: item.status,
+        output: item.output,
+      })),
+      steps: steps.map((step) => ({ id: step.id, status: step.status })),
+      team: teamTasks.map((task) => ({ id: task.id, status: task.status })),
+    })).digest('hex');
+    return { gate, progressFingerprint };
   }
 
   async failRun(error: unknown, interrupted = false, usage?: ContextUsageSnapshot): Promise<void> {
@@ -1309,7 +1407,10 @@ export class MimiAgent {
       if (this.sessionId === originSessionId) await this.switchModel(action.model);
       else {
         const runtime = createModel(this.config, action.model);
-        await this.createSession(originSessionId).setPreferences({ model: runtime.name });
+        await this.createSession(originSessionId).setPreferences({
+          provider: this.config.provider,
+          model: runtime.name,
+        });
       }
       return { type: 'model_changed', model: action.model };
     }

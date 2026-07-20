@@ -186,7 +186,7 @@ test('wraps SDK side-effect tools with the active run ledger', async () => {
   assert.equal(executions, 1);
 });
 
-test('daemon semantic call ids replay the same side effect across changed SDK call ids', async () => {
+test('daemon semantic call ids distinguish same-attempt repeats and replay them across attempts', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'nano-ledger-semantic-'));
   const ledger = new ExecutionLedger(path.join(root, 'ledger.json'));
   let executions = 0;
@@ -196,26 +196,38 @@ test('daemon semantic call ids replay the same side effect across changed SDK ca
     parameters: z.object({ path: z.string() }),
     execute: async () => ({ executions: ++executions }),
   });
-  const [wrapped] = withExecutionLedger([original], ledger, () => ({
+  const identity = () => ({
     sessionId: 'demo', runId: 'event:event-1', semanticCallIds: true,
-  }));
+  });
+  const [wrapped] = withExecutionLedger([original], ledger, identity);
   assert.ok(wrapped && 'invoke' in wrapped);
   const first = await wrapped.invoke(
     new RunContext({}), '{"path":"a.txt"}', { toolCall: { callId: 'sdk-call-1' } } as never,
   );
-  const replay = await wrapped.invoke(
+  const second = await wrapped.invoke(
     new RunContext({}), '{ "path": "a.txt" }', { toolCall: { callId: 'sdk-call-2' } } as never,
   );
   await wrapped.invoke(
     new RunContext({}), '{"path":"b.txt"}', { toolCall: { callId: 'sdk-call-3' } } as never,
   );
-  assert.deepEqual(replay, first);
-  assert.equal(executions, 2);
-  const [replayedCall] = await ledger.listCalls('demo', 'event:event-1');
-  assert.deepEqual(replayedCall?.modelCallIds, ['sdk-call-1', 'sdk-call-2']);
+  assert.notDeepEqual(second, first);
+  assert.equal(executions, 3);
+
+  const [retryWrapped] = withExecutionLedger([original], ledger, identity);
+  assert.ok(retryWrapped && 'invoke' in retryWrapped);
+  assert.deepEqual(await retryWrapped.invoke(
+    new RunContext({}), '{"path":"a.txt"}', { toolCall: { callId: 'retry-call-1' } } as never,
+  ), first);
+  assert.deepEqual(await retryWrapped.invoke(
+    new RunContext({}), '{"path":"a.txt"}', { toolCall: { callId: 'retry-call-2' } } as never,
+  ), second);
+  assert.equal(executions, 3);
+  const replayedCalls = await ledger.listCalls('demo', 'event:event-1');
+  assert.deepEqual(replayedCalls[0]?.modelCallIds, ['sdk-call-1', 'retry-call-1']);
+  assert.deepEqual(replayedCalls[1]?.modelCallIds, ['sdk-call-2', 'retry-call-2']);
 });
 
-test('semantic call ids canonicalize nested JSON object keys without reordering arrays', async () => {
+test('semantic call ids canonicalize nested JSON object keys across attempts without reordering arrays', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-ledger-canonical-'));
   const ledger = new ExecutionLedger(path.join(root, 'ledger.json'));
   let executions = 0;
@@ -225,24 +237,28 @@ test('semantic call ids canonicalize nested JSON object keys without reordering 
     parameters: z.object({ metadata: z.record(z.string(), z.unknown()), order: z.array(z.number()) }),
     execute: async () => ({ executions: ++executions }),
   });
-  const [wrapped] = withExecutionLedger([original], ledger, () => ({
+  const identity = () => ({
     sessionId: 'demo', runId: 'event:event-canonical', semanticCallIds: true,
-  }));
+  });
+  const [wrapped] = withExecutionLedger([original], ledger, identity);
   assert.ok(wrapped && 'invoke' in wrapped);
   const first = await wrapped.invoke(
     new RunContext({}),
     '{"metadata":{"b":2,"nested":{"z":1,"a":0}},"order":[2,1]}',
     { toolCall: { callId: 'sdk-a' } } as never,
   );
-  const replay = await wrapped.invoke(
-    new RunContext({}),
-    '{"order":[2,1],"metadata":{"nested":{"a":0,"z":1},"b":2}}',
-    { toolCall: { callId: 'sdk-b' } } as never,
-  );
   await wrapped.invoke(
     new RunContext({}),
     '{"metadata":{"b":2,"nested":{"a":0,"z":1}},"order":[1,2]}',
     { toolCall: { callId: 'sdk-c' } } as never,
+  );
+  assert.equal(executions, 2);
+  const [retryWrapped] = withExecutionLedger([original], ledger, identity);
+  assert.ok(retryWrapped && 'invoke' in retryWrapped);
+  const replay = await retryWrapped.invoke(
+    new RunContext({}),
+    '{"order":[2,1],"metadata":{"nested":{"a":0,"z":1},"b":2}}',
+    { toolCall: { callId: 'sdk-b' } } as never,
   );
   assert.deepEqual(replay, first);
   assert.equal(executions, 2);
@@ -257,14 +273,17 @@ test('side-effect authorization is consumed only inside the first semantic ledge
     name: 'write_file', description: 'test', parameters: z.object({ path: z.string() }),
     execute: async () => ({ executions: ++executions }),
   });
-  const [wrapped] = withExecutionLedger([original], ledger, () => ({
+  const identity = () => ({
     sessionId: 'demo', runId: 'event:authorized', semanticCallIds: true,
     authorizeSideEffect: async () => { authorizations += 1; },
-  }));
+  });
+  const [wrapped] = withExecutionLedger([original], ledger, identity);
   assert.ok(wrapped && 'invoke' in wrapped);
   const input = '{"path":"reports/today.md"}';
   await wrapped.invoke(new RunContext({}), input, { toolCall: { callId: 'sdk-a' } } as never);
-  await wrapped.invoke(new RunContext({}), input, { toolCall: { callId: 'sdk-b' } } as never);
+  const [retryWrapped] = withExecutionLedger([original], ledger, identity);
+  assert.ok(retryWrapped && 'invoke' in retryWrapped);
+  await retryWrapped.invoke(new RunContext({}), input, { toolCall: { callId: 'sdk-b' } } as never);
   assert.equal(authorizations, 1);
   assert.equal(executions, 1);
 });

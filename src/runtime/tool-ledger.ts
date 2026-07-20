@@ -48,6 +48,7 @@ export function withExecutionLedger(
   ledger: ExecutionLedger,
   currentRun: () => RunIdentity | undefined,
 ): Tool[] {
+  const semanticOccurrences = new Map<string, number>();
   return tools.map((tool) => {
     if (!isInvokable(tool)) return tool;
     const sideEffect = isSideEffectTool(tool.name);
@@ -60,8 +61,13 @@ export function withExecutionLedger(
         if (!sideEffect) return originalInvoke(runContext, input, details);
         const sdkCallId = details?.toolCall?.callId;
         const argumentsJson = run?.semanticCallIds ? semanticArguments(input) : input;
+        const semanticKey = `${tool.name}\0${argumentsJson}`;
+        const occurrence = run?.semanticCallIds
+          ? (semanticOccurrences.get(semanticKey) ?? 0) + 1
+          : undefined;
+        if (occurrence !== undefined) semanticOccurrences.set(semanticKey, occurrence);
         const callId = run?.semanticCallIds
-          ? createHash('sha256').update(`${tool.name}\0${argumentsJson}`).digest('hex')
+          ? createHash('sha256').update(`${semanticKey}\0${occurrence}`).digest('hex')
           : sdkCallId;
         const invokeAuthorized = async () => {
           await run?.authorizeSideEffect?.(tool.name, input);

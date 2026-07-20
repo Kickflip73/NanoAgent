@@ -2,7 +2,12 @@ import { tool } from '@openai/agents';
 import { z } from 'zod';
 import { assertSessionId } from './session-id.js';
 import { AtomicJsonStore } from './state-file.js';
-import { completionCriterionSchema, type CompletionCriterion } from './completion.js';
+import {
+  completionContractSchema,
+  completionCriterionSchema,
+  type CompletionContract,
+  type CompletionCriterion,
+} from './completion.js';
 
 export interface PlanStep {
   id: string;
@@ -16,6 +21,7 @@ export interface Goal {
   objective: string;
   status: GoalStatus;
   acceptanceCriteria?: CompletionCriterion[];
+  completionContract?: CompletionContract;
   completionEvidence?: string;
   nextAction?: string;
   checkpoint?: string;
@@ -41,6 +47,7 @@ const goalSchema = z.object({
   objective: z.string(),
   status: z.enum(['active', 'paused', 'completed', 'failed']),
   acceptanceCriteria: z.array(completionCriterionSchema).max(8).optional(),
+  completionContract: completionContractSchema.optional(),
   completionEvidence: z.string().optional(),
   nextAction: z.string().optional(),
   checkpoint: z.string().optional(),
@@ -104,7 +111,11 @@ export class PlanStore {
     return (await this.state.read())[sessionId]?.goal;
   }
 
-  async setGoal(objective: string, acceptanceCriteria?: CompletionCriterion[]): Promise<Goal> {
+  async setGoal(
+    objective: string,
+    acceptanceCriteria?: CompletionCriterion[],
+    completionContract?: CompletionContract,
+  ): Promise<Goal> {
     const sessionId = this.sessionId;
     const goal = await this.mutate((plans) => {
       const now = new Date().toISOString();
@@ -112,6 +123,7 @@ export class PlanStore {
         objective: objective.trim(),
         status: 'active',
         ...(acceptanceCriteria?.length ? { acceptanceCriteria } : {}),
+        ...(completionContract ? { completionContract } : {}),
         createdAt: now,
         updatedAt: now,
       };
@@ -130,6 +142,25 @@ export class PlanStore {
       state.goal = {
         ...state.goal,
         acceptanceCriteria: criteria,
+        updatedAt: new Date().toISOString(),
+      };
+      return state.goal;
+    });
+  }
+
+  async setGoalCompletionContract(contract: CompletionContract): Promise<Goal | undefined> {
+    const sessionId = this.sessionId;
+    return this.mutate((plans) => {
+      const state = plans[sessionId];
+      if (!state?.goal || state.goal.status === 'completed') return undefined;
+      if (state.goal.completionContract
+        && JSON.stringify(state.goal.completionContract) !== JSON.stringify(contract)) {
+        throw new Error('当前 Goal 的 Completion Contract 已锁定，拒绝覆盖');
+      }
+      state.goal = {
+        ...state.goal,
+        completionContract: contract,
+        acceptanceCriteria: contract.criteria,
         updatedAt: new Date().toISOString(),
       };
       return state.goal;
@@ -198,7 +229,11 @@ export class PlanStore {
     await this.notify(sessionId, []);
   }
 
-  createTools() {
+  createTools(options: {
+    beforeGoalSet?: () => void | Promise<void>;
+    completionContract?: () => CompletionContract | undefined;
+    onGoalSet?: (goal: Goal) => void | Promise<void>;
+  } = {}) {
     const step = z.object({
       id: z.string().min(1),
       description: z.string().min(1),
@@ -224,7 +259,16 @@ export class PlanStore {
           objective: z.string().min(1).max(2_000),
           acceptanceCriteria: z.array(completionCriterionSchema).min(1).max(8),
         }),
-        execute: async ({ objective, acceptanceCriteria }) => this.setGoal(objective, acceptanceCriteria),
+        execute: async ({ objective, acceptanceCriteria }) => {
+          await options.beforeGoalSet?.();
+          const goal = await this.setGoal(
+            objective,
+            acceptanceCriteria,
+            options.completionContract?.(),
+          );
+          await options.onGoalSet?.(goal);
+          return goal;
+        },
       }),
       tool({
         name: 'update_goal',

@@ -60,6 +60,18 @@ Connector 明确返回“尚未执行”的普通失败时，Outbox 按指数退
 
 stdout 必须专用于协议消息；诊断日志写 stderr。单条未换行消息最大 1MB。
 
+需要以 cursor 消费上游事件的 Connector 必须先通过 status 声明
+`"eventAcknowledgement":true`。Daemon 只有在 Event 已写入持久 Inbox（重复
+`source + externalId` 也视为已持久化）后，才向 stdin 返回：
+
+```json
+{"type":"event_ack","externalId":"message-123","ok":true,"eventId":"host-event-id"}
+```
+
+写入失败返回 `ok:false` 和有界 `error`。Connector 必须等整批 Event 全部收到
+成功 ACK 后才推进上游 cursor；ACK 丢失或失败时保留原 cursor 并重读，由 Host
+去重。未声明该能力的旧 Connector 不会收到新消息类型。
+
 ## OpenClaw 微信传输桥
 
 已登录 `@tencent-weixin/openclaw-weixin` 的机器可以复用该通道，不需要在 MimiAgent 中复制微信 Token：
@@ -77,10 +89,10 @@ OpenClaw 插件只在 `inbound_claim` 截获微信入站并写入本用户的 Mi
 Connector 应在渠道状态变化时输出就绪度；这和子进程是否存活是两件事：
 
 ```json
-{"type":"status","inbound":"ready","outbound":"ready","deliveryConfirmed":true}
+{"type":"status","inbound":"ready","outbound":"ready","deliveryConfirmed":true,"eventAcknowledgement":true}
 ```
 
-`inbound` / `outbound` 只能是 `ready | unavailable | unknown`。`deliveryConfirmed:false` 表示 UI 自动化等执行面只能确认动作已尝试，不能确认远端实际收到。未上报 status 的旧 Connector 保持 `unknown`；进程离线时两项统一为 `unavailable`。因此 `online` 只用于诊断子进程，不能再被解释为渠道已经可收发。
+`inbound` / `outbound` 只能是 `ready | unavailable | unknown`。`deliveryConfirmed:false` 表示 UI 自动化等执行面只能确认动作已尝试，不能确认远端实际收到。`eventAcknowledgement:true` 表示 Connector 会等待 Inbox 持久化 ACK；未声明时 Host 保持旧协议兼容。未上报 status 的旧 Connector 保持 `unknown`；进程离线时两项统一为 `unavailable`。因此 `online` 只用于诊断子进程，不能再被解释为渠道已经可收发。
 
 ## 通用本机 Webhook
 
@@ -157,7 +169,7 @@ Connector 执行完成后返回：
 
 POST 请求体包含 `version:1`、`type`、稳定 `id`、`target`、`payload`，Action 额外包含 `action`；同一 `id` 同时放入 `Idempotency-Key`，消息类型放入 `X-Mimi-Message-Type`。Relay 以 2xx 表示接收，Action 可返回 `{"ok":true,"result":...}`；非 2xx 或 `{"ok":false,"error":"..."}` 会沿既有失败语义返回。
 
-事件端点接收 `limit=100` 和可选 `cursor`，返回 `{"events":[...],"cursor":"next"}`；每个 Event 使用本章 Connector → MimiAgent 的字段。Cursor 是非破坏性读取位置：Relay 必须让旧 cursor 和无 cursor 请求在足够长的保留窗口内重放事件，不能因一次 GET 就删除消息。Connector 只在进程内推进 cursor，异常重启后主动重读，由中心 `source + externalId` 去重，因此不会用提前持久化游标换取潜在事件丢失。轮询首次失败和恢复各产生一个有界健康 Event，失败期间指数退避但不影响出站能力。启用模板中的 `http-action` 后，可把 `actions` 目录替换成远端真正支持的明确事务名称；不配置事件 URL 时仍可结合 localhost Webhook 的 `reply.connector` 形成闭环。
+事件端点接收 `limit=100` 和可选 `cursor`，返回 `{"events":[...],"cursor":"next"}`；每个 Event 使用本章 Connector → MimiAgent 的字段。Cursor 是非破坏性读取位置：Relay 必须让旧 cursor 和无 cursor 请求在足够长的保留窗口内重放事件，不能因一次 GET 就删除消息。Connector 等待该批 Event 的持久化 ACK 后才在进程内推进 cursor；ACK 失败、丢失或进程异常都会保留旧 cursor 并主动重读，由中心 `source + externalId` 去重。轮询首次失败和恢复各产生一个有界健康 Event，失败期间指数退避但不影响出站能力。启用模板中的 `http-action` 后，可把 `actions` 目录替换成远端真正支持的明确事务名称；不配置事件 URL 时仍可结合 localhost Webhook 的 `reply.connector` 形成闭环。
 
 这只是一个通用适配协议，不代表 MimiAgent 已经登录或直连微信。只有外部微信网关同时提供真实事件端点、事务端点并完成账号侧配置后，才能启用并视为在线；缺少这些条件时应保持 Connector disabled，不能把模板存在误报为“微信已打通”。
 

@@ -196,6 +196,26 @@ function normalizeEvent(value) {
 let pollCursor;
 let pollFailures = 0;
 let pollOutageId;
+const pendingEventAcks = new Map();
+emit({
+  type: 'status', inbound: eventUrl ? 'ready' : 'unavailable', outbound: 'ready',
+  deliveryConfirmed: true, eventAcknowledgement: true,
+});
+
+function emitWithAck(event) {
+  return new Promise((resolve, reject) => {
+    if (pendingEventAcks.has(event.externalId)) {
+      reject(new Error(`duplicate pending event: ${event.externalId}`));
+      return;
+    }
+    const timer = setTimeout(() => {
+      pendingEventAcks.delete(event.externalId);
+      reject(new Error(`event ACK timed out: ${event.externalId}`));
+    }, timeoutMs);
+    pendingEventAcks.set(event.externalId, { resolve, reject, timer });
+    emit(event);
+  });
+}
 
 function pollHealth(state, error) {
   if (state === 'offline') pollOutageId = `http-event-poll:${Date.now()}`;
@@ -230,7 +250,7 @@ async function pollEvents() {
     if (payload.cursor !== undefined && (
       typeof payload.cursor !== 'string' || !payload.cursor || payload.cursor.length > 2_000
     )) throw new Error('event response cursor is invalid');
-    for (const event of events) emit(event);
+    await Promise.all(events.map((event) => emitWithAck(event)));
     if (payload.cursor) pollCursor = payload.cursor;
     if (pollFailures > 0) pollHealth('recovered');
     pollFailures = 0;
@@ -262,6 +282,15 @@ process.stdin.on('data', (chunk) => {
       message = JSON.parse(line);
     } catch (error) {
       fail(undefined, error);
+      continue;
+    }
+    if (message?.type === 'event_ack') {
+      const pending = pendingEventAcks.get(message.externalId);
+      if (!pending) continue;
+      clearTimeout(pending.timer);
+      pendingEventAcks.delete(message.externalId);
+      if (message.ok) pending.resolve();
+      else pending.reject(new Error(message.error || `event rejected: ${message.externalId}`));
       continue;
     }
     void forward(message).catch((error) => fail(message, error));
