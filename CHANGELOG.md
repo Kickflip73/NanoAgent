@@ -53,6 +53,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- upgrade the lightweight coding I/O loop with bounded recursive directory discovery, path-only and ripgrep-backed regex/glob/context search, ranged digest-bearing reads, stale-safe unified-diff patches, and private-data-filtered Git change inspection
 - remove generated max-turn defaults and fixed-count repeated-tool termination; normal Agent, SubAgent, and Team runs now stop from durable task state, explicit cancellation, timeout, or an operator-configured limit
 - scope Completion Gate enforcement to explicit persistent Goals, stop replaying whole Events after an unfinished Goal, and reuse consecutive identical side-effect results instead of executing them again
 - harden unattended execution with secret-free Shell environments, full process-group cleanup, public-network-only HTTP requests, persistent Connector inbound ACKs, poison-row quarantine, provider-bound model preferences, build-aware Daemon upgrades, and per-attempt logical side-effect identities

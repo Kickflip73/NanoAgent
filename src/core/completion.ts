@@ -149,7 +149,7 @@ function criterionSatisfied(
   }
   if (criterion.requiredEvidence === 'artifact') {
     return {
-      satisfied: succeeded.some((item) => ['write_file', 'edit_file', 'move_file'].includes(item.toolName)),
+      satisfied: succeeded.some((item) => ['write_file', 'edit_file', 'apply_patch', 'move_file'].includes(item.toolName)),
       uncertain: false,
     };
   }

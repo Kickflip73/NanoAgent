@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { lookup as dnsLookup } from 'node:dns';
 import { lookup } from 'node:dns/promises';
 import { constants } from 'node:fs';
@@ -12,6 +13,7 @@ import { PRE_MIMI_DATA_DIRECTORY } from './core/mimi-legacy.js';
 import { withExclusiveFileLock } from './core/state-file.js';
 
 const MAX_TEXT_BYTES = 200_000;
+const MAX_RANGED_TEXT_BYTES = 5_000_000;
 const MAX_SHELL_OUTPUT = 100_000;
 const MAX_HTTP_BYTES = 200_000;
 const MAX_HTTP_REDIRECTS = 5;
@@ -162,6 +164,56 @@ export async function readLocalFile(
   }
 }
 
+export interface LocalFileView {
+  path: string;
+  content: string;
+  startLine: number;
+  endLine: number;
+  totalLines: number;
+  bytes: number;
+  sha256: string;
+  truncated: boolean;
+}
+
+export async function readLocalFileView(
+  workspaceRoot: string,
+  requestedPath: string,
+  options: { startLine?: number; endLine?: number; maxLines?: number } = {},
+  signal?: AbortSignal,
+): Promise<LocalFileView> {
+  signal?.throwIfAborted();
+  const target = resolvePath(workspaceRoot, requestedPath);
+  const info = await stat(target);
+  if (!info.isFile()) throw new Error('只支持读取常规文本文件');
+  const ranged = options.startLine !== undefined || options.endLine !== undefined || options.maxLines !== undefined;
+  const byteLimit = ranged ? MAX_RANGED_TEXT_BYTES : MAX_TEXT_BYTES;
+  if (info.size > byteLimit) {
+    throw new Error(`文件超过 ${byteLimit} 字节限制，请缩小目标文件或使用 Shell 分段读取`);
+  }
+  const buffer = await readFile(target, { signal });
+  signal?.throwIfAborted();
+  const content = buffer.toString('utf8');
+  if (content.includes('\0')) throw new Error('只支持读取 UTF-8 文本文件');
+  const lines = content.split(/\r?\n/);
+  const totalLines = lines.length;
+  const startLine = options.startLine ?? 1;
+  if (startLine > totalLines) throw new Error(`起始行 ${startLine} 超出文件总行数 ${totalLines}`);
+  const requestedEnd = options.endLine ?? totalLines;
+  if (requestedEnd < startLine) throw new Error('endLine 不能小于 startLine');
+  const maxLines = options.maxLines ?? (ranged ? 400 : totalLines);
+  const endLine = Math.min(totalLines, requestedEnd, startLine + maxLines - 1);
+  return {
+    path: target,
+    content: lines.slice(startLine - 1, endLine).join('\n'),
+    startLine,
+    endLine,
+    totalLines,
+    bytes: buffer.byteLength,
+    sha256: createHash('sha256').update(buffer).digest('hex'),
+    truncated: startLine > 1 || endLine < totalLines,
+  };
+}
+
 async function withMutationLocks<R>(targets: string[], operation: () => Promise<R>): Promise<R> {
   const canonical = [...new Set(await Promise.all(targets.map(canonicalPotentialPath)))].sort();
   const acquire = (index: number): Promise<R> => index >= canonical.length
@@ -220,6 +272,185 @@ export async function editLocalFile(
   });
 }
 
+interface PatchHunk {
+  oldStart: number;
+  oldCount: number;
+  newStart: number;
+  newCount: number;
+  lines: string[];
+}
+
+interface ParsedFilePatch {
+  oldPath: string | null;
+  newPath: string | null;
+  hunks: PatchHunk[];
+}
+
+export interface PatchFileResult {
+  path: string;
+  created: boolean;
+  additions: number;
+  deletions: number;
+  oldSha256?: string;
+  newSha256: string;
+}
+
+function patchPath(value: string): string | null {
+  const raw = value.split('\t', 1)[0]!.trim();
+  if (raw === '/dev/null') return null;
+  if (!raw || raw.startsWith('"')) throw new Error(`暂不支持带引号的 patch 路径：${raw}`);
+  return raw.replace(/^[ab]\//, '');
+}
+
+function parseUnifiedPatch(patch: string): ParsedFilePatch[] {
+  if (!patch.trim()) throw new Error('patch 不能为空');
+  const lines = patch.replace(/\r\n/g, '\n').split('\n');
+  const files: ParsedFilePatch[] = [];
+  let index = 0;
+  while (index < lines.length) {
+    if (!lines[index]!.startsWith('--- ')) {
+      index += 1;
+      continue;
+    }
+    const oldPath = patchPath(lines[index]!.slice(4));
+    index += 1;
+    if (!lines[index]?.startsWith('+++ ')) throw new Error('patch 的 --- 文件头后必须紧跟 +++ 文件头');
+    const newPath = patchPath(lines[index]!.slice(4));
+    index += 1;
+    const hunks: PatchHunk[] = [];
+    while (index < lines.length && !lines[index]!.startsWith('--- ')) {
+      const header = lines[index]!.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/u);
+      if (!header) {
+        index += 1;
+        continue;
+      }
+      const hunk: PatchHunk = {
+        oldStart: Number(header[1]),
+        oldCount: Number(header[2] ?? '1'),
+        newStart: Number(header[3]),
+        newCount: Number(header[4] ?? '1'),
+        lines: [],
+      };
+      index += 1;
+      let oldLines = 0;
+      let newLines = 0;
+      while (index < lines.length && (oldLines < hunk.oldCount || newLines < hunk.newCount)) {
+        const line = lines[index]!;
+        if (line === '\\ No newline at end of file') {
+          index += 1;
+          continue;
+        }
+        const marker = line[0] ?? '';
+        if (![' ', '+', '-'].includes(marker)) break;
+        hunk.lines.push(line);
+        if (marker !== '+') oldLines += 1;
+        if (marker !== '-') newLines += 1;
+        index += 1;
+      }
+      if (oldLines !== hunk.oldCount || newLines !== hunk.newCount) {
+        throw new Error(`patch hunk 行数不匹配：期望 -${hunk.oldCount}/+${hunk.newCount}，实际 -${oldLines}/+${newLines}`);
+      }
+      hunks.push(hunk);
+    }
+    if (!hunks.length) throw new Error(`patch 文件 ${newPath ?? oldPath ?? 'unknown'} 没有 hunk`);
+    if (newPath === null) throw new Error('apply_patch 暂不支持删除文件');
+    if (oldPath !== null && oldPath !== newPath) throw new Error('apply_patch 暂不支持重命名文件，请使用 move_file');
+    files.push({ oldPath, newPath, hunks });
+  }
+  if (!files.length) throw new Error('未找到有效的 unified diff 文件头');
+  const paths = files.map((file) => file.newPath!);
+  if (new Set(paths).size !== paths.length) throw new Error('同一文件不能在一个 patch 中重复出现');
+  return files;
+}
+
+function textLines(content: string): { lines: string[]; finalNewline: boolean } {
+  if (!content) return { lines: [], finalNewline: false };
+  const finalNewline = content.endsWith('\n');
+  const body = finalNewline ? content.slice(0, -1) : content;
+  return { lines: body.split(/\r?\n/), finalNewline };
+}
+
+function applyHunks(content: string, file: ParsedFilePatch): string {
+  const original = textLines(content);
+  const next: string[] = [];
+  let cursor = 0;
+  for (const hunk of file.hunks) {
+    const target = hunk.oldStart === 0 ? 0 : hunk.oldStart - 1;
+    if (target < cursor || target > original.lines.length) throw new Error(`patch hunk 起始行无效：${hunk.oldStart}`);
+    next.push(...original.lines.slice(cursor, target));
+    cursor = target;
+    for (const line of hunk.lines) {
+      const marker = line[0]!;
+      const value = line.slice(1);
+      if (marker === '+') {
+        next.push(value);
+        continue;
+      }
+      if (original.lines[cursor] !== value) {
+        throw new Error(`patch 上下文不匹配：第 ${cursor + 1} 行期望 ${JSON.stringify(value)}`);
+      }
+      if (marker === ' ') next.push(value);
+      cursor += 1;
+    }
+  }
+  next.push(...original.lines.slice(cursor));
+  const joined = next.join('\n');
+  return joined && (original.finalNewline || file.oldPath === null) ? `${joined}\n` : joined;
+}
+
+export async function applyLocalPatch(
+  workspaceRoot: string,
+  patch: string,
+  expectedFiles: Array<{ path: string; sha256: string }> = [],
+  validate?: (target: string) => Promise<void>,
+): Promise<{ files: PatchFileResult[] }> {
+  const parsed = parseUnifiedPatch(patch);
+  const targets = parsed.map((file) => resolvePath(workspaceRoot, file.newPath!));
+  const expected = new Map(expectedFiles.map((item) => [resolvePath(workspaceRoot, item.path), item.sha256.toLowerCase()]));
+  return withMutationLocks(targets, async () => {
+    const prepared: Array<{ target: string; content: string; result: PatchFileResult }> = [];
+    for (let index = 0; index < parsed.length; index += 1) {
+      const file = parsed[index]!;
+      const target = await canonicalPotentialPath(targets[index]!);
+      await validate?.(target);
+      let original = '';
+      let originalBuffer: Buffer | undefined;
+      try {
+        originalBuffer = await readFile(target);
+        original = originalBuffer.toString('utf8');
+        if (file.oldPath === null) throw new Error(`创建目标已存在：${file.newPath}`);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        if (file.oldPath !== null) throw new Error(`patch 目标不存在：${file.oldPath}`);
+      }
+      const oldSha256 = originalBuffer
+        ? createHash('sha256').update(originalBuffer).digest('hex')
+        : undefined;
+      const expectedSha256 = expected.get(targets[index]!);
+      if (expectedSha256 && oldSha256 !== expectedSha256) {
+        throw new Error(`文件已变化，拒绝应用过期 patch：${file.newPath}`);
+      }
+      const content = applyHunks(original, file);
+      const additions = file.hunks.reduce((sum, hunk) => sum + hunk.lines.filter((line) => line[0] === '+').length, 0);
+      const deletions = file.hunks.reduce((sum, hunk) => sum + hunk.lines.filter((line) => line[0] === '-').length, 0);
+      prepared.push({
+        target,
+        content,
+        result: {
+          path: file.newPath!,
+          created: file.oldPath === null,
+          additions,
+          deletions,
+          ...(oldSha256 ? { oldSha256 } : {}),
+          newSha256: createHash('sha256').update(content).digest('hex'),
+        },
+      });
+    }
+    for (const item of prepared) await atomicWrite(item.target, item.content);
+    return { files: prepared.map((item) => item.result) };
+  });
+}
+
 export async function moveLocalFile(
   workspaceRoot: string,
   sourcePath: string,
@@ -253,6 +484,7 @@ export interface FileSearchMatch {
   path: string;
   line?: number;
   text?: string;
+  context?: Array<{ line: number; text: string }>;
   match: 'path' | 'content';
 }
 
@@ -260,6 +492,26 @@ export interface FileSearchLimits {
   maxScannedEntries?: number;
   maxDepth?: number;
   maxReadBytes?: number;
+  regex?: boolean;
+  caseSensitive?: boolean;
+  globs?: string[];
+  contextLines?: number;
+  excludedPaths?: string[];
+  pathsOnly?: boolean;
+}
+
+function globPattern(pattern: string): RegExp {
+  let source = '';
+  for (let index = 0; index < pattern.length; index += 1) {
+    const character = pattern[index]!;
+    if (character === '*' && pattern[index + 1] === '*') {
+      source += '.*';
+      index += 1;
+    } else if (character === '*') source += '[^/]*';
+    else if (character === '?') source += '[^/]';
+    else source += character.replace(/[|\\{}()[\]^$+?.]/g, '\\$&');
+  }
+  return new RegExp(`^${source}$`);
 }
 
 export async function searchLocalFiles(
@@ -271,7 +523,13 @@ export async function searchLocalFiles(
   limits: FileSearchLimits = {},
 ): Promise<FileSearchMatch[]> {
   const root = resolvePath(workspaceRoot, requestedPath);
-  const needle = query.toLowerCase();
+  const flags = limits.caseSensitive ? 'u' : 'iu';
+  const matcher = limits.regex
+    ? new RegExp(query, flags)
+    : new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), flags);
+  const globs = limits.globs?.map(globPattern) ?? [];
+  const contextLines = limits.contextLines ?? 0;
+  const excludedRoots = (limits.excludedPaths ?? []).map((value) => resolvePath(workspaceRoot, value));
   const results: FileSearchMatch[] = [];
   const maxScannedEntries = limits.maxScannedEntries ?? 10_000;
   const maxDepth = limits.maxDepth ?? 64;
@@ -282,6 +540,7 @@ export async function searchLocalFiles(
   const visit = async (target: string, depth: number): Promise<void> => {
     signal?.throwIfAborted();
     if (results.length >= maxResults) return;
+    if (excludedRoots.some((excluded) => containsPath(excluded, target))) return;
     if (depth > maxDepth) throw new Error(`文件搜索目录深度超过 ${maxDepth} 层`);
     scannedEntries += 1;
     if (scannedEntries > maxScannedEntries) throw new Error(`文件搜索扫描项超过 ${maxScannedEntries} 个`);
@@ -300,14 +559,16 @@ export async function searchLocalFiles(
       }
       return;
     }
-    if (!info.isFile() || info.size > MAX_TEXT_BYTES) return;
-    readBytes += info.size;
-    if (readBytes > maxReadBytes) throw new Error(`文件搜索读取总量超过 ${maxReadBytes} 字节`);
-    const relativePath = path.relative(workspaceRoot, target);
-    if (relativePath.toLowerCase().includes(needle)) {
+    if (!info.isFile()) return;
+    const relativePath = path.relative(workspaceRoot, target).split(path.sep).join('/');
+    if (globs.length && !globs.some((glob) => glob.test(relativePath))) return;
+    if (matcher.test(relativePath)) {
       results.push({ path: relativePath, match: 'path' });
       if (results.length >= maxResults) return;
     }
+    if (limits.pathsOnly || info.size > MAX_TEXT_BYTES) return;
+    readBytes += info.size;
+    if (readBytes > maxReadBytes) throw new Error(`文件搜索读取总量超过 ${maxReadBytes} 字节`);
     let content: string;
     try {
       content = await readFile(target, 'utf8');
@@ -317,11 +578,19 @@ export async function searchLocalFiles(
     if (content.includes('\0')) return;
     const lines = content.split(/\r?\n/);
     for (let index = 0; index < lines.length; index += 1) {
-      if (!lines[index]!.toLowerCase().includes(needle)) continue;
+      if (!matcher.test(lines[index]!)) continue;
+      const contextStart = Math.max(0, index - contextLines);
+      const contextEnd = Math.min(lines.length, index + contextLines + 1);
       results.push({
         path: relativePath,
         line: index + 1,
         text: truncate(lines[index]!.trim(), 240),
+        ...(contextLines ? {
+          context: lines.slice(contextStart, contextEnd).map((line, contextIndex) => ({
+            line: contextStart + contextIndex + 1,
+            text: truncate(line, 240),
+          })),
+        } : {}),
         match: 'content',
       });
       if (results.length >= maxResults) break;
@@ -330,6 +599,229 @@ export async function searchLocalFiles(
 
   await visit(root, 0);
   return results;
+}
+
+interface DirectCommandResult {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  missing?: boolean;
+}
+
+async function runDirectCommand(
+  command: string,
+  args: string[],
+  cwd: string,
+  signal?: AbortSignal,
+  maxBytes = 5_000_000,
+): Promise<DirectCommandResult> {
+  signal?.throwIfAborted();
+  return new Promise((resolve) => {
+    const allowedEnvironment = ['PATH', 'HOME', 'TMPDIR', 'TEMP', 'TMP', 'LANG', 'LC_ALL', 'LC_CTYPE', 'SystemRoot', 'ComSpec', 'PATHEXT'];
+    const environment = Object.fromEntries(allowedEnvironment
+      .map((name) => [name, process.env[name]])
+      .filter((entry): entry is [string, string] => entry[1] !== undefined));
+    const child = spawn(command, args, { cwd, env: environment, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let settled = false;
+    const finish = (result: DirectCommandResult): void => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener('abort', abort);
+      resolve(result);
+    };
+    const abort = (): void => {
+      child.kill('SIGTERM');
+      finish({
+        exitCode: 1,
+        stdout: Buffer.concat(stdout).toString('utf8'),
+        stderr: signal?.reason instanceof Error ? signal.reason.message : String(signal?.reason ?? '命令已取消'),
+      });
+    };
+    signal?.addEventListener('abort', abort, { once: true });
+    child.stdout.on('data', (chunk: Buffer) => {
+      stdoutBytes += chunk.length;
+      if (stdoutBytes <= maxBytes) stdout.push(chunk);
+      else child.kill('SIGTERM');
+    });
+    child.stderr.on('data', (chunk: Buffer) => {
+      stderrBytes += chunk.length;
+      if (stderrBytes <= maxBytes) stderr.push(chunk);
+      else child.kill('SIGTERM');
+    });
+    child.once('error', (error) => finish({
+      exitCode: 1,
+      stdout: Buffer.concat(stdout).toString('utf8'),
+      stderr: error.message,
+      ...((error as NodeJS.ErrnoException).code === 'ENOENT' ? { missing: true } : {}),
+    }));
+    child.once('close', (code) => finish({
+      exitCode: code ?? 1,
+      stdout: Buffer.concat(stdout).toString('utf8'),
+      stderr: [Buffer.concat(stderr).toString('utf8'), stdoutBytes > maxBytes || stderrBytes > maxBytes
+        ? `输出超过 ${maxBytes} 字节限制`
+        : ''].filter(Boolean).join('\n'),
+    }));
+  });
+}
+
+function ripgrepBaseArgs(workspaceRoot: string, options: FileSearchLimits): string[] {
+  const args = [
+    '--hidden', '--max-filesize', '200K',
+    '--glob', '!.git/**',
+    '--glob', '!.mimi-agent/**',
+    '--glob', `!${PRE_MIMI_DATA_DIRECTORY}/**`,
+    '--glob', '!node_modules/**',
+    '--glob', '!dist/**',
+  ];
+  for (const excludedPath of options.excludedPaths ?? []) {
+    const relative = path.relative(workspaceRoot, resolvePath(workspaceRoot, excludedPath)).split(path.sep).join('/');
+    if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) continue;
+    args.push('--glob', `!${relative}`, '--glob', `!${relative}/**`);
+  }
+  for (const glob of options.globs ?? []) args.push('--glob', glob);
+  return args;
+}
+
+function isExcludedSearchPath(workspaceRoot: string, relativePath: string, options: FileSearchLimits): boolean {
+  const target = resolvePath(workspaceRoot, relativePath);
+  return (options.excludedPaths ?? [])
+    .some((excludedPath) => containsPath(resolvePath(workspaceRoot, excludedPath), target));
+}
+
+export async function searchWorkspaceFiles(
+  workspaceRoot: string,
+  query: string,
+  requestedPath = '.',
+  maxResults = 50,
+  signal?: AbortSignal,
+  options: FileSearchLimits = {},
+): Promise<FileSearchMatch[]> {
+  const target = resolvePath(workspaceRoot, requestedPath);
+  const expressionFlags = options.caseSensitive ? 'u' : 'iu';
+  const expression = options.regex
+    ? new RegExp(query, expressionFlags)
+    : new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), expressionFlags);
+  const baseArgs = ripgrepBaseArgs(workspaceRoot, options);
+  const [fileResult, contentResult] = await Promise.all([
+    runDirectCommand('rg', [...baseArgs, '--files', target], workspaceRoot, signal),
+    options.pathsOnly ? Promise.resolve<DirectCommandResult>({ exitCode: 1, stdout: '', stderr: '' }) : runDirectCommand('rg', [
+      ...baseArgs,
+      '--json', '--line-number',
+      ...(options.caseSensitive ? [] : ['--ignore-case']),
+      ...(options.regex ? [] : ['--fixed-strings']),
+      ...(options.contextLines ? ['--context', String(options.contextLines)] : []),
+      '--', query, target,
+    ], workspaceRoot, signal, 20_000_000),
+  ]);
+  if (fileResult.missing || contentResult.missing) {
+    return searchLocalFiles(workspaceRoot, query, requestedPath, maxResults, signal, options);
+  }
+  if (![0, 1].includes(fileResult.exitCode) || ![0, 1].includes(contentResult.exitCode)) {
+    throw new Error(`ripgrep 搜索失败：${contentResult.stderr || fileResult.stderr}`);
+  }
+  const results: FileSearchMatch[] = [];
+  for (const file of fileResult.stdout.split(/\r?\n/).filter(Boolean)) {
+    const relative = path.relative(workspaceRoot, path.resolve(workspaceRoot, file)).split(path.sep).join('/');
+    if (isExcludedSearchPath(workspaceRoot, relative, options)) continue;
+    if (!expression.test(relative)) continue;
+    results.push({ path: relative, match: 'path' });
+    if (results.length >= maxResults) return results;
+  }
+  if (options.pathsOnly) return results;
+  const contentLines = new Map<string, Map<number, string>>();
+  const contentMatches: Array<{ path: string; line: number; text: string }> = [];
+  for (const line of contentResult.stdout.split(/\r?\n/).filter(Boolean)) {
+    let event: {
+      type?: string;
+      data?: { path?: { text?: string }; line_number?: number; lines?: { text?: string } };
+    };
+    try {
+      event = JSON.parse(line) as typeof event;
+    } catch {
+      continue;
+    }
+    if (!['match', 'context'].includes(event.type ?? '') || !event.data?.path?.text || !event.data.line_number) continue;
+    const relative = path.relative(workspaceRoot, path.resolve(workspaceRoot, event.data.path.text)).split(path.sep).join('/');
+    if (isExcludedSearchPath(workspaceRoot, relative, options)) continue;
+    const text = truncate((event.data.lines?.text ?? '').replace(/\r?\n$/, ''), 240);
+    const fileLines = contentLines.get(relative) ?? new Map<number, string>();
+    fileLines.set(event.data.line_number, text);
+    contentLines.set(relative, fileLines);
+    if (event.type === 'match') contentMatches.push({ path: relative, line: event.data.line_number, text });
+  }
+  const contextLines = options.contextLines ?? 0;
+  for (const match of contentMatches) {
+    const fileLines = contentLines.get(match.path) ?? new Map<number, string>();
+    results.push({
+      path: match.path,
+      line: match.line,
+      text: match.text,
+      ...(contextLines ? {
+        context: Array.from({ length: contextLines * 2 + 1 }, (_, index) => match.line - contextLines + index)
+          .filter((lineNumber) => fileLines.has(lineNumber))
+          .map((lineNumber) => ({ line: lineNumber, text: fileLines.get(lineNumber)! })),
+      } : {}),
+      match: 'content',
+    });
+    if (results.length >= maxResults) break;
+  }
+  return results;
+}
+
+export interface WorkspaceChanges {
+  git: boolean;
+  status: string;
+  diffStat: string;
+  diff?: string;
+  truncated: boolean;
+}
+
+export async function inspectWorkspaceChanges(
+  workspaceRoot: string,
+  paths: string[] = [],
+  includeDiff = true,
+  signal?: AbortSignal,
+  excludedPaths: string[] = [],
+): Promise<WorkspaceChanges> {
+  const exclusions = [...new Set([
+    '.mimi-agent', PRE_MIMI_DATA_DIRECTORY, ...excludedPaths,
+  ].map((value) => value.split(path.sep).join('/')).filter((value) => value && value !== '.'))];
+  const pathspec = [
+    '--', ...(paths.length ? paths : ['.']),
+    ...exclusions.flatMap((value) => [`:(exclude)${value}`, `:(exclude)${value}/**`]),
+  ];
+  const status = await runDirectCommand(
+    'git', ['--no-optional-locks', '-c', 'core.fsmonitor=false', 'status', '--short', '--untracked-files=all', ...pathspec], workspaceRoot, signal, MAX_TEXT_BYTES,
+  );
+  if (status.missing || (status.exitCode !== 0 && /not a git repository/iu.test(status.stderr))) {
+    return { git: false, status: '', diffStat: '', truncated: false };
+  }
+  if (status.exitCode !== 0) throw new Error(`git status 失败：${status.stderr}`);
+  const [unstagedStat, stagedStat, unstagedDiff, stagedDiff] = await Promise.all([
+    runDirectCommand('git', ['diff', '--no-ext-diff', '--no-textconv', '--stat', ...pathspec], workspaceRoot, signal, MAX_TEXT_BYTES),
+    runDirectCommand('git', ['diff', '--cached', '--no-ext-diff', '--no-textconv', '--stat', ...pathspec], workspaceRoot, signal, MAX_TEXT_BYTES),
+    includeDiff
+      ? runDirectCommand('git', ['diff', '--no-ext-diff', '--no-textconv', '--unified=3', ...pathspec], workspaceRoot, signal, MAX_TEXT_BYTES)
+      : Promise.resolve({ exitCode: 0, stdout: '', stderr: '' }),
+    includeDiff
+      ? runDirectCommand('git', ['diff', '--cached', '--no-ext-diff', '--no-textconv', '--unified=3', ...pathspec], workspaceRoot, signal, MAX_TEXT_BYTES)
+      : Promise.resolve({ exitCode: 0, stdout: '', stderr: '' }),
+  ]);
+  const commands = [unstagedStat, stagedStat, unstagedDiff, stagedDiff];
+  const failed = commands.find((result) => result.exitCode !== 0);
+  if (failed) throw new Error(`git diff 失败：${failed.stderr}`);
+  const diff = [unstagedDiff.stdout, stagedDiff.stdout].filter(Boolean).join('\n');
+  return {
+    git: true,
+    status: truncate(status.stdout, MAX_TEXT_BYTES),
+    diffStat: truncate([unstagedStat.stdout, stagedStat.stdout].filter(Boolean).join('\n'), MAX_TEXT_BYTES),
+    ...(includeDiff ? { diff: truncate(diff, MAX_TEXT_BYTES) } : {}),
+    truncated: [status, ...commands].some((result) => /输出超过/u.test(result.stderr)),
+  };
 }
 
 async function readBoundedResponse(response: Response, signal: AbortSignal): Promise<string> {
@@ -672,15 +1164,24 @@ export function createTools(
 
   const readFileTool = tool({
     name: 'read_file',
-    description: '读取本机 UTF-8 文本文件，支持绝对路径或相对当前工作区的路径。',
-    parameters: z.object({ path: z.string().min(1) }),
-    execute: async ({ path: requestedPath }, _context, details) => {
+    description: '读取本机 UTF-8 文本文件；大型文件优先指定 startLine/endLine 分段读取。指定行范围或 includeMetadata 时返回行范围、总行数和 SHA-256。',
+    parameters: z.object({
+      path: z.string().min(1),
+      startLine: z.number().int().min(1).optional(),
+      endLine: z.number().int().min(1).optional(),
+      maxLines: z.number().int().min(1).max(2_000).optional(),
+      includeMetadata: z.boolean().default(false),
+    }),
+    execute: async ({ path: requestedPath, startLine, endLine, maxLines, includeMetadata }, _context, details) => {
       const target = resolvePath(workspaceRoot, requestedPath);
       await Promise.all([
         assertPathAllowed(target, protectedPaths),
         assertReadablePath(workspaceRoot, target, access.readablePaths),
       ]);
-      return readLocalFile(workspaceRoot, requestedPath, details?.signal);
+      if (!includeMetadata && startLine === undefined && endLine === undefined && maxLines === undefined) {
+        return readLocalFile(workspaceRoot, requestedPath, details?.signal);
+      }
+      return readLocalFileView(workspaceRoot, requestedPath, { startLine, endLine, maxLines }, details?.signal);
     },
   });
 
@@ -718,6 +1219,27 @@ export function createTools(
     },
   });
 
+  const applyPatch = tool({
+    name: 'apply_patch',
+    description: '应用一个或多个文件的 unified diff。所有 hunk 会先校验；可用读取结果的 SHA-256 拒绝覆盖并发变化。当前不处理删除；重命名使用 move_file。',
+    parameters: z.object({
+      patch: z.string().min(1),
+      expectedFiles: z.array(z.object({
+        path: z.string().min(1),
+        sha256: z.string().regex(/^[a-fA-F0-9]{64}$/u),
+      })).max(100).default([]),
+    }),
+    execute: async ({ patch, expectedFiles }) => applyLocalPatch(
+      workspaceRoot,
+      patch,
+      expectedFiles,
+      async (target) => Promise.all([
+        assertPathAllowed(target, protectedPaths),
+        assertWritablePath(workspaceRoot, target, access.writablePaths ?? ['.']),
+      ]).then(() => undefined),
+    ),
+  });
+
   const moveFile = tool({
     name: 'move_file',
     description: '移动或重命名文件；默认不覆盖已有目标。',
@@ -740,46 +1262,89 @@ export function createTools(
 
   const listDirectory = tool({
     name: 'list_directory',
-    description: '列出本机目录内容，支持绝对路径或相对当前工作区的路径。',
+    description: '列出本机目录；可用 depth 有界递归，并用 globs 筛选相对路径。默认只列一层。',
     parameters: z.object({
       path: z.string().default('.'),
       includeHidden: z.boolean().default(false),
+      depth: z.number().int().min(1).max(8).default(1),
+      maxEntries: z.number().int().min(1).max(2_000).default(200),
+      globs: z.array(z.string().min(1).max(200)).max(20).default([]),
     }),
-    execute: async ({ path: requestedPath, includeHidden }) => {
+    execute: async ({ path: requestedPath, includeHidden, depth, maxEntries, globs }, _context, details) => {
       const target = resolvePath(workspaceRoot, requestedPath);
       await Promise.all([
         assertPathAllowed(target, protectedPaths),
         assertReadablePath(workspaceRoot, target, access.readablePaths),
       ]);
-      const entries = await readdir(target, { withFileTypes: true });
-      return entries
-        .filter((entry) => includeHidden || !entry.name.startsWith('.'))
-        .map((entry) => ({
-          name: entry.name,
-          type: entry.isDirectory()
-            ? 'directory'
-            : entry.isSymbolicLink()
-              ? 'symlink'
-              : 'file',
-        }));
+      const matchers = globs.map(globPattern);
+      const results: Array<{ name: string; type: 'directory' | 'symlink' | 'file' }> = [];
+      const visit = async (directory: string, currentDepth: number): Promise<void> => {
+        details?.signal?.throwIfAborted();
+        for (const entry of await readdir(directory, { withFileTypes: true })) {
+          if (results.length >= maxEntries) return;
+          if (!includeHidden && entry.name.startsWith('.')) continue;
+          const entryPath = path.join(directory, entry.name);
+          if (protectedPaths.some((protectedPath) => containsPath(resolvePath(workspaceRoot, protectedPath), entryPath))) continue;
+          const name = path.relative(target, entryPath).split(path.sep).join('/');
+          const type = entry.isDirectory() ? 'directory' : entry.isSymbolicLink() ? 'symlink' : 'file';
+          if (!matchers.length || matchers.some((matcher) => matcher.test(name))) results.push({ name, type });
+          if (entry.isDirectory() && currentDepth < depth && !SKIPPED_DIRECTORIES.has(entry.name)) {
+            await visit(entryPath, currentDepth + 1);
+          }
+        }
+      };
+      await visit(target, 1);
+      if (depth === 1 && maxEntries === 200 && !globs.length) return results;
+      return { entries: results, truncated: results.length >= maxEntries };
     },
   });
 
   const searchFiles = tool({
     name: 'search_files',
-    description: '在工作区中按文件名和文本内容搜索，自动跳过 .git、node_modules、dist 和运行数据。',
+    description: '使用 ripgrep（不可用时自动回退）搜索文件名和文本；pathsOnly 可只列匹配路径且不读取文件内容。',
     parameters: z.object({
-      query: z.string().min(1),
+      query: z.string().default(''),
       path: z.string().default('.'),
+      regex: z.boolean().default(false),
+      caseSensitive: z.boolean().default(false),
+      globs: z.array(z.string().min(1).max(200)).max(20).default([]),
+      contextLines: z.number().int().min(0).max(10).default(0),
+      pathsOnly: z.boolean().default(false),
       maxResults: z.number().int().min(1).max(200).default(50),
     }),
-    execute: async ({ query, path: requestedPath, maxResults }, _context, details) => {
+    execute: async ({ query, path: requestedPath, regex, caseSensitive, globs, contextLines, pathsOnly, maxResults }, _context, details) => {
+      if (!pathsOnly && !query) throw new Error('搜索文件内容时 query 不能为空');
       const target = resolvePath(workspaceRoot, requestedPath);
       await Promise.all([
         assertPathAllowed(target, protectedPaths),
         assertReadablePath(workspaceRoot, target, access.readablePaths),
       ]);
-      return searchLocalFiles(workspaceRoot, query, requestedPath, maxResults, details?.signal);
+      return searchWorkspaceFiles(workspaceRoot, query, requestedPath, maxResults, details?.signal, {
+        regex, caseSensitive, globs, contextLines, pathsOnly, excludedPaths: protectedPaths,
+      });
+    },
+  });
+
+  const inspectChanges = tool({
+    name: 'inspect_changes',
+    description: '只读检查当前 Git 工作区的 status、diffstat 和有界 diff；文件修改后用它复核最终结果和已有用户改动。',
+    parameters: z.object({
+      paths: z.array(z.string().min(1).max(500)).max(100).default([]),
+      includeDiff: z.boolean().default(true),
+    }),
+    execute: async ({ paths, includeDiff }, _context, details) => {
+      const relativePaths = await Promise.all(paths.map(async (requestedPath) => {
+        const target = resolvePath(workspaceRoot, requestedPath);
+        await Promise.all([
+          assertPathAllowed(target, protectedPaths),
+          assertReadablePath(workspaceRoot, target, access.readablePaths),
+        ]);
+        return path.relative(workspaceRoot, target);
+      }));
+      const excludedPaths = protectedPaths
+        .map((protectedPath) => path.relative(workspaceRoot, protectedPath))
+        .filter((relative) => relative && !relative.startsWith('..') && !path.isAbsolute(relative));
+      return inspectWorkspaceChanges(workspaceRoot, relativePaths, includeDiff, details?.signal, excludedPaths);
     },
   });
 
@@ -923,9 +1488,10 @@ export function createTools(
   const localTools = [
     currentTime,
     readFileTool,
-    ...(access.allowWrite === false ? [] : [writeFileTool, editFile, moveFile]),
+    ...(access.allowWrite === false ? [] : [writeFileTool, editFile, applyPatch, moveFile]),
     listDirectory,
     searchFiles,
+    inspectChanges,
     ...(access.allowShell === false ? [] : [shell]),
     calculate,
     httpGet,

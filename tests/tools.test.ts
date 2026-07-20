@@ -6,13 +6,17 @@ import path from 'node:path';
 import test from 'node:test';
 import { RunContext } from '@openai/agents';
 import {
+  applyLocalPatch,
   createTools,
   editLocalFile,
+  inspectWorkspaceChanges,
   moveLocalFile,
   readLocalFile,
+  readLocalFileView,
   requestUrl,
   runShellCommand,
   searchLocalFiles,
+  searchWorkspaceFiles,
   writeLocalFile,
 } from '../src/tools.js';
 import { createRuntimeControlTools, type RuntimeAction } from '../src/runtime/control.js';
@@ -110,27 +114,46 @@ test('reads files using relative and absolute paths', async () => {
   assert.equal(await readLocalFile('/', target), '你好，Agent');
 });
 
+test('reads bounded line ranges with stable file metadata', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-agent-read-range-'));
+  await writeFile(path.join(root, 'note.txt'), 'one\ntwo\nthree\nfour\n');
+
+  const view = await readLocalFileView(root, 'note.txt', { startLine: 2, maxLines: 2 });
+  assert.equal(view.content, 'two\nthree');
+  assert.equal(view.startLine, 2);
+  assert.equal(view.endLine, 3);
+  assert.equal(view.totalLines, 5);
+  assert.equal(view.truncated, true);
+  assert.match(view.sha256, /^[a-f0-9]{64}$/u);
+});
+
 test('blocks file and shell tools from reading private MimiAgent and MimiAgent runtime data', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'nano-private-tools-'));
   const legacyRuntime = path.join(root, PRE_MIMI_DATA_DIRECTORY);
   const modernRuntime = path.join(root, '.mimi-agent');
+  const customRuntime = path.join(root, 'custom-runtime-data');
   await writeFile(path.join(root, 'public.txt'), 'PUBLIC_OK');
   await mkdir(path.join(legacyRuntime, 'sessions'), { recursive: true });
   await mkdir(path.join(modernRuntime, 'sessions'), { recursive: true });
+  await mkdir(customRuntime);
   await writeFile(path.join(legacyRuntime, 'sessions', 'private.json'), 'LEGACY_PRIVATE_SESSION_SENTINEL');
   await writeFile(path.join(modernRuntime, 'sessions', 'private.json'), 'MODERN_PRIVATE_SESSION_SENTINEL');
-  const tools = createTools(root, false, [legacyRuntime, modernRuntime]);
+  await writeFile(path.join(customRuntime, 'private.txt'), 'CUSTOM_PRIVATE_SENTINEL');
+  const tools = createTools(root, false, [legacyRuntime, modernRuntime, customRuntime]);
   const invoke = async (name: string, input: object) => {
     const selected = tools.find((item) => item.name === name);
     if (!selected || !('invoke' in selected)) throw new Error(`工具不可调用：${name}`);
-    return String(await selected.invoke(new RunContext({}), JSON.stringify(input)));
+    const result = await selected.invoke(new RunContext({}), JSON.stringify(input));
+    return typeof result === 'string' ? result : JSON.stringify(result);
   };
 
   assert.match(await invoke('read_file', { path: 'public.txt' }), /PUBLIC_OK/);
+  assert.match(await invoke('read_file', { path: 'public.txt', includeMetadata: true }), /"sha256":"[a-f0-9]{64}"/u);
   assert.match(await invoke('read_file', { path: `${PRE_MIMI_DATA_DIRECTORY}/sessions/private.json` }), /MimiAgent 私有运行数据（含旧目录）/);
   assert.match(await invoke('read_file', { path: '.mimi-agent/sessions/private.json' }), /MimiAgent 私有运行数据（含旧目录）/);
   assert.match(await invoke('search_files', { query: 'PRIVATE', path: PRE_MIMI_DATA_DIRECTORY, maxResults: 10 }), /MimiAgent 私有运行数据（含旧目录）/);
   assert.match(await invoke('search_files', { query: 'PRIVATE', path: '.mimi-agent', maxResults: 10 }), /MimiAgent 私有运行数据（含旧目录）/);
+  assert.doesNotMatch(await invoke('search_files', { query: 'CUSTOM_PRIVATE', path: '.', maxResults: 10 }), /CUSTOM_PRIVATE_SENTINEL/u);
   const shell = await runShellCommand(root, `cat ${PRE_MIMI_DATA_DIRECTORY}/sessions/private.json .mimi-agent/sessions/private.json`, 5, undefined, [legacyRuntime, modernRuntime]);
   assert.notEqual(shell.exitCode, 0);
   assert.doesNotMatch(shell.stdout, /PRIVATE_SESSION_SENTINEL/);
@@ -215,15 +238,24 @@ test('enforces Team builder write paths and disables unsandboxed Shell', async (
   const invoke = async (name: string, input: object) => {
     const selected = tools.find((item) => item.name === name);
     if (!selected || !('invoke' in selected)) throw new Error(`工具不可调用：${name}`);
-    return String(await selected.invoke(new RunContext({}), JSON.stringify(input)));
+    const result = await selected.invoke(new RunContext({}), JSON.stringify(input));
+    return typeof result === 'string' ? result : JSON.stringify(result);
   };
 
   assert.ok(!tools.some((item) => item.name === 'run_shell'));
   assert.match(await invoke('write_file', { path: 'allowed/ok.txt', content: 'ok' }), /已写入/);
+  assert.match(await invoke('apply_patch', {
+    patch: ['--- a/allowed/ok.txt', '+++ b/allowed/ok.txt', '@@ -1 +1 @@', '-ok', '+OK'].join('\n'),
+    expectedFiles: [],
+  }), /"path":"allowed\/ok\.txt"/u);
   assert.match(await invoke('write_file', { path: 'not-allowed.txt', content: 'no' }), /超出.*paths/);
+  assert.match(await invoke('apply_patch', {
+    patch: ['--- /dev/null', '+++ b/not-allowed.txt', '@@ -0,0 +1 @@', '+no'].join('\n'),
+    expectedFiles: [],
+  }), /超出.*paths/);
   assert.match(await invoke('write_file', { path: path.join(outside, 'absolute.txt'), content: 'no' }), /不能超出当前工作区/);
   assert.match(await invoke('write_file', { path: 'allowed/escape/link.txt', content: 'no' }), /符号链接.*超出/);
-  assert.equal(await readFile(path.join(root, 'allowed', 'ok.txt'), 'utf8'), 'ok');
+  assert.equal(await readFile(path.join(root, 'allowed', 'ok.txt'), 'utf8'), 'OK');
   await assert.rejects(access(path.join(outside, 'link.txt')), /ENOENT/);
 });
 
@@ -239,7 +271,8 @@ test('scopes local reads to the workspace and rejects symlink escapes', async ()
   const invoke = async (name: string, input: object) => {
     const selected = tools.find((item) => item.name === name);
     if (!selected || !('invoke' in selected)) throw new Error(`工具不可调用：${name}`);
-    return String(await selected.invoke(new RunContext({}), JSON.stringify(input)));
+    const result = await selected.invoke(new RunContext({}), JSON.stringify(input));
+    return typeof result === 'string' ? result : JSON.stringify(result);
   };
 
   assert.match(await invoke('read_file', { path: 'inside.txt' }), /INSIDE/);
@@ -254,9 +287,11 @@ test('can remove all local mutation and shell tools for read-only runtimes', () 
     readablePaths: ['.'], writablePaths: [], allowWrite: false, allowShell: false,
   }).map((tool) => tool.name);
   assert.ok(names.includes('read_file'));
+  assert.ok(names.includes('inspect_changes'));
   assert.ok(names.includes('http_get'));
   assert.ok(!names.includes('write_file'));
   assert.ok(!names.includes('edit_file'));
+  assert.ok(!names.includes('apply_patch'));
   assert.ok(!names.includes('move_file'));
   assert.ok(!names.includes('run_shell'));
 });
@@ -292,6 +327,128 @@ test('edits, searches and moves local files', async () => {
     { from: path.join(root, 'note.txt'), to: path.join(root, 'docs/moved.txt') },
   );
   assert.equal(await readFile(path.join(root, 'docs/moved.txt'), 'utf8'), 'MimiAgent uses Node.js.');
+});
+
+test('searches code with regex, globs and bounded context', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-agent-search-code-'));
+  await mkdir(path.join(root, 'src'));
+  await writeFile(path.join(root, 'src', 'agent.ts'), 'before\nexport function runAgent() {}\nafter\n');
+  await writeFile(path.join(root, 'src', 'agent.md'), 'runAgent is documented');
+
+  const matches = await searchWorkspaceFiles(root, 'function\\s+runAgent', '.', 20, undefined, {
+    regex: true,
+    globs: ['**/*.ts'],
+    contextLines: 1,
+  });
+  const content = matches.find((match) => match.match === 'content');
+  assert.equal(content?.path, 'src/agent.ts');
+  assert.equal(content?.line, 2);
+  assert.deepEqual(content?.context?.map((line) => line.line), [1, 2, 3]);
+});
+
+test('lists bounded recursive directory entries and filters paths without reading content', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-agent-list-code-'));
+  await mkdir(path.join(root, 'src', 'nested'), { recursive: true });
+  await mkdir(path.join(root, '.mimi-agent'), { recursive: true });
+  await writeFile(path.join(root, 'src', 'agent.ts'), 'SECRET_CONTENT');
+  await writeFile(path.join(root, 'src', 'nested', 'agent.test.ts'), 'SECRET_TEST_CONTENT');
+  await writeFile(path.join(root, '.mimi-agent', 'private.ts'), 'PRIVATE');
+  const tools = createTools(root, false, [path.join(root, '.mimi-agent')]);
+  const invoke = async (name: string, input: object): Promise<string> => {
+    const selected = tools.find((item) => item.name === name);
+    if (!selected || !('invoke' in selected)) throw new Error(`工具不可调用：${name}`);
+    return JSON.stringify(await selected.invoke(new RunContext({}), JSON.stringify(input)));
+  };
+
+  const listing = await invoke('list_directory', { path: '.', depth: 3, globs: ['**/*.test.ts'] });
+  assert.match(listing, /src\/nested\/agent\.test\.ts/u);
+  assert.doesNotMatch(listing, /agent\.ts"/u);
+  assert.doesNotMatch(listing, /private\.ts/u);
+
+  const paths = await searchWorkspaceFiles(root, '', '.', 20, undefined, {
+    pathsOnly: true,
+    globs: ['**/*.ts'],
+    excludedPaths: [path.join(root, '.mimi-agent')],
+    maxReadBytes: 1,
+  });
+  assert.deepEqual(paths.map((match) => match.path).sort(), ['src/agent.ts', 'src/nested/agent.test.ts']);
+  assert.ok(paths.every((match) => match.match === 'path' && match.text === undefined));
+});
+
+test('applies validated multi-file patches and rejects stale digests', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-agent-patch-'));
+  const note = path.join(root, 'note.txt');
+  await writeFile(note, 'alpha\nbeta\ngamma\n');
+  const digest = (await readLocalFileView(root, 'note.txt')).sha256;
+  const result = await applyLocalPatch(root, [
+    '--- a/note.txt',
+    '+++ b/note.txt',
+    '@@ -1,3 +1,3 @@',
+    ' alpha',
+    '-beta',
+    '+BETA',
+    ' gamma',
+    '--- /dev/null',
+    '+++ b/new.txt',
+    '@@ -0,0 +1,2 @@',
+    '+created',
+    '+file',
+  ].join('\n'), [{ path: 'note.txt', sha256: digest }]);
+
+  assert.deepEqual(result.files.map((file) => [file.path, file.created]), [
+    ['note.txt', false], ['new.txt', true],
+  ]);
+  assert.equal(await readFile(note, 'utf8'), 'alpha\nBETA\ngamma\n');
+  assert.equal(await readFile(path.join(root, 'new.txt'), 'utf8'), 'created\nfile\n');
+  await assert.rejects(applyLocalPatch(root, [
+    '--- a/note.txt',
+    '+++ b/note.txt',
+    '@@ -1,1 +1,1 @@',
+    '-alpha',
+    '+ALPHA',
+  ].join('\n'), [{ path: 'note.txt', sha256: digest }]), /文件已变化/);
+  assert.equal(await readFile(note, 'utf8'), 'alpha\nBETA\ngamma\n');
+
+  await writeFile(path.join(root, 'other.txt'), 'actual\n');
+  await assert.rejects(applyLocalPatch(root, [
+    '--- a/note.txt',
+    '+++ b/note.txt',
+    '@@ -1 +1 @@',
+    '-alpha',
+    '+ALPHA',
+    '--- a/other.txt',
+    '+++ b/other.txt',
+    '@@ -1 +1 @@',
+    '-expected',
+    '+changed',
+  ].join('\n')), /上下文不匹配/);
+  assert.equal(await readFile(note, 'utf8'), 'alpha\nBETA\ngamma\n');
+});
+
+test('inspects Git changes without exposing a write-capable shell tool', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-agent-inspect-changes-'));
+  await writeFile(path.join(root, 'note.txt'), 'before\n');
+  assert.equal((await runShellCommand(root, 'git init -q && git add note.txt', 5)).exitCode, 0);
+  await writeFile(path.join(root, 'note.txt'), 'after\n');
+
+  const changes = await inspectWorkspaceChanges(root);
+  assert.equal(changes.git, true);
+  assert.match(changes.status, /note\.txt/u);
+  assert.match(changes.diff ?? '', /before|after/u);
+});
+
+test('excludes private runtime paths from Git change inspection', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-agent-inspect-private-'));
+  await mkdir(path.join(root, '.mimi-agent'));
+  await writeFile(path.join(root, 'public.txt'), 'public-before\n');
+  await writeFile(path.join(root, '.mimi-agent', 'private.txt'), 'PRIVATE_BEFORE\n');
+  assert.equal((await runShellCommand(root, 'git init -q && git add public.txt && git add -f .mimi-agent/private.txt', 5)).exitCode, 0);
+  await writeFile(path.join(root, 'public.txt'), 'public-after\n');
+  await writeFile(path.join(root, '.mimi-agent', 'private.txt'), 'PRIVATE_SECRET\n');
+
+  const changes = await inspectWorkspaceChanges(root);
+  assert.match(changes.diff ?? '', /public-(?:before|after)/u);
+  assert.doesNotMatch(JSON.stringify(changes), /PRIVATE_/u);
 });
 
 test('serializes concurrent edits without losing either mutation', async () => {

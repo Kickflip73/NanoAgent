@@ -43,9 +43,11 @@ const TOOL_POLICY = {
   read_file: { capabilities: ['read'], modes: ALL_MODES, subAgents: ALL_SUBAGENTS, teamRoles: ALL_TEAM_ROLES },
   write_file: { capabilities: ['write'], teamRoles: ['builder'], sideEffect: true },
   edit_file: { capabilities: ['write'], teamRoles: ['builder'], sideEffect: true },
+  apply_patch: { capabilities: ['write'], teamRoles: ['builder'], sideEffect: true },
   move_file: { capabilities: ['write'], teamRoles: ['builder'], sideEffect: true },
   list_directory: { capabilities: ['read'], modes: ALL_MODES, subAgents: ALL_SUBAGENTS, teamRoles: ALL_TEAM_ROLES },
   search_files: { capabilities: ['read'], modes: ALL_MODES, subAgents: ALL_SUBAGENTS, teamRoles: ALL_TEAM_ROLES },
+  inspect_changes: { capabilities: ['read'], modes: ALL_MODES, subAgents: ALL_SUBAGENTS, teamRoles: ALL_TEAM_ROLES },
   run_shell: {
     capabilities: ['execute'],
     teamRolesWithShell: ['builder', 'tester', 'reviewer'],

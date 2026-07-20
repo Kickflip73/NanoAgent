@@ -32,7 +32,7 @@ src/
 │   └── components.ts    模型、状态存储和扩展初始化
 ├── core/                    Session、Context、Memory、Plan、Team 与 Trace
 ├── extensions/              Skills、MCP、RAG、SubAgent 与 Team executor
-└── tools.ts                 高频本地原子工具
+└── tools.ts                 高频本地原子工具（分段读取、检索、摘要校验 Patch、变更检查等）
 
 src/daemon/
 ├── store.ts             SQLite WAL Inbox / Run / Outbox / Lease / Audit / Schedule / Digest

@@ -49,6 +49,17 @@ test('preserves mode and permission tool policy semantics', () => {
   );
 });
 
+test('scopes patch and change-inspection tools across modes and permissions', () => {
+  const tools = [fakeTool('apply_patch'), fakeTool('inspect_changes')];
+  assert.deepEqual(toolsForMode('plan', tools).map((tool) => tool.name), ['inspect_changes']);
+  assert.deepEqual(toolsForMode('general', tools).map((tool) => tool.name), ['apply_patch', 'inspect_changes']);
+  assert.deepEqual(toolsForPermission('workspace', tools).map((tool) => tool.name), ['apply_patch', 'inspect_changes']);
+  assert.deepEqual(toolsForPermission('read-only', tools).map((tool) => tool.name), ['inspect_changes']);
+  assert.deepEqual(toolsForRunPolicy(tools, {
+    allowedCapabilities: ['read', 'write'], allowSideEffects: false,
+  }).map((tool) => tool.name), ['inspect_changes']);
+});
+
 test('read-only local deployment still exposes configured connector transactions', () => {
   const tools = [
     'read_file', 'write_file', 'remember', 'update_plan', 'connector_action',
@@ -101,40 +112,40 @@ test('explicit run policies can bound both read-only and side-effect tools by na
 
 test('preserves SubAgent and Team role tool order', () => {
   assert.deepEqual(subAgentToolNames('researcher'), [
-    'current_time', 'read_file', 'list_directory', 'search_files', 'http_get', 'web_search', 'search_knowledge',
+    'current_time', 'read_file', 'list_directory', 'search_files', 'inspect_changes', 'http_get', 'web_search', 'search_knowledge',
   ]);
   assert.deepEqual(subAgentToolNames('architect'), [
-    'read_file', 'list_directory', 'search_files', 'web_search', 'search_knowledge',
+    'read_file', 'list_directory', 'search_files', 'inspect_changes', 'web_search', 'search_knowledge',
   ]);
   assert.deepEqual(subAgentToolNames('reviewer'), [
-    'read_file', 'list_directory', 'search_files', 'search_knowledge',
+    'read_file', 'list_directory', 'search_files', 'inspect_changes', 'search_knowledge',
   ]);
 
   assert.deepEqual(teamRoleToolNames('explorer'), [
-    'current_time', 'read_file', 'list_directory', 'search_files', 'http_get', 'web_search', 'search_knowledge',
+    'current_time', 'read_file', 'list_directory', 'search_files', 'inspect_changes', 'http_get', 'web_search', 'search_knowledge',
   ]);
   assert.deepEqual(teamRoleToolNames('architect'), [
-    'read_file', 'list_directory', 'search_files', 'web_search', 'search_knowledge',
+    'read_file', 'list_directory', 'search_files', 'inspect_changes', 'web_search', 'search_knowledge',
   ]);
   assert.deepEqual(teamRoleToolNames('builder'), [
-    'current_time', 'calculate', 'read_file', 'write_file', 'edit_file', 'move_file',
-    'list_directory', 'search_files', 'search_knowledge',
+    'current_time', 'calculate', 'read_file', 'write_file', 'edit_file', 'apply_patch', 'move_file',
+    'list_directory', 'search_files', 'inspect_changes', 'search_knowledge',
   ]);
   assert.deepEqual(teamRoleToolNames('tester'), [
-    'current_time', 'calculate', 'read_file', 'list_directory', 'search_files', 'search_knowledge',
+    'current_time', 'calculate', 'read_file', 'list_directory', 'search_files', 'inspect_changes', 'search_knowledge',
   ]);
   assert.deepEqual(teamRoleToolNames('reviewer'), [
-    'read_file', 'list_directory', 'search_files', 'search_knowledge',
+    'read_file', 'list_directory', 'search_files', 'inspect_changes', 'search_knowledge',
   ]);
   assert.deepEqual(teamRoleToolNames('builder', true), [
-    'current_time', 'calculate', 'read_file', 'write_file', 'edit_file', 'move_file',
-    'list_directory', 'search_files', 'search_knowledge', 'run_shell',
+    'current_time', 'calculate', 'read_file', 'write_file', 'edit_file', 'apply_patch', 'move_file',
+    'list_directory', 'search_files', 'inspect_changes', 'search_knowledge', 'run_shell',
   ]);
 });
 
 test('classifies the existing durable side-effect tools from one policy source', () => {
   const sideEffects = [
-    'write_file', 'edit_file', 'move_file', 'run_shell', 'http_request', 'connector_action',
+    'write_file', 'edit_file', 'apply_patch', 'move_file', 'run_shell', 'http_request', 'connector_action',
     'set_mimi_connector_enabled', 'reload_mimi_connectors', 'index_knowledge',
     'remember', 'forget', 'update_plan', 'set_goal', 'update_goal',
     'snooze_mimi', 'clear_mimi_snooze',

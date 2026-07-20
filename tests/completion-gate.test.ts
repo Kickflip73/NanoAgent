@@ -105,6 +105,16 @@ test('artifact evidence requires a structured mutation from the current run', ()
   }]).decision, 'pass');
   assert.equal(evaluateCompletion({
     ...artifact,
+    criteria: [{ ...artifact.criteria[0]!, expectedTool: 'apply_patch' }],
+  }, {
+    status: 'completed',
+    proofs: [{ criterionId: 'report', evidence: 'patched', toolCallIds: ['patch-1'] }],
+  }, [{
+    toolName: 'apply_patch', callId: 'patch-1', argumentsJson: '{"patch":"report.md"}',
+    status: 'succeeded', output: { files: [{ path: 'report.md' }] },
+  }]).decision, 'pass');
+  assert.equal(evaluateCompletion({
+    ...artifact,
     criteria: [{ ...artifact.criteria[0]!, expectedTool: 'run_shell' }],
   }, {
     status: 'completed',
