@@ -808,7 +808,7 @@ export class MimiDispatcher {
           new Date(),
           hostRunId,
           error.progressFingerprint,
-          error.gate.decision === 'uncertain',
+          true,
         );
       } else if (this.stopRequested && active.runController?.signal.aborted) {
         this.store.preemptEvent(

@@ -3,7 +3,6 @@ import { test } from 'node:test';
 import type { MimiAgent } from '../src/runtime/mimi-agent.js';
 import { isTerminalRunInterruption, TerminalRunInterruptedError } from '../src/runtime/run-outcome.js';
 import { AgentRunService } from '../src/runtime/run-service.js';
-import { CompletionGateError } from '../src/core/completion.js';
 
 test('shared run service owns completion, usage and observer isolation', async () => {
   let completedAnswer = '';
@@ -73,11 +72,9 @@ test('shared run service preserves a terminal signal when the SDK throws a gener
   assert.equal(isTerminalRunInterruption(failed), true);
 });
 
-test('completion gate rejection defers the run without recording a normal failure', async () => {
-  const gateError = new CompletionGateError({
-    decision: 'continue', reason: 'missing proof', unmetCriteria: ['sent'],
-  });
-  let deferred: CompletionGateError | undefined;
+test('an unfinished Goal completes the Event once with the Host-committed safe answer', async () => {
+  const safeAnswer = '长期 Goal 尚未通过验收，已保留当前 Goal 和检查点，不会从头自动重跑。';
+  let committedAnswer: string | undefined;
   let failed = false;
   const stream = {
     rawResponses: [],
@@ -96,15 +93,15 @@ test('completion gate rejection defers the run without recording a normal failur
     onRuntimeEvent: () => () => undefined,
     stream: async () => stream,
     recordEvent: async () => undefined,
-    completeRun: async () => { throw gateError; },
-    deferRunForCompletion: async (error: CompletionGateError) => { deferred = error; },
+    completeRun: async () => { committedAnswer = safeAnswer; return []; },
+    get completedRunAnswer() { return committedAnswer; },
     failRun: async () => { failed = true; },
   } as unknown as MimiAgent;
 
-  await assert.rejects(new AgentRunService(agent).execute({ input: '发送消息' }, {
+  const result = await new AgentRunService(agent).execute({ input: '继续 Goal' }, {
     onStreamEvent: (event) => { streamed.push(event); },
-  }), /missing proof/);
-  assert.equal(deferred, gateError);
+  });
+  assert.equal(result.answer, safeAnswer);
   assert.equal(failed, false);
   assert.deepEqual(streamed, []);
 });

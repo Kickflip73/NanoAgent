@@ -53,22 +53,19 @@ test('completion gate requires a contract and an explicit completion report', ()
   assert.match(evaluateCompletion(contract, undefined, []).reason, /finish_task/);
 });
 
-test('completion gate stays off for pure answers and goals stay explicit', () => {
+test('completion gate intent stays explicit instead of guessing from task verbs', () => {
   for (const input of [
     '请问今天天气怎么样', '帮我解释闭包', '翻译 hello', '分析这段错误日志', '检查这份方案',
     '这是链路测试。不要调用任何工具，仅回复：MIMI_AUDIT_OK',
+    '发送微信消息', '修复登录页', '运行测试', '导出报告', 'Move report.md to docs',
+    'Copy a.txt to b.txt', 'Commit and push the current changes', '打开构建产物进入游戏',
   ]) {
     assert.equal(requiresCompletionContract(input), false, input);
   }
-  for (const input of [
-    '发送微信消息', '修复登录页', '运行测试', '导出报告', 'Move report.md to docs',
-    'Copy a.txt to b.txt', 'Commit and push the current changes',
-  ]) {
-    assert.equal(requiresCompletionContract(input), true, input);
-  }
   assert.equal(requiresPersistentGoal('修复登录页'), false);
   assert.equal(requiresPersistentGoal('/goal 持续完善项目'), true);
-  assert.equal(requiresPersistentGoal('这是一个多阶段任务'), true);
+  assert.equal(requiresCompletionContract('/goal 持续完善项目'), true);
+  assert.equal(requiresPersistentGoal('这是一个多阶段任务'), false);
 });
 
 test('completion gate accepts verified external action receipts', () => {

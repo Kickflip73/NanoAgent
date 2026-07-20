@@ -43,12 +43,24 @@ function semanticArguments(input: string): string {
   }
 }
 
+function alreadyExecutedResult(result: unknown): unknown {
+  const replay = {
+    mimiStatus: 'already_executed',
+    message: '相同操作已经成功执行且其后没有新的副作用；本次未重复执行，请使用 previousResult 继续回答。',
+    previousResult: result,
+  };
+  return result && typeof result === 'object' && !Array.isArray(result)
+    ? { ...result as Record<string, unknown>, ...replay }
+    : replay;
+}
+
 export function withExecutionLedger(
   tools: Tool[],
   ledger: ExecutionLedger,
   currentRun: () => RunIdentity | undefined,
 ): Tool[] {
   const semanticOccurrences = new Map<string, number>();
+  let previousSemanticKey: string | undefined;
   return tools.map((tool) => {
     if (!isInvokable(tool)) return tool;
     const sideEffect = isSideEffectTool(tool.name);
@@ -62,10 +74,16 @@ export function withExecutionLedger(
         const sdkCallId = details?.toolCall?.callId;
         const argumentsJson = run?.semanticCallIds ? semanticArguments(input) : input;
         const semanticKey = `${tool.name}\0${argumentsJson}`;
+        const consecutiveDuplicate = run?.semanticCallIds && previousSemanticKey === semanticKey;
         const occurrence = run?.semanticCallIds
-          ? (semanticOccurrences.get(semanticKey) ?? 0) + 1
+          ? consecutiveDuplicate
+            ? semanticOccurrences.get(semanticKey) ?? 1
+            : (semanticOccurrences.get(semanticKey) ?? 0) + 1
           : undefined;
-        if (occurrence !== undefined) semanticOccurrences.set(semanticKey, occurrence);
+        if (occurrence !== undefined) {
+          semanticOccurrences.set(semanticKey, occurrence);
+          previousSemanticKey = semanticKey;
+        }
         const callId = run?.semanticCallIds
           ? createHash('sha256').update(`${semanticKey}\0${occurrence}`).digest('hex')
           : sdkCallId;
@@ -74,7 +92,7 @@ export function withExecutionLedger(
           return originalInvoke(runContext, input, details);
         };
         if (!run || !callId) return invokeAuthorized();
-        return ledger.executeOnce({
+        const result = await ledger.executeOnce({
           sessionId: run.sessionId,
           runId: run.runId,
           toolName: tool.name,
@@ -82,6 +100,7 @@ export function withExecutionLedger(
           ...(sdkCallId && sdkCallId !== callId ? { modelCallId: sdkCallId } : {}),
           argumentsJson,
         }, invokeAuthorized);
+        return consecutiveDuplicate ? alreadyExecutedResult(result) : result;
       },
     } as Tool;
   });

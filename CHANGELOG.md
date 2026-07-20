@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.11.6] - 2026-07-20 11:41
+
+### Fixed
+
+- prevent repeated task execution (@Kickflip73)
+
 ## [0.11.5] - 2026-07-20 11:25
 
 ### Fixed
@@ -41,6 +47,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- scope Completion Gate enforcement to explicit persistent Goals, stop replaying whole Events after an unfinished Goal, and reuse consecutive identical side-effect results instead of executing them again
 - harden unattended execution with secret-free Shell environments, full process-group cleanup, public-network-only HTTP requests, persistent Connector inbound ACKs, poison-row quarantine, provider-bound model preferences, build-aware Daemon upgrades, and per-attempt logical side-effect identities
 - replace fixed-count stability patches with evidence-aware completion progress, immutable Event-to-Session binding, route-scoped Outbox lanes, prompt-budgeted briefings, protocol-preserving context compaction, and persisted Connector delivery receipts
 - bound Completion Gate deferrals and model turns, keep pure answers out of execution gating, isolate stale Goal/Plan/recovery context, preserve delivery suppression across crash recovery, batch briefing/context protocol units, and prevent one blocked IM channel from holding up another

@@ -186,7 +186,7 @@ test('wraps SDK side-effect tools with the active run ledger', async () => {
   assert.equal(executions, 1);
 });
 
-test('daemon semantic call ids distinguish same-attempt repeats and replay them across attempts', async () => {
+test('daemon semantic call ids replay consecutive duplicate effects and distinguish them after another effect', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'nano-ledger-semantic-'));
   const ledger = new ExecutionLedger(path.join(root, 'ledger.json'));
   let executions = 0;
@@ -207,10 +207,15 @@ test('daemon semantic call ids distinguish same-attempt repeats and replay them 
   const second = await wrapped.invoke(
     new RunContext({}), '{ "path": "a.txt" }', { toolCall: { callId: 'sdk-call-2' } } as never,
   );
-  await wrapped.invoke(
+  const different = await wrapped.invoke(
     new RunContext({}), '{"path":"b.txt"}', { toolCall: { callId: 'sdk-call-3' } } as never,
   );
-  assert.notDeepEqual(second, first);
+  const third = await wrapped.invoke(
+    new RunContext({}), '{"path":"a.txt"}', { toolCall: { callId: 'sdk-call-4' } } as never,
+  );
+  assert.match(JSON.stringify(second), /already_executed/);
+  assert.notDeepEqual(different, first);
+  assert.notDeepEqual(third, first);
   assert.equal(executions, 3);
 
   const [retryWrapped] = withExecutionLedger([original], ledger, identity);
@@ -220,11 +225,23 @@ test('daemon semantic call ids distinguish same-attempt repeats and replay them 
   ), first);
   assert.deepEqual(await retryWrapped.invoke(
     new RunContext({}), '{"path":"a.txt"}', { toolCall: { callId: 'retry-call-2' } } as never,
-  ), second);
+  ), {
+    executions: 1,
+    mimiStatus: 'already_executed',
+    message: '相同操作已经成功执行且其后没有新的副作用；本次未重复执行，请使用 previousResult 继续回答。',
+    previousResult: first,
+  });
+  await retryWrapped.invoke(
+    new RunContext({}), '{"path":"b.txt"}', { toolCall: { callId: 'retry-call-3' } } as never,
+  );
+  assert.deepEqual(await retryWrapped.invoke(
+    new RunContext({}), '{"path":"a.txt"}', { toolCall: { callId: 'retry-call-4' } } as never,
+  ), third);
   assert.equal(executions, 3);
   const replayedCalls = await ledger.listCalls('demo', 'event:event-1');
-  assert.deepEqual(replayedCalls[0]?.modelCallIds, ['sdk-call-1', 'retry-call-1']);
-  assert.deepEqual(replayedCalls[1]?.modelCallIds, ['sdk-call-2', 'retry-call-2']);
+  assert.deepEqual(replayedCalls[0]?.modelCallIds, [
+    'sdk-call-1', 'sdk-call-2', 'retry-call-1', 'retry-call-2',
+  ]);
 });
 
 test('semantic call ids canonicalize nested JSON object keys across attempts without reordering arrays', async () => {

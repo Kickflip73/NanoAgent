@@ -245,11 +245,13 @@ Goal
 
 ## Completion Contract 与终态门控
 
-所有被识别为执行、产出或外部动作的任务，在调用首个任务工具前必须通过 `prepare_task` 建立 1～8 条可验证验收条件。长程、多阶段或显式 `/goal` 任务同时自动创建 Goal，并把同一组条件写入 Goal；普通闲聊和纯解释不强制建立 Goal。
+Completion Gate 只约束已经存在或本轮显式创建的持久 Goal。Goal 在调用首个任务工具前通过 `prepare_task` 建立 1～8 条可验证验收条件；普通问答、短操作和未启用 Goal 的任务由模型根据本轮目标与真实工具结果判断是否完成，不创建 Contract，也不调用 `finish_task`。自然语言中的“打开”“运行”“修复”等动词不能自动升级成 Goal。
 
 `finish_task` 只提交候选终态。Host 会把引用的 tool call 与 ExecutionLedger 中的真实结果、调用参数、本轮结构化文件写入/编辑/移动、测试退出码，以及当前任务未完成的 Plan/Team 状态逐项核对；读取预存在文件或普通 Shell `exitCode=0` 不能冒充本轮产物。客观条件必须预先绑定工具和关键参数片段，复合任务必须覆盖产物与外部回执的证据并集。首份 Contract 建立后不可重写降级，长任务的完整 Contract 同时锁在 Goal 中，不会因为别的 Run 更新最近 checkpoint 而丢失。Plan 模式只返回只读方案，不建立无法满足的 artifact Gate。
 
-未通过时，Daemon 把 Contract、未满足项、真实 ExecutionLedger 证据和 Plan/Team 状态计算为稳定进展指纹。只有连续没有新增客观证据才会终止自动 continuation；出现新证据会重置无进展计数。该计数保存在 Host 控制的 SQLite 列，外部 Event payload 无法伪造或重置。外部动作只有结构化 `outcome=confirmed` 回执能满足完成条件；`accepted`、超时、断连或未知结果立即进入待人工核对的终态，禁止再次调用模型或自动重放。后台 `blocked` 还必须成功调用 `request_background_task_input`，由 Host 持久化后才成立。
+未通过时，Host 保留 Goal、Contract、未满足项、真实 ExecutionLedger 证据和 checkpoint，并结束当前 Event；后续只能由 owner 使用 `/resume` 继续，不能回滚 Session 后从头自动重放整轮。外部动作只有结构化 `outcome=confirmed` 回执能满足完成条件；`accepted`、超时、断连或未知结果进入待人工核对的终态，禁止再次调用模型或自动重放。后台 `blocked` 还必须成功调用 `request_background_task_input`，由 Host 持久化后才成立。
+
+同一 Run 中连续出现完全相同的副作用工具与参数时，ExecutionLedger 复用第一次成功结果并向模型返回 `already_executed`，避免截断、重复思考或模型重试造成重复发送/启动。只有在其间发生了另一个副作用、客观状态可能已改变时，相同调用才获得新的逻辑执行序号。
 
 Completion Contract、报告和最近门控结果随 Run checkpoint 持久化，长任务 Contract 还随 Goal 持久化。Goal 只能由通过的 Completion Gate 标记完成，模型不能直接写入 completed；同一 Session 存在未完成 Goal 时，无关 Run 的 Plan/Goal/Team 修改会在工具授权层被拒绝，而不只依赖提示词隐藏。
 

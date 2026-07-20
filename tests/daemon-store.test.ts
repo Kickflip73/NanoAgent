@@ -208,7 +208,7 @@ test('Codex task results hand back to the same Event for Mimi verification', asy
   }
 });
 
-test('completion deferrals use durable exponential backoff without consuming failure attempts', async () => {
+test('a rejected Goal gate terminates the current Event without replaying it', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-completion-deferral-'));
   const store = new MimiStore(path.join(root, 'mimi.db'));
   try {
@@ -217,33 +217,14 @@ test('completion deferrals use durable exponential backoff without consuming fai
       payload: { completionGate: { deferrals: 999 } },
     });
     assert.ok(store.claimEventById('gate-task', 'worker'));
-    const first = store.deferEventForCompletion('gate-task', 'worker', 'missing test evidence', new Date(), undefined, 'proof-a');
-    assert.equal(first.status, 'queued');
-    assert.equal(first.attempts, 0);
-    assert.equal(first.completionDeferrals, 1);
-    assert.equal(first.completionNoProgressDeferrals, 1);
-    assert.ok(Date.parse(first.notBefore) >= Date.parse(first.updatedAt) + 900);
-
-    assert.ok(store.claimEventById('gate-task', 'worker', 60_000, new Date(first.notBefore)));
-    const second = store.deferEventForCompletion(
-      'gate-task', 'worker', 'new evidence but still missing', new Date(first.notBefore), undefined, 'proof-b',
-    );
-    assert.equal(second.status, 'queued');
-    assert.equal(second.completionDeferrals, 2);
-    assert.equal(second.completionNoProgressDeferrals, 1);
-    assert.ok(store.claimEventById('gate-task', 'worker', 60_000, new Date(second.notBefore)));
-    const third = store.deferEventForCompletion(
-      'gate-task', 'worker', 'same objective state', new Date(second.notBefore), undefined, 'proof-b',
-    );
-    assert.equal(third.status, 'queued');
-    assert.equal(third.completionNoProgressDeferrals, 2);
-    assert.ok(store.claimEventById('gate-task', 'worker', 60_000, new Date(third.notBefore)));
     const terminal = store.deferEventForCompletion(
-      'gate-task', 'worker', 'wording changed only', new Date(third.notBefore), undefined, 'proof-b',
+      'gate-task', 'worker', 'missing test evidence', new Date(), undefined, 'proof-a',
     );
     assert.equal(terminal.status, 'dead_letter');
-    assert.equal(terminal.completionDeferrals, 4);
-    assert.equal(terminal.completionNoProgressDeferrals, 3);
+    assert.equal(terminal.attempts, 1);
+    assert.equal(terminal.completionDeferrals, 1);
+    assert.equal(terminal.completionNoProgressDeferrals, 1);
+    assert.match(terminal.error ?? '', /不会自动重放/);
     assert.equal(store.listOutbox(10)[0]?.eventId, 'gate-task');
 
     const retried = store.retryDeadLetterEvent('gate-task');

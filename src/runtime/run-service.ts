@@ -7,7 +7,6 @@ import type {
   MimiAgent,
   MimiRunOptions,
 } from './mimi-agent.js';
-import { CompletionGateError } from '../core/completion.js';
 import { assertRunCanComplete, isRunInterrupted, isTerminalRunInterruption } from './run-outcome.js';
 
 export interface AgentRunRequest {
@@ -117,8 +116,9 @@ export class AgentRunService {
         : finalOutput === undefined ? streamedAnswer : JSON.stringify(finalOutput)).slice(0, 20_000);
       const usage = usageFrom(stream);
       const effects = await this.agent.completeRun(answer, usage);
+      const committedAnswer = this.agent.completedRunAnswer ?? answer;
       const result = {
-        answer,
+        answer: committedAnswer,
         effects,
         usage,
         delivery: await request.options?.completionDelivery?.(),
@@ -126,11 +126,6 @@ export class AgentRunService {
       await observe(observer.onComplete, result);
       return result;
     } catch (error) {
-      if (error instanceof CompletionGateError) {
-        await this.agent.deferRunForCompletion(error, usageFrom(stream));
-        await observe(observer.onError, error);
-        throw error;
-      }
       const terminalReason = request.signal?.aborted
         && isTerminalRunInterruption(request.signal.reason)
         ? request.signal.reason

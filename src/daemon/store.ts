@@ -31,7 +31,6 @@ const TERMINAL_EVENT_STATUSES = new Set<EventStatus>([
 ]);
 const DEFAULT_OUTBOX_LEASE_MS = 180_000;
 const DEFAULT_EVENT_MAX_ATTEMPTS = 5;
-const MAX_COMPLETION_NO_PROGRESS_DEFERRALS = 3;
 const DEFAULT_PREEMPTION_RESERVATION_MS = 60_000;
 const MAX_TASK_RESUME_CONTEXT_LENGTH = 4_000;
 const MAX_TASK_PROMPT_LENGTH = 64_000;
@@ -1000,7 +999,7 @@ export class MimiStore {
     at = new Date(),
     runId?: string,
     progressFingerprint = '',
-    terminal = false,
+    _terminal = false,
   ): StoredEvent {
     return this.transaction(() => {
       const event = this.getEvent(id);
@@ -1008,60 +1007,29 @@ export class MimiStore {
         throw new Error(`事件 ${id} 租约已失效`);
       }
       const deferrals = (event.completionDeferrals ?? 0) + 1;
-      const sameProgress = Boolean(progressFingerprint)
-        && progressFingerprint === event.completionProgressFingerprint;
-      const noProgressDeferrals = sameProgress
-        ? (event.completionNoProgressDeferrals ?? 0) + 1
-        : 1;
-      const delayMs = Math.min(5 * 60_000, 1_000 * 2 ** Math.min(8, noProgressDeferrals - 1));
+      const noProgressDeferrals = 1;
       const timestamp = at.toISOString();
-      if (terminal || noProgressDeferrals >= MAX_COMPLETION_NO_PROGRESS_DEFERRALS) {
-        const terminalReason = terminal
-          ? `Completion Gate 结果不可安全重放，已停止自动重试：${reason}`
-          : `Completion Gate 连续 ${noProgressDeferrals} 次没有新增执行证据，已停止自动重试：${reason}`;
-        const updated = this.database.prepare(`
-          UPDATE events SET status = 'dead_letter', error = ?, completion_deferrals = ?,
-            completion_no_progress_deferrals = ?, completion_progress_fingerprint = ?,
-            not_before = ?, lease_owner = NULL, lease_until = NULL, updated_at = ?
-          WHERE id = ? AND status = 'running' AND lease_owner = ? AND task_control IS NULL
-        `).run(
-          terminalReason.slice(0, 4_000),
-          deferrals,
-          noProgressDeferrals,
-          progressFingerprint || null,
-          timestamp,
-          timestamp,
-          id,
-          owner,
-        );
-        if (Number(updated.changes) !== 1) throw new Error(`事件 ${id} 租约已失效`);
-        if (runId) this.finishRun(runId, 'failed', undefined, terminalReason, timestamp);
-        const delivery = eventFailureDelivery(event, terminalReason);
-        this.insertOutbox(event.id, delivery.route, delivery.payload, timestamp);
-        this.insertAudit('event.dead_letter', id, { completionDeferrals: deferrals }, timestamp);
-        return this.getEvent(id)!;
-      }
+      const terminalReason = `Goal 未通过 Completion Gate；当前 Event 已结束且不会自动重放，Goal 与检查点可由 /resume 继续：${reason}`;
       const updated = this.database.prepare(`
-        UPDATE events SET status = 'queued', attempts = MAX(0, attempts - 1),
-          error = ?, completion_deferrals = ?, completion_no_progress_deferrals = ?,
-          completion_progress_fingerprint = ?, not_before = ?, lease_owner = NULL,
-          lease_until = NULL, updated_at = ?
+        UPDATE events SET status = 'dead_letter', error = ?, completion_deferrals = ?,
+          completion_no_progress_deferrals = ?, completion_progress_fingerprint = ?,
+          not_before = ?, lease_owner = NULL, lease_until = NULL, updated_at = ?
         WHERE id = ? AND status = 'running' AND lease_owner = ? AND task_control IS NULL
       `).run(
-        reason.slice(0, 4_000),
+        terminalReason.slice(0, 4_000),
         deferrals,
         noProgressDeferrals,
         progressFingerprint || null,
-        new Date(at.getTime() + delayMs).toISOString(),
+        timestamp,
         timestamp,
         id,
         owner,
       );
       if (Number(updated.changes) !== 1) throw new Error(`事件 ${id} 租约已失效`);
-      if (runId) this.finishRun(runId, 'interrupted', undefined, reason, timestamp);
-      this.insertAudit('event.completion_deferred', id, {
-        deferrals, noProgressDeferrals, progressFingerprint, delayMs,
-      }, timestamp);
+      if (runId) this.finishRun(runId, 'failed', undefined, terminalReason, timestamp);
+      const delivery = eventFailureDelivery(event, terminalReason);
+      this.insertOutbox(event.id, delivery.route, delivery.payload, timestamp);
+      this.insertAudit('event.dead_letter', id, { completionDeferrals: deferrals }, timestamp);
       return this.getEvent(id)!;
     });
   }

@@ -331,17 +331,6 @@ export class FileSession implements Session {
     });
   }
 
-  async deferRunForCompletion(
-    reason: string,
-    expectedRunId?: string,
-  ): Promise<RunCheckpoint | undefined> {
-    return this.finishRun('interrupted', {
-      error: reason.trim().slice(0, 2_000),
-      phase: '验收未通过',
-      nextAction: '根据未满足的验收条件继续执行，禁止重复不确定的副作用',
-    }, expectedRunId);
-  }
-
   async completeRun(answer: string, expectedRunId?: string): Promise<RunCheckpoint | undefined> {
     return this.finishRun(
       'completed',

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -174,6 +174,72 @@ test('default owner General runs expose Shell while Plan remains read-only', asy
     else process.env.AGENT_SESSION = previousSession;
     if (previousSecret === undefined) delete process.env.OPENAI_API_KEY;
     else process.env.OPENAI_API_KEY = previousSecret;
+  }
+});
+
+test('a short launch question executes once without creating a Completion Gate', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-short-launch-'));
+  const dataRoot = path.join(root, '.mimi-agent');
+  const previousSession = process.env.AGENT_SESSION;
+  process.env.AGENT_SESSION = 'short-launch';
+  const agent = await MimiAgent.create({
+    provider: 'openai', workspaceRoot: root, dataRoot, permissionMode: 'trusted',
+    skillsRoot: path.join(root, 'skills'), mcpConfig: path.join(root, 'mcp.json'),
+    historyLimit: 40, contextWindow: 128_000, maxTurns: 20,
+  });
+  const marker = path.join(root, 'launches.txt');
+  let secondOutput = '';
+  const runner = (agent as unknown as { runner: { run: (...args: unknown[]) => Promise<unknown> } }).runner;
+  runner.run = async (runtimeAgent) => {
+    const shell = (runtimeAgent as { tools: Array<Tool> }).tools.find((item) => item.name === 'run_shell');
+    assert.ok(shell && 'invoke' in shell);
+    const input = JSON.stringify({ command: `printf launch\\n >> ${marker}`, timeoutSeconds: 5 });
+    await shell.invoke(new RunContext({}), input, { toolCall: { callId: 'launch-1' } } as never);
+    secondOutput = JSON.stringify(await shell.invoke(
+      new RunContext({}), input, { toolCall: { callId: 'launch-2' } } as never,
+    ));
+    return {};
+  };
+  try {
+    await agent.stream('产物在哪？我该怎么打开进入游戏？', undefined, {
+      executionKey: 'event:short-launch', retainExecutionLedger: true,
+    });
+    assert.equal(agent.completionGateRequired, false);
+    await agent.completeRun('产物已打开');
+    assert.equal((await readFile(marker, 'utf8')).trim().split('\n').length, 1);
+    assert.match(secondOutput, /already_executed/);
+  } finally {
+    await agent.close();
+    if (previousSession === undefined) delete process.env.AGENT_SESSION;
+    else process.env.AGENT_SESSION = previousSession;
+  }
+});
+
+test('only an explicit persistent Goal enables Completion Gate enforcement', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-explicit-goal-gate-'));
+  const dataRoot = path.join(root, '.mimi-agent');
+  const sessionId = 'explicit-goal-gate';
+  const previousSession = process.env.AGENT_SESSION;
+  process.env.AGENT_SESSION = sessionId;
+  const plans = new PlanStore(path.join(dataRoot, 'plans.json'), sessionId);
+  await plans.setGoal('稳定现有消息链路');
+  const agent = await MimiAgent.create({
+    provider: 'openai', workspaceRoot: root, dataRoot, permissionMode: 'trusted',
+    skillsRoot: path.join(root, 'skills'), mcpConfig: path.join(root, 'mcp.json'),
+    historyLimit: 40, contextWindow: 128_000, maxTurns: 20,
+  });
+  const runner = (agent as unknown as { runner: { run: (...args: unknown[]) => Promise<unknown> } }).runner;
+  runner.run = async () => ({});
+  try {
+    await agent.stream('稳定现有消息链路');
+    assert.equal(agent.completionGateRequired, true);
+    await agent.completeRun('模型声称已经完成');
+    assert.match(agent.completedRunAnswer ?? '', /尚未通过验收/);
+    assert.equal((await plans.getGoal())?.status, 'active');
+  } finally {
+    await agent.close();
+    if (previousSession === undefined) delete process.env.AGENT_SESSION;
+    else process.env.AGENT_SESSION = previousSession;
   }
 });
 

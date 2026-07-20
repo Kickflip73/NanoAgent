@@ -19,12 +19,9 @@ import { ContextManager, estimateTokens, type ContextStats } from '../core/conte
 import { GuidanceLoader } from '../core/guidance.js';
 import { ExecutionLedger, type ExecutionCallRecord } from '../core/execution-ledger.js';
 import {
-  CompletionGateError,
   assertCompletionContractForTask,
   evaluateCompletion,
   expectedCompletionKind,
-  requiresCompletionContract,
-  requiresPersistentGoal,
   type CompletionContract,
   type CompletionGateDecision,
   type CompletionReport,
@@ -312,6 +309,7 @@ export class MimiAgent {
   private lastContextStats?: ContextStats;
   private modelProfile: ModelProfile;
   private lastUsage?: ContextUsageSnapshot;
+  private lastCommittedAnswer?: string;
   private readonly runtimeRoot = path.resolve(fileURLToPath(new URL('../../', import.meta.url)));
 
   private constructor(
@@ -409,6 +407,7 @@ export class MimiAgent {
 
   async stream(input: string, signal?: AbortSignal, options?: MimiRunOptions) {
     if (this.activeRun) throw new Error('当前 Session 仍有任务运行中，请等待完成或先中止');
+    this.lastCommittedAnswer = undefined;
     const mode = this.mode;
     const policyTools = options?.policy?.allowedTools;
     const executableCompletion = mode !== 'plan'
@@ -430,8 +429,7 @@ export class MimiAgent {
       options,
       pendingActions: [],
       requireDurableBlocker: Boolean(options?.hostTools?.some((tool) => tool.name === 'request_background_task_input')),
-      completionRequired: completionToolsAllowed && (options?.requireCompletionGate
-        ?? Boolean(options?.completionContract || requiresCompletionContract(input))),
+      completionRequired: false,
       completionContract: options?.completionContract,
     };
     run.releaseOwner = registerSessionRunOwner(run.ownerId);
@@ -472,16 +470,6 @@ export class MimiAgent {
     const resumesCheckpoint = recovery !== undefined
       && recovery.status !== 'completed'
       && (recovery.input.trim() === input.trim() || input.includes('恢复最近一次未完成运行：'));
-    if (run.completionRequired && resumesCheckpoint && recovery.completionContract) {
-      run.completionContract = recovery.completionContract;
-      await run.session.updateRunCompletion({
-        completionContract: run.completionContract,
-        completionReport: undefined,
-        completionGate: undefined,
-      }, run.runId);
-    } else if (run.completionContract) {
-      await run.session.updateRunCompletion({ completionContract: run.completionContract }, run.runId);
-    }
     await this.hooks.emit({ type: 'run_start', sessionId: run.sessionId, input });
     const [memories, plan, storedGoal, teamSummary, history, guidance, storedArchive] = await Promise.all([
       canReadMemory ? this.memory.search(this.memoryQuery(input, options?.cause)) : Promise.resolve([]),
@@ -499,14 +487,8 @@ export class MimiAgent {
       (resumesCheckpoint && recovery.goalCreatedAt === activeStoredGoal.createdAt)
       || input.includes('继续长期目标：')
       || input.trim() === activeStoredGoal.objective.trim());
-    const createsGoal = activeStoredGoal === undefined
-      && run.completionRequired && canReadState && requiresPersistentGoal(input);
-    if (createsGoal) await runTeam.clear();
-    const goal = resumesGoal
-      ? activeStoredGoal
-      : createsGoal
-        ? await runPlans.setGoal(input, run.completionContract?.criteria, run.completionContract)
-        : undefined;
+    const goal = resumesGoal ? activeStoredGoal : undefined;
+    run.completionRequired = completionToolsAllowed && resumesGoal;
     if (resumesGoal && activeStoredGoal.completionContract) {
       run.completionContract = activeStoredGoal.completionContract;
       await run.session.updateRunCompletion({
@@ -516,7 +498,7 @@ export class MimiAgent {
       }, run.runId);
     }
     const checkpointWithoutGoal = resumesCheckpoint && !activeStoredGoal && !recovery.goalCreatedAt;
-    const activePlan = createsGoal && !resumesGoal ? [] : resumesGoal || checkpointWithoutGoal ? plan : [];
+    const activePlan = resumesGoal || checkpointWithoutGoal ? plan : [];
     const activeTeamSummary = resumesGoal || checkpointWithoutGoal ? teamSummary : '';
     run.planOwned = Boolean((resumesGoal || checkpointWithoutGoal) && plan.length);
     run.teamOwned = Boolean((resumesGoal || checkpointWithoutGoal) && teamSummary);
@@ -589,12 +571,14 @@ export class MimiAgent {
         completionContract: () => run.completionContract,
         onGoalSet: async (createdGoal) => {
           run.goalCreatedAt = createdGoal.createdAt;
+          run.completionRequired = completionToolsAllowed;
           await run.session.updateRunGoalOwnership(createdGoal.createdAt, run.runId);
         },
       }),
-      ...(run.completionRequired ? createCompletionTools({
+      ...(completionToolsAllowed ? createCompletionTools({
         prepare: async (contract) => {
           if (this.activeRun !== run) throw new Error('Completion Contract 所属 Run 已失效');
+          if (!run.goalCreatedAt) throw new Error('普通任务不使用 Completion Contract；请先显式调用 set_goal 创建持久 Goal');
           const accepted = assertCompletionContractForTask(run.input, contract, run.completionContract);
           run.completionRequired = true;
           run.completionContract = accepted;
@@ -610,6 +594,7 @@ export class MimiAgent {
         },
         finish: async (report) => {
           if (this.activeRun !== run) throw new Error('Completion Gate 所属 Run 已失效');
+          if (!run.goalCreatedAt) throw new Error('普通任务不使用 Completion Gate；请直接根据实际结果回答');
           run.completionReport = report;
           const { gate } = await this.evaluateRunCompletion(run, runPlans, runTeam);
           await run.session.updateRunCompletion({
@@ -1175,10 +1160,10 @@ export class MimiAgent {
         completionReport: run.completionReport,
         completionGate: gate,
       }, run.runId);
-      if (gate.decision === 'continue' || gate.decision === 'uncertain') {
-        throw new CompletionGateError(gate, evaluated.progressFingerprint);
-      }
     }
+    const committedAnswer = gate && gate.decision !== 'pass'
+      ? this.incompleteGoalAnswer(gate)
+      : answer;
     this.activeRun = undefined;
     const validUsage = this.validUsage(usage);
     const executionKey = run.options?.executionKey;
@@ -1191,7 +1176,7 @@ export class MimiAgent {
         const executionCalls = await this.ledger.listCalls(run.sessionId, executionKey);
         const receipt = {
           runId: run.runId,
-          answer,
+          answer: committedAnswer,
           usage: validUsage,
           actions,
           delivery: await run.options.completionDelivery?.(executionCalls),
@@ -1204,7 +1189,7 @@ export class MimiAgent {
         }
         receiptCommitted = true;
       }
-      completed = await run.session.completeRun(answer, run.runId);
+      completed = await run.session.completeRun(committedAnswer, run.runId);
       if (completed?.runId !== run.runId || completed.status !== 'completed') {
         throw new Error(`Run ${run.runId} 已失效，拒绝用旧结果完成当前 Session`);
       }
@@ -1219,7 +1204,8 @@ export class MimiAgent {
       throw error;
     }
     this.lastUsage = validUsage;
-    await this.hooks.emit({ type: 'run_end', sessionId: run.sessionId, answer });
+    this.lastCommittedAnswer = committedAnswer;
+    await this.hooks.emit({ type: 'run_end', sessionId: run.sessionId, answer: committedAnswer });
     if (!run.options?.retainExecutionLedger) {
       await this.ledger.clearRun(run.sessionId, run.options?.executionKey ?? run.runId).catch(() => undefined);
     }
@@ -1235,22 +1221,8 @@ export class MimiAgent {
     return this.activeRun?.completionRequired === true;
   }
 
-  async deferRunForCompletion(error: CompletionGateError, usage?: ContextUsageSnapshot): Promise<void> {
-    const run = this.activeRun;
-    if (!run) return;
-    this.activeRun = undefined;
-    run.releaseOwner();
-    this.lastUsage = this.validUsage(usage);
-    if (run.options?.retainExecutionLedger) {
-      await run.session.rollbackRunItems(run.runId).catch(() => undefined);
-    }
-    await run.session.deferRunForCompletion(error.message, run.runId);
-    await this.hooks.emit({
-      type: 'run_error',
-      sessionId: run.sessionId,
-      error: error.message,
-      interrupted: true,
-    });
+  get completedRunAnswer(): string | undefined {
+    return this.lastCommittedAnswer;
   }
 
   private async evaluateRunCompletion(
@@ -1264,7 +1236,7 @@ export class MimiAgent {
       run.goalCreatedAt || run.planOwned ? plans.get() : Promise.resolve([]),
       run.goalCreatedAt || run.teamOwned ? team.list() : Promise.resolve([]),
     ]);
-    // When this run has no tool calls (e.g. resumed after Completion Gate rejection),
+    // A manually resumed Goal may rely on evidence retained by its prior checkpoint.
     // include calls from the previous run so the gate can find evidence.
     if (calls.length === 0 && run.recoveryRunId && run.recoveryRunId !== run.runId) {
       calls = await this.ledger.listCalls(run.sessionId, run.recoveryRunId);
@@ -1301,6 +1273,17 @@ export class MimiAgent {
       team: teamTasks.map((task) => ({ id: task.id, status: task.status })),
     })).digest('hex');
     return { gate, progressFingerprint };
+  }
+
+  private incompleteGoalAnswer(gate: CompletionGateDecision): string {
+    const unmet = gate.unmetCriteria.length ? `；未满足：${gate.unmetCriteria.join(', ')}` : '';
+    if (gate.decision === 'uncertain') {
+      return `长期 Goal 的完成状态仍不确定，已保留 Goal 且不会自动重放副作用：${gate.reason}${unmet}`;
+    }
+    if (gate.decision === 'blocked') {
+      return `长期 Goal 尚未完成并已保留检查点：${gate.reason}${unmet}。补充所需信息后可用 /resume 继续。`;
+    }
+    return `长期 Goal 尚未通过验收，已保留当前 Goal 和检查点，不会从头自动重跑：${gate.reason}${unmet}。可用 /resume 继续。`;
   }
 
   async failRun(error: unknown, interrupted = false, usage?: ContextUsageSnapshot): Promise<void> {

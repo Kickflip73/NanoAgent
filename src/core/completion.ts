@@ -231,20 +231,12 @@ export class CompletionGateError extends Error {
 }
 
 export function requiresCompletionContract(input: string): boolean {
-  const normalized = input.trim().toLowerCase();
-  if (!normalized) return false;
-  if (/(?:不要|无需|不需要)(?:调用|使用)任何?工具|(?:仅|只)(?:需)?回复/u.test(normalized)
-    || /\b(?:do not|don't) (?:call|use) (?:any )?tools?\b|\bonly repl(?:y|ies)\b/u.test(normalized)) {
-    return false;
-  }
-  return /(?:^\/goal\b|修复|升级|实现|创建|生成|编写|修改|发送|发给|通知|删除|清空|复制|移动|改名|部署|安装|运行|执行|测试|验证|导出|预订|购买|提交|推送|发布|迁移|重构|打开|关闭|关掉|把.+(?:放|移|改|写|存|关|开))/u.test(normalized)
-    || /\b(?:fix|build|create|write|edit|send|delete|copy|move|rename|deploy|install|run|test|verify|export|submit|commit|push|implement|open|close|turn|notify|purchase|book|pay|publish|develop|migrate|refactor)\b/u.test(normalized);
+  return requiresPersistentGoal(input);
 }
 
 export function requiresPersistentGoal(input: string): boolean {
   const normalized = input.trim().toLowerCase();
-  return /^\/goal\b/u.test(normalized)
-    || /(?:长期|持续(?:任务|研究|跟进|监控|执行|处理)|跨轮|多阶段|完整项目|long[- ]?running|multi[- ]?step)/u.test(normalized);
+  return /^\/goal\b/u.test(normalized);
 }
 
 export function expectedCompletionKind(input: string): CompletionKind {
@@ -257,7 +249,10 @@ export function expectedCompletionKind(input: string): CompletionKind {
     || /\b(?:fix|build|create|write|edit|copy|move|rename|implement|develop|migrate|refactor)\b/u.test(normalized)) {
     return 'artifact';
   }
-  return requiresPersistentGoal(normalized) ? 'long_running' : 'answer';
+  return /(?:长期|持续(?:任务|研究|跟进|监控|执行|处理)|跨轮|多阶段|完整项目|long[- ]?running|multi[- ]?step)/u.test(normalized)
+    || requiresPersistentGoal(normalized)
+    ? 'long_running'
+    : 'answer';
 }
 
 export function assertCompletionContractForTask(
