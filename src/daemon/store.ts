@@ -2,14 +2,18 @@ import { createHash, randomUUID } from 'node:crypto';
 import { chmodSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { isDeepStrictEqual } from 'node:util';
 import { assertSessionId } from '../core/session-id.js';
+import { EventStore } from './event-store.js';
+import { EventRouter } from './event-router.js';
+import { TaskStore } from './task-store.js';
 import type {
   EventEnvelope,
-  EventExecutionLane,
-  EventStatus,
+  EventRouteReceipt,
   DigestItem,
   HostRunRecord,
+  IngressTaskRoute,
+  ImmutableEvent,
+  ImmutableEventInput,
   MimiActivitySnapshot,
   MimiEventSummary,
   MimiOutboxSummary,
@@ -20,25 +24,31 @@ import type {
   OutboxStatus,
   ReplyRoute,
   ScheduleRecord,
-  StoredEvent,
+  TaskAttemptRecord,
   TaskControlIntent,
+  TaskInput,
+  TaskRecord,
+  TaskRouteInput,
+  TaskSelector,
+  TaskStatus,
 } from './types.js';
 
 type Row = Record<string, string | number | null | undefined>;
 
-const TERMINAL_EVENT_STATUSES = new Set<EventStatus>([
-  'paused', 'blocked', 'completed', 'ignored', 'digested', 'dead_letter', 'archived',
-]);
 const DEFAULT_OUTBOX_LEASE_MS = 180_000;
-const DEFAULT_EVENT_MAX_ATTEMPTS = 5;
-const DEFAULT_PREEMPTION_RESERVATION_MS = 60_000;
 const MAX_TASK_RESUME_CONTEXT_LENGTH = 4_000;
 const MAX_TASK_PROMPT_LENGTH = 64_000;
+
+export interface IngressRouteDecision {
+  decision: 'task_created' | 'digest' | 'observe_only' | 'rejected';
+  reasonCode: string;
+}
 
 export interface HistoryPruneResult {
   outbox: number;
   digestItems: number;
   runs: number;
+  tasks: number;
   events: number;
   schedules: number;
   attentionState: number;
@@ -100,128 +110,23 @@ function ownerRouteKey(profileId: string): string {
   return `owner-route:${createHash('sha256').update(profileId).digest('hex').slice(0, 24)}`;
 }
 
-function eventPreemptionResource(eventId: string): string {
-  return `event-preemption:${eventId}`;
-}
-
-function eventFailurePayload(event: StoredEvent, error: unknown): Record<string, unknown> {
-  const summary = errorSummary(error);
-  return {
-    type: 'event_dead_letter',
-    eventId: event.id,
-    source: event.source.slice(0, 200),
-    attempts: event.attempts,
-    error: summary,
-    text: `MimiAgent 任务最终失败：source=${event.source.slice(0, 120)}，event=${event.id.slice(0, 80)}，尝试 ${event.attempts} 次。${summary} 请运行 mimi daemon events 检查。`.slice(0, 1_000),
-  };
-}
-
-function eventFailureDelivery(
-  event: StoredEvent,
-  error: unknown,
-): { route: ReplyRoute; payload: Record<string, unknown> } {
-  if (event.executionLane !== 'task') {
-    return { route: { channel: 'system' }, payload: eventFailurePayload(event, error) };
-  }
-  const summary = errorSummary(error);
-  return {
-    route: event.replyRoute ?? { channel: 'system' },
-    payload: {
-      type: 'background_task_failed',
-      taskId: event.id,
-      attempts: event.attempts,
-      error: summary,
-      text: `MimiAgent 后台任务失败（${event.id.slice(0, 80)}），尝试 ${event.attempts} 次：${summary}`.slice(0, 1_000),
-    },
-  };
-}
-
 function deliveryFailurePayload(message: OutboxMessage, error: unknown): Record<string, unknown> {
   const summary = errorSummary(error);
   return {
     type: 'delivery_dead_letter',
-    eventId: message.eventId,
+    taskId: message.taskId,
     outboxId: message.id,
     channel: message.channel.slice(0, 200),
     attempts: message.attempts,
     error: summary,
-    text: `MimiAgent 未能确认结果是否已通过 ${message.channel.slice(0, 120)} 投递，event=${message.eventId.slice(0, 80)}，attempt=${message.attempts}。已进入 dead letter，不会自动重发。${summary} 请运行 mimi daemon outbox 核对后再决定重试或归档。`.slice(0, 1_000),
+    text: `MimiAgent 未能确认结果是否已通过 ${message.channel.slice(0, 120)} 投递，task=${message.taskId.slice(0, 80)}，attempt=${message.attempts}。已进入 dead letter，不会自动重发。${summary} 请运行 mimi daemon outbox 核对后再决定重试或归档。`.slice(0, 1_000),
   };
-}
-
-function eventFromRow(row: Row): StoredEvent {
-  return {
-    id: String(row.id),
-    externalId: String(row.external_id),
-    source: String(row.source),
-    kind: String(row.kind) as StoredEvent['kind'],
-    trust: String(row.trust) as StoredEvent['trust'],
-    actor: parseOptionalJson(row.actor_json),
-    conversation: parseOptionalJson(row.conversation_json),
-    payload: parseJson(row.payload_json),
-    occurredAt: String(row.occurred_at),
-    receivedAt: String(row.received_at),
-    priority: Number(row.priority),
-    profileId: String(row.profile_id),
-    sessionKey: optional(row.session_key),
-    replyRoute: parseOptionalJson(row.reply_route_json),
-    executionLane: (optional(row.execution_lane) ?? 'conversation') as StoredEvent['executionLane'],
-    originSessionKey: optional(row.origin_session_key),
-    parentEventId: optional(row.parent_event_id),
-    rootEventId: optional(row.root_event_id),
-    taskDepth: Number(row.task_depth ?? 0),
-    taskControl: optional(row.task_control) as TaskControlIntent | undefined,
-    taskControlReason: optional(row.task_control_reason),
-    status: String(row.status) as EventStatus,
-    attempts: Number(row.attempts),
-    maxAttempts: row.max_attempts === null || row.max_attempts === undefined
-      ? undefined
-      : Number(row.max_attempts),
-    completionDeferrals: Number(row.completion_deferrals ?? 0),
-    completionNoProgressDeferrals: Number(row.completion_no_progress_deferrals ?? 0),
-    completionProgressFingerprint: optional(row.completion_progress_fingerprint),
-    notBefore: String(row.not_before),
-    leaseOwner: optional(row.lease_owner),
-    leaseUntil: optional(row.lease_until),
-    result: parseJson(row.result_json),
-    error: optional(row.error),
-    createdAt: String(row.created_at),
-    updatedAt: String(row.updated_at),
-  };
-}
-
-function matchesConversationAuthority(stored: StoredEvent, expected: EventEnvelope): boolean {
-  return stored.source === expected.source
-    && stored.externalId === expected.externalId
-    && stored.kind === expected.kind
-    && stored.trust === expected.trust
-    && isDeepStrictEqual(stored.actor, expected.actor)
-    && isDeepStrictEqual(stored.conversation, expected.conversation)
-    && isDeepStrictEqual(stored.payload, expected.payload)
-    && stored.priority === expected.priority
-    && stored.profileId === expected.profileId
-    && stored.sessionKey === expected.sessionKey
-    && isDeepStrictEqual(stored.replyRoute, expected.replyRoute)
-    && stored.executionLane === 'conversation'
-    && stored.originSessionKey === undefined
-    && stored.parentEventId === undefined
-    && stored.rootEventId === undefined
-    && stored.taskDepth === 0;
-}
-
-function isConversationAuthority(event: StoredEvent | undefined): event is StoredEvent {
-  return event !== undefined
-    && event.executionLane === 'conversation'
-    && event.originSessionKey === undefined
-    && event.parentEventId === undefined
-    && event.rootEventId === undefined
-    && event.taskDepth === 0;
 }
 
 function outboxFromRow(row: Row): OutboxMessage {
   return {
     id: String(row.id),
-    eventId: String(row.event_id),
+    taskId: String(row.task_id),
     channel: String(row.channel),
     target: optional(row.target),
     payload: parseJson(row.payload_json),
@@ -259,7 +164,9 @@ function scheduleFromRow(row: Row): ScheduleRecord {
 function runFromRow(row: Row): HostRunRecord {
   return {
     id: String(row.id),
-    eventId: String(row.event_id),
+    taskId: String(row.task_id),
+    attemptNo: Number(row.attempt_no),
+    workerId: String(row.worker_id),
     sessionKey: String(row.session_key),
     status: String(row.status) as HostRunRecord['status'],
     startedAt: String(row.started_at),
@@ -288,6 +195,10 @@ function digestFromRow(row: Row): DigestItem {
 export class MimiStore {
   readonly file: string;
   private readonly database: DatabaseSync;
+  private readonly eventStore: EventStore;
+  private readonly eventRouter: EventRouter;
+  private readonly taskStore: TaskStore;
+  private ingressRoutePolicy?: (event: EventEnvelope, at: Date) => IngressRouteDecision;
 
   constructor(file: string) {
     this.file = path.resolve(file);
@@ -295,7 +206,10 @@ export class MimiStore {
     chmodSync(path.dirname(this.file), 0o700);
     this.database = new DatabaseSync(this.file, { timeout: 5_000 });
     this.database.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;');
+    this.eventStore = new EventStore(this.database);
+    this.taskStore = new TaskStore(this.database);
     this.migrate();
+    this.eventRouter = new EventRouter(this, 'ingress-v1');
     chmodSync(this.file, 0o600);
   }
 
@@ -303,259 +217,652 @@ export class MimiStore {
     this.database.close();
   }
 
-  enqueueEvent(event: EventEnvelope): { event: StoredEvent; inserted: boolean } {
-    return this.insertEvent(event);
+  setIngressRoutePolicy(policy: (event: EventEnvelope, at: Date) => IngressRouteDecision): void {
+    this.ingressRoutePolicy = policy;
   }
 
-  ensureConversationAuthority(event: EventEnvelope): StoredEvent {
-    if (
-      (event.executionLane ?? 'conversation') !== 'conversation'
-      || event.originSessionKey !== undefined
-      || event.parentEventId !== undefined
-      || event.rootEventId !== undefined
-      || (event.taskDepth ?? 0) !== 0
-    ) {
-      throw new Error('Conversation authority 必须是无父级的 conversation root Event');
-    }
+  appendEvent(event: ImmutableEventInput): { event: ImmutableEvent; inserted: boolean } {
+    return this.transaction(() => this.eventStore.append(event, nowIso()));
+  }
+
+  getImmutableEvent(id: string): ImmutableEvent | undefined {
+    return this.eventStore.get(id);
+  }
+
+  listImmutableEvents(limit = 50): ImmutableEvent[] {
+    return this.eventStore.list(managementLimit(limit));
+  }
+
+  getEventRouteReceipt(eventId: string): EventRouteReceipt | undefined {
+    return this.eventStore.getReceipt(eventId);
+  }
+
+  routeEvent(eventId: string, route: TaskRouteInput): EventRouteReceipt {
     return this.transaction(() => {
-      const result = this.insertEvent({ ...event, executionLane: 'conversation', taskDepth: 0 });
-      if (!result.inserted) {
-        if (result.event.status !== 'completed' || !matchesConversationAuthority(result.event, event)) {
-          throw new Error(`Conversation authority 冲突：${event.source}/${event.externalId}`);
-        }
-        return result.event;
+      const existing = this.eventStore.getReceipt(eventId);
+      if (existing) return existing;
+      if (!this.eventStore.get(eventId)) throw new Error(`Event 不存在：${eventId}`);
+      const tasks = route.tasks ?? [];
+      if (tasks.length > 16) throw new Error('单个 Event 最多路由 16 个 Task');
+      if (route.decision === 'task_created' && tasks.length === 0) {
+        throw new Error('task_created 路由必须创建至少一个 Task');
+      }
+      if (route.decision !== 'task_created' && tasks.length > 0) {
+        throw new Error(`${route.decision} 路由不能创建 Task`);
+      }
+      if (tasks.some((task) => task.triggerEventId !== undefined && task.triggerEventId !== eventId)) {
+        throw new Error('Event 路由创建的 Task 必须引用当前 trigger Event');
       }
       const timestamp = nowIso();
-      const updated = this.database.prepare(`
-        UPDATE events SET status = 'completed', result_json = ?, updated_at = ?
-        WHERE id = ? AND status = 'queued' AND attempts = 0
-      `).run(json({ authority: true }), timestamp, result.event.id);
-      if (Number(updated.changes) !== 1) {
-        throw new Error(`Conversation authority 写入失败：${event.source}/${event.externalId}`);
-      }
-      this.insertAudit('event.authority_recorded', result.event.id, { source: event.source }, timestamp);
-      return this.getEvent(result.event.id)!;
+      const taskIds = [...new Set(tasks.map((task) => this.enqueueTaskRecord({
+        ...task,
+        triggerEventId: task.triggerEventId ?? eventId,
+      }, timestamp).id))];
+      return this.eventStore.insertReceipt({
+        eventId,
+        routerVersion: route.routerVersion,
+        decision: route.decision,
+        taskIds,
+        reasonCode: route.reasonCode.slice(0, 200),
+        routedAt: timestamp,
+      });
     });
   }
 
-  enqueueBackgroundTask(
-    event: EventEnvelope,
-    maxChildren: number,
-  ): { event: StoredEvent; inserted: boolean } {
-    if (event.executionLane !== 'task' || !event.parentEventId) {
-      throw new Error('后台任务必须声明 task execution lane 和 parent event');
-    }
-    if (!Number.isSafeInteger(maxChildren) || maxChildren < 1 || maxChildren > 64) {
-      throw new Error('后台任务直接子任务上限必须在 1-64 之间');
-    }
-    const parentEventId = event.parentEventId;
-    return this.transaction(() => {
-      const existing = this.database.prepare('SELECT * FROM events WHERE source = ? AND external_id = ?')
-        .get(event.source, event.externalId) as Row | undefined;
-      if (existing) return { event: eventFromRow(existing), inserted: false };
-      if (this.backgroundTaskChildCount(parentEventId) >= maxChildren) {
-        throw new Error(`当前任务最多可直接委派 ${maxChildren} 个后台子任务，请先合并或完成已有子任务`);
-      }
-      return this.insertEvent(event);
-    });
+  enqueueTask(task: TaskInput): TaskRecord {
+    return this.transaction(() => this.enqueueTaskRecord(task, nowIso()));
   }
 
-  private insertEvent(event: EventEnvelope): { event: StoredEvent; inserted: boolean } {
-    const timestamp = nowIso();
-    const result = this.database.prepare(`
-      INSERT INTO events (
-        id, external_id, source, kind, trust, actor_json, conversation_json, payload_json,
-        occurred_at, received_at, priority, profile_id, session_key, reply_route_json,
-        execution_lane, origin_session_key, parent_event_id, root_event_id, task_depth,
-        status, attempts, not_before, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?, ?)
-      ON CONFLICT(source, external_id) DO NOTHING
-    `).run(
-      event.id,
-      event.externalId,
-      event.source,
-      event.kind,
-      event.trust,
-      json(event.actor),
-      json(event.conversation),
-      json(event.payload),
-      event.occurredAt,
-      event.receivedAt,
-      event.priority,
-      event.profileId,
-      event.sessionKey ?? null,
-      json(event.replyRoute),
-      event.executionLane ?? 'conversation',
-      event.originSessionKey ?? null,
-      event.parentEventId ?? null,
-      event.rootEventId ?? null,
-      event.taskDepth ?? 0,
-      event.receivedAt,
-      timestamp,
-      timestamp,
-    );
-    const stored = this.database.prepare('SELECT * FROM events WHERE source = ? AND external_id = ?')
-      .get(event.source, event.externalId) as Row | undefined;
-    if (!stored) throw new Error(`事件写入失败：${event.source}/${event.externalId}`);
-    return { event: eventFromRow(stored), inserted: Number(result.changes) === 1 };
+  getTask(id: string): TaskRecord | undefined {
+    return this.taskStore.get(id);
   }
 
-  getEvent(id: string): StoredEvent | undefined {
-    const row = this.database.prepare('SELECT * FROM events WHERE id = ?').get(id) as Row | undefined;
-    return row ? eventFromRow(row) : undefined;
+  listTasks(limit = 50): TaskRecord[] {
+    return this.taskStore.list(managementLimit(limit));
   }
 
-  listEvents(limit = 50): StoredEvent[] {
-    return (this.database.prepare('SELECT * FROM events ORDER BY received_at DESC LIMIT ?').all(limit) as Row[])
-      .map(eventFromRow);
-  }
-
-  listBackgroundTasks(limit = 50): StoredEvent[] {
-    return (this.database.prepare(`
-      SELECT * FROM events WHERE execution_lane = 'task'
-      ORDER BY received_at DESC, rowid DESC LIMIT ?
-    `).all(managementLimit(limit)) as Row[]).map(eventFromRow);
-  }
-
-  backgroundTaskChildCount(parentEventId: string): number {
-    const row = this.database.prepare(`
-      SELECT COUNT(*) AS count FROM events
-      WHERE execution_lane = 'task' AND parent_event_id = ?
-    `).get(parentEventId) as Row;
+  taskChildCount(parentTaskId: string): number {
+    const row = this.database.prepare('SELECT COUNT(*) AS count FROM tasks WHERE parent_task_id = ?')
+      .get(parentTaskId) as Row;
     return Number(row.count);
   }
 
-  taskControl(id: string): { intent: TaskControlIntent; reason: string } | undefined {
-    const row = this.database.prepare(`
-      SELECT task_control, task_control_reason FROM events
-      WHERE id = ? AND execution_lane = 'task' AND task_control IS NOT NULL
-    `).get(id) as Row | undefined;
-    const intent = optional(row?.task_control);
-    if (intent !== 'pause' && intent !== 'cancel') return undefined;
+  claimTask(
+    owner: string,
+    selector: TaskSelector = {},
+    leaseMs = 60_000,
+    at = new Date(),
+  ): TaskRecord | undefined {
+    return this.transaction(() => {
+      const timestamp = at.toISOString();
+      this.recoverExpiredTasks(timestamp);
+      for (let scanned = 0; scanned < 100; scanned += 1) {
+        const candidate = this.taskStore.claimCandidate(selector, timestamp);
+        if (!candidate) return undefined;
+        const leaseUntil = new Date(at.getTime() + leaseMs).toISOString();
+        if (!this.taskStore.claim(candidate.id, owner, leaseUntil, timestamp)) continue;
+        const task = this.taskStore.get(candidate.id)!;
+        this.appendTaskLifecycleEvent(task, 'task.started', timestamp, {
+          attemptNo: task.attemptCount,
+          workerId: owner,
+        });
+        return task;
+      }
+      return undefined;
+    });
+  }
+
+  claimTaskById(
+    taskId: string,
+    owner: string,
+    leaseMs = 60_000,
+    at = new Date(),
+  ): TaskRecord | undefined {
+    return this.transaction(() => {
+      const timestamp = at.toISOString();
+      this.recoverExpiredTasks(timestamp);
+      const task = this.taskStore.get(taskId);
+      if (!task || task.status !== 'queued' || task.notBefore > timestamp) return undefined;
+      const leaseUntil = new Date(at.getTime() + leaseMs).toISOString();
+      if (!this.taskStore.claim(taskId, owner, leaseUntil, timestamp)) return undefined;
+      const claimed = this.taskStore.get(taskId)!;
+      this.appendTaskLifecycleEvent(claimed, 'task.started', timestamp, {
+        attemptNo: claimed.attemptCount,
+        workerId: owner,
+      });
+      return claimed;
+    });
+  }
+
+  readyTasks(selector: TaskSelector = {}, limit = 50, at = new Date()): TaskRecord[] {
+    return this.transaction(() => {
+      const timestamp = at.toISOString();
+      this.recoverExpiredTasks(timestamp);
+      return this.taskStore.listReady(selector, timestamp, managementLimit(limit));
+    });
+  }
+
+  beginTaskAttempt(
+    taskId: string,
+    owner: string,
+    sessionKey: string,
+    workerId = owner,
+    at = new Date(),
+  ): TaskAttemptRecord {
+    return this.transaction(() => {
+      const task = this.taskStore.get(taskId);
+      if (!task || task.status !== 'running' || task.leaseOwner !== owner
+        || !task.leaseUntil || task.leaseUntil <= at.toISOString()) {
+        throw new Error(`Task ${taskId} 租约已失效`);
+      }
+      return this.taskStore.beginAttempt(randomUUID(), task, sessionKey, workerId, at.toISOString());
+    });
+  }
+
+  renewTaskLease(taskId: string, owner: string, leaseMs = 60_000, at = new Date()): boolean {
+    const timestamp = at.toISOString();
+    const updated = this.database.prepare(`
+      UPDATE tasks SET lease_until = ?, updated_at = ?
+      WHERE id = ? AND status = 'running' AND lease_owner = ? AND lease_until > ?
+        AND control_intent IS NULL
+    `).run(new Date(at.getTime() + leaseMs).toISOString(), timestamp, taskId, owner, timestamp);
+    return Number(updated.changes) === 1;
+  }
+
+  taskControl(taskId: string): { intent: TaskControlIntent; reason: string } | undefined {
+    const task = this.taskStore.get(taskId);
+    if (!task?.controlIntent) return undefined;
     return {
-      intent,
-      reason: optional(row?.task_control_reason)
-        ?? (intent === 'cancel' ? 'owner 取消了后台任务' : 'owner 暂停了后台任务'),
+      intent: task.controlIntent,
+      reason: task.controlReason
+        ?? (task.controlIntent === 'cancel' ? 'owner 取消了后台任务' : 'owner 暂停了后台任务'),
     };
   }
 
-  requestRunningTaskControl(
-    id: string,
-    intent: TaskControlIntent,
-    reason: string,
+  getTaskAttempt(id: string): TaskAttemptRecord | undefined {
+    return this.taskStore.getAttempt(id);
+  }
+
+  settleTaskControl(
+    taskId: string,
+    owner: string,
+    attemptId?: string,
     at = new Date(),
-  ): StoredEvent | undefined {
+  ): TaskRecord | undefined {
     return this.transaction(() => {
-      const current = this.getEvent(id);
-      if (!current || current.executionLane !== 'task' || current.status !== 'running') return undefined;
-      const timestamp = at.toISOString();
-      const fallback = intent === 'cancel' ? 'owner 取消了后台任务' : 'owner 暂停了后台任务';
-      const summary = reason.replace(/\s+/g, ' ').trim().slice(0, 4_000) || fallback;
-      const updated = this.database.prepare(`
-        UPDATE events SET
-          task_control = CASE WHEN task_control = 'cancel' THEN task_control ELSE ? END,
-          task_control_reason = CASE WHEN task_control = 'cancel' THEN task_control_reason ELSE ? END,
-          updated_at = ?
-        WHERE id = ? AND execution_lane = 'task' AND status = 'running'
-      `).run(intent, summary, timestamp, id);
-      if (Number(updated.changes) !== 1) return undefined;
-      const stored = this.getEvent(id)!;
-      if (stored.taskControl !== current.taskControl || stored.taskControlReason !== current.taskControlReason) {
-        this.insertAudit('event.control_requested', id, {
-          intent: stored.taskControl,
-          reason: stored.taskControlReason?.slice(0, 1_000),
-        }, timestamp);
+      const task = this.taskStore.get(taskId);
+      if (!task || task.status !== 'running' || task.leaseOwner !== owner || !task.controlIntent) {
+        return undefined;
       }
-      return stored;
+      const timestamp = at.toISOString();
+      const cancelled = task.controlIntent === 'cancel';
+      const reason = task.controlReason
+        ?? (cancelled ? 'owner cancelled Task' : 'owner paused Task');
+      const updated = this.database.prepare(`
+        UPDATE tasks SET status = ?, error = ?, lease_owner = NULL, lease_until = NULL,
+          control_intent = NULL, control_reason = NULL, updated_at = ?
+        WHERE id = ? AND status = 'running' AND lease_owner = ? AND control_intent = ?
+      `).run(cancelled ? 'cancelled' : 'paused', reason, timestamp, taskId, owner, task.controlIntent);
+      if (Number(updated.changes) !== 1) return undefined;
+      if (!this.taskStore.finishAttempt(
+        attemptId,
+        taskId,
+        task.attemptCount,
+        'interrupted',
+        undefined,
+        reason,
+        timestamp,
+      ) && attemptId) {
+        throw new Error(`Task Attempt ${attemptId} 已终止或不存在`);
+      }
+      const settled = this.taskStore.get(taskId)!;
+      this.appendTaskLifecycleEvent(
+        settled,
+        cancelled ? 'task.cancelled' : 'task.paused',
+        timestamp,
+        { reason, phase: 'safe_boundary' },
+      );
+      return settled;
     });
+  }
+
+  pauseTask(taskId: string, reason = 'owner paused Task', at = new Date()): TaskRecord {
+    return this.transaction(() => {
+      const task = this.taskStore.get(taskId);
+      if (!task) throw new Error(`Task 不存在：${taskId}`);
+      const timestamp = at.toISOString();
+      const summary = errorSummary(reason, 4_000);
+      if (task.status === 'queued') {
+        const updated = this.database.prepare(`
+          UPDATE tasks SET status = 'paused', control_reason = ?, updated_at = ?
+          WHERE id = ? AND status = 'queued'
+        `).run(summary, timestamp, taskId);
+        if (Number(updated.changes) !== 1) throw new Error(`Task ${taskId} 状态已变化`);
+        const paused = this.taskStore.get(taskId)!;
+        this.appendTaskLifecycleEvent(paused, 'task.paused', timestamp, { reason: summary });
+        return paused;
+      }
+      if (task.status === 'running') {
+        if (task.controlIntent === 'cancel' || task.controlIntent === 'pause') return task;
+        const updated = this.database.prepare(`
+          UPDATE tasks SET
+            control_intent = CASE WHEN control_intent = 'cancel' THEN control_intent ELSE 'pause' END,
+            control_reason = CASE WHEN control_intent = 'cancel' THEN control_reason ELSE ? END,
+            updated_at = ?
+          WHERE id = ? AND status = 'running'
+        `).run(summary, timestamp, taskId);
+        if (Number(updated.changes) !== 1) throw new Error(`Task ${taskId} 状态已变化`);
+        const requested = this.taskStore.get(taskId)!;
+        if (requested.controlIntent === 'pause') {
+          this.appendTaskLifecycleEvent(requested, 'task.pause_requested', timestamp, { reason: summary });
+        }
+        return requested;
+      }
+      if (task.status === 'paused') return task;
+      throw new Error(`Task ${taskId} 不是可暂停状态：${task.status}`);
+    });
+  }
+
+  resumeTask(taskId: string, context?: string, at = new Date()): TaskRecord {
+    return this.transaction(() => {
+      const task = this.taskStore.get(taskId);
+      if (!task || (task.status !== 'paused' && task.status !== 'blocked')) {
+        throw new Error(`Task ${taskId} 不是可恢复状态`);
+      }
+      const timestamp = at.toISOString();
+      const objective = resumedTaskPayload(task.objective, context);
+      const updated = this.database.prepare(`
+        UPDATE tasks SET status = 'queued', objective_json = ?, not_before = ?, control_intent = NULL,
+          control_reason = NULL, result_json = NULL, error = NULL, updated_at = ?
+        WHERE id = ? AND status IN ('paused', 'blocked')
+      `).run(json(objective), timestamp, timestamp, taskId);
+      if (Number(updated.changes) !== 1) throw new Error(`Task ${taskId} 状态已变化`);
+      const resumed = this.taskStore.get(taskId)!;
+      this.appendTaskLifecycleEvent(resumed, 'task.resumed', timestamp, {
+        previousStatus: task.status,
+        additionalContext: Boolean(context?.trim()),
+      });
+      return resumed;
+    });
+  }
+
+  cancelTask(taskId: string, reason = 'owner cancelled Task', at = new Date()): TaskRecord {
+    return this.transaction(() => {
+      const task = this.taskStore.get(taskId);
+      if (!task) throw new Error(`Task 不存在：${taskId}`);
+      const timestamp = at.toISOString();
+      const summary = errorSummary(reason, 4_000);
+      if (task.status === 'running') {
+        if (task.controlIntent === 'cancel') return task;
+        this.database.prepare(`
+          UPDATE tasks SET control_intent = 'cancel', control_reason = ?, updated_at = ?
+          WHERE id = ? AND status = 'running'
+        `).run(summary, timestamp, taskId);
+        const requested = this.taskStore.get(taskId)!;
+        this.appendTaskLifecycleEvent(requested, 'task.cancel_requested', timestamp, { reason: summary });
+        return requested;
+      }
+      if (task.status === 'queued' || task.status === 'paused' || task.status === 'blocked') {
+        const updated = this.database.prepare(`
+          UPDATE tasks SET status = 'cancelled', error = ?, control_intent = NULL,
+            control_reason = NULL, updated_at = ?
+          WHERE id = ? AND status IN ('queued', 'paused', 'blocked')
+        `).run(summary, timestamp, taskId);
+        if (Number(updated.changes) !== 1) throw new Error(`Task ${taskId} 状态已变化`);
+        const cancelled = this.taskStore.get(taskId)!;
+        this.appendTaskLifecycleEvent(cancelled, 'task.cancelled', timestamp, { reason: summary });
+        return cancelled;
+      }
+      return task;
+    });
+  }
+
+  completeTask(
+    taskId: string,
+    owner: string,
+    result: unknown,
+    attemptId?: string,
+    at = new Date(),
+    delivery?: { route: ReplyRoute; payload: unknown },
+  ): TaskRecord {
+    return this.transaction(() => {
+      const timestamp = at.toISOString();
+      const current = this.taskStore.get(taskId);
+      if (!current || current.status !== 'running' || current.leaseOwner !== owner
+        || !current.leaseUntil || current.leaseUntil <= timestamp) {
+        throw new Error(`Task ${taskId} 租约已失效`);
+      }
+      if (!this.taskStore.updateTerminal(taskId, owner, 'completed', result, undefined, timestamp)) {
+        throw new Error(`Task ${taskId} 租约已失效`);
+      }
+      if (!this.taskStore.finishAttempt(
+        attemptId,
+        taskId,
+        current.attemptCount,
+        'completed',
+        result,
+        undefined,
+        timestamp,
+      ) && attemptId) {
+        throw new Error(`Task Attempt ${attemptId} 已终止或不存在`);
+      }
+      const task = this.taskStore.get(taskId)!;
+      if (task.type === 'briefing' && task.triggerEventId) {
+        this.database.prepare(`
+          UPDATE digest_items SET digested_at = ?
+          WHERE briefing_event_id = ? AND digested_at IS NULL
+        `).run(timestamp, task.triggerEventId);
+      }
+      this.appendTaskLifecycleEvent(task, 'task.completed', timestamp, { resultAvailable: result !== undefined });
+      if (delivery) this.insertOutbox(taskId, delivery.route, delivery.payload, timestamp);
+      return task;
+    });
+  }
+
+  bindRunningTaskSession(taskId: string, owner: string, sessionKey: string, at = new Date()): void {
+    const timestamp = at.toISOString();
+    const updated = this.database.prepare(`
+      UPDATE tasks SET session_key = ?, updated_at = ?
+      WHERE id = ? AND status = 'running' AND lease_owner = ?
+        AND lease_until > ? AND control_intent IS NULL
+    `).run(sessionKey, timestamp, taskId, owner, timestamp);
+    if (Number(updated.changes) !== 1) throw new Error(`Task ${taskId} 租约已失效`);
+  }
+
+  blockTask(
+    taskId: string,
+    owner: string,
+    result: unknown,
+    reason: string,
+    attemptId?: string,
+    at = new Date(),
+    delivery?: { route: ReplyRoute; payload: unknown },
+  ): TaskRecord {
+    return this.transaction(() => {
+      const task = this.taskStore.get(taskId);
+      const timestamp = at.toISOString();
+      if (!task || task.status !== 'running' || task.leaseOwner !== owner
+        || !task.leaseUntil || task.leaseUntil <= timestamp || task.controlIntent !== undefined) {
+        throw new Error(`Task ${taskId} 租约已失效`);
+      }
+      const updated = this.database.prepare(`
+        UPDATE tasks SET status = 'blocked', result_json = ?, error = ?, lease_owner = NULL,
+          lease_until = NULL, control_intent = NULL, control_reason = NULL, updated_at = ?
+        WHERE id = ? AND status = 'running' AND lease_owner = ?
+          AND lease_until > ? AND control_intent IS NULL
+      `).run(json(result), errorSummary(reason, 4_000), timestamp, taskId, owner, timestamp);
+      if (Number(updated.changes) !== 1) throw new Error(`Task ${taskId} 租约已失效`);
+      if (!this.taskStore.finishAttempt(
+        attemptId,
+        taskId,
+        task.attemptCount,
+        'interrupted',
+        result,
+        reason,
+        timestamp,
+      ) && attemptId) {
+        throw new Error(`Task Attempt ${attemptId} 已终止或不存在`);
+      }
+      const blocked = this.taskStore.get(taskId)!;
+      this.appendTaskLifecycleEvent(blocked, 'task.blocked', timestamp, { reason });
+      if (delivery) this.insertOutbox(taskId, delivery.route, delivery.payload, timestamp);
+      return blocked;
+    });
+  }
+
+  requeueTask(taskId: string, owner: string, reason: string, attemptId?: string, at = new Date()): TaskRecord {
+    return this.transaction(() => {
+      const task = this.taskStore.get(taskId);
+      const timestamp = at.toISOString();
+      if (!task || task.status !== 'running' || task.leaseOwner !== owner
+        || !task.leaseUntil || task.leaseUntil <= timestamp || task.controlIntent) {
+        throw new Error(`Task ${taskId} 租约已失效`);
+      }
+      if (!this.taskStore.requeueFailure(taskId, owner, errorSummary(reason, 4_000), timestamp, timestamp)) {
+        throw new Error(`Task ${taskId} 租约已失效`);
+      }
+      if (!this.taskStore.finishAttempt(
+        attemptId, taskId, task.attemptCount, 'interrupted', undefined, reason, timestamp,
+      ) && attemptId) throw new Error(`Task Attempt ${attemptId} 已终止或不存在`);
+      const queued = this.taskStore.get(taskId)!;
+      this.appendTaskLifecycleEvent(queued, 'task.retry_scheduled', timestamp, { reason, notBefore: timestamp });
+      return queued;
+    });
+  }
+
+  preemptTask(taskId: string, owner: string, reason: string, attemptId?: string, at = new Date()): TaskRecord {
+    return this.transaction(() => {
+      const timestamp = at.toISOString();
+      const task = this.taskStore.get(taskId);
+      if (!task || task.status !== 'running' || task.leaseOwner !== owner
+        || !task.leaseUntil || task.leaseUntil <= timestamp || task.controlIntent) {
+        throw new Error(`Task ${taskId} 租约已失效`);
+      }
+      const updated = this.database.prepare(`
+        UPDATE tasks SET status = 'queued', max_attempts = max_attempts + 1,
+          not_before = ?, error = ?, lease_owner = NULL, lease_until = NULL, updated_at = ?
+        WHERE id = ? AND status = 'running' AND lease_owner = ?
+          AND lease_until > ? AND control_intent IS NULL
+      `).run(timestamp, errorSummary(reason, 4_000), timestamp, taskId, owner, timestamp);
+      if (Number(updated.changes) !== 1) throw new Error(`Task ${taskId} 租约已失效`);
+      if (!this.taskStore.finishAttempt(
+        attemptId, taskId, task.attemptCount, 'interrupted', undefined, reason, timestamp,
+      ) && attemptId) throw new Error(`Task Attempt ${attemptId} 已终止或不存在`);
+      const queued = this.taskStore.get(taskId)!;
+      this.appendTaskLifecycleEvent(queued, 'task.preempted', timestamp, { reason });
+      return queued;
+    });
+  }
+
+  failTask(
+    taskId: string,
+    owner: string,
+    error: unknown,
+    attemptId?: string,
+    at = new Date(),
+    retryable = true,
+    terminalStatus: Extract<TaskStatus, 'failed' | 'dead_letter'> = 'failed',
+  ): TaskRecord {
+    return this.transaction(() => {
+      const task = this.taskStore.get(taskId);
+      if (!task || task.status !== 'running' || task.leaseOwner !== owner
+        || !task.leaseUntil || task.leaseUntil <= at.toISOString()) {
+        throw new Error(`Task ${taskId} 租约已失效`);
+      }
+      const timestamp = at.toISOString();
+      const summary = errorSummary(error, 4_000);
+      const terminal = !retryable || task.attemptCount >= task.maxAttempts;
+      if (terminal) {
+        const status = retryable ? 'dead_letter' : terminalStatus;
+        if (!this.taskStore.updateTerminal(taskId, owner, status, undefined, summary, timestamp)) {
+          throw new Error(`Task ${taskId} 租约已失效`);
+        }
+      } else {
+        const delay = Math.min(60 * 60_000, 1_000 * 2 ** Math.max(0, task.attemptCount - 1));
+        if (!this.taskStore.requeueFailure(
+          taskId,
+          owner,
+          summary,
+          new Date(at.getTime() + delay).toISOString(),
+          timestamp,
+        )) throw new Error(`Task ${taskId} 租约已失效`);
+      }
+      if (!this.taskStore.finishAttempt(
+        attemptId,
+        taskId,
+        task.attemptCount,
+        'failed',
+        undefined,
+        summary,
+        timestamp,
+      ) && attemptId) {
+        throw new Error(`Task Attempt ${attemptId} 已终止或不存在`);
+      }
+      const updated = this.taskStore.get(taskId)!;
+      this.appendTaskLifecycleEvent(updated, terminal
+        ? (updated.status === 'failed' ? 'task.failed' : 'task.dead_letter')
+        : 'task.retry_scheduled', timestamp, {
+        error: summary,
+        attemptNo: task.attemptCount,
+        notBefore: updated.notBefore,
+      });
+      if (terminal) {
+        const trigger = task.triggerEventId ? this.eventStore.get(task.triggerEventId) : undefined;
+        const authority = this.eventStore.get(task.authorityEventId);
+        const route = trigger?.replyRoute ?? authority?.replyRoute;
+        if (route) {
+          this.insertOutbox(task.id, route, {
+            type: updated.status === 'dead_letter' ? 'task_dead_letter' : 'task_failed',
+            taskId: task.id,
+            text: `MimiAgent 任务失败（${task.id}）：${summary}`.slice(0, 4_000),
+          }, timestamp);
+        }
+      }
+      return updated;
+    });
+  }
+
+  ingestEvent(
+    event: EventEnvelope,
+    route: IngressTaskRoute = {},
+  ): { event: ImmutableEvent; task?: TaskRecord; inserted: boolean } {
+    return this.transaction(() => {
+      const appended = this.eventStore.append({
+        id: event.id,
+        externalId: event.externalId,
+        source: event.source,
+        type: event.kind === 'schedule' ? 'schedule.due' : `${event.kind}.received`,
+        trust: event.trust,
+        actor: event.actor,
+        conversation: event.conversation,
+        payload: event.payload,
+        correlationId: event.id,
+        profileId: event.profileId,
+        replyRoute: event.replyRoute,
+        occurredAt: event.occurredAt,
+        receivedAt: event.receivedAt,
+      }, nowIso());
+      const receipt = this.eventStore.getReceipt(appended.event.id);
+      if (receipt) {
+        return {
+          ...appended,
+          task: receipt.taskIds[0] ? this.taskStore.get(receipt.taskIds[0]) : undefined,
+        };
+      }
+      const decision = route.type
+        ? { decision: 'task_created' as const, reasonCode: 'explicit_task_route' }
+        : this.ingressRoutePolicy?.(event, new Date())
+          ?? (event.kind === 'ambient'
+            ? { decision: 'digest' as const, reasonCode: 'ambient_digest' }
+            : { decision: 'task_created' as const, reasonCode: 'default_action' });
+      if (decision.decision !== 'task_created') {
+        const timestamp = nowIso();
+        this.eventRouter.routeEvent(appended.event.id, {
+          decision: decision.decision,
+          reasonCode: decision.reasonCode,
+        });
+        if (decision.decision === 'digest') {
+          this.database.prepare(`
+            INSERT OR IGNORE INTO digest_items (
+              id, event_id, source, kind, priority, payload_json, reason, occurred_at, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `).run(
+            randomUUID(), appended.event.id, event.source, event.kind, event.priority,
+            json(event.payload), decision.reasonCode, event.occurredAt, timestamp,
+          );
+        }
+        return appended;
+      }
+      const payload = event.payload && typeof event.payload === 'object' && !Array.isArray(event.payload)
+        ? event.payload as Record<string, unknown>
+        : {};
+      const taskType = route.type ?? 'conversation';
+      const authorityEventId = route.authorityEventId ?? appended.event.id;
+      const taskInput: TaskInput = {
+        id: taskType === 'conversation' ? randomUUID() : event.id,
+        type: taskType,
+        idempotencyKey: `event:${appended.event.id}:reply`,
+        triggerEventId: appended.event.id,
+        authorityEventId: this.eventStore.get(authorityEventId) ? authorityEventId : appended.event.id,
+        parentTaskId: route.parentTaskId,
+        profileId: event.profileId,
+        sessionKey: route.sessionKey ?? event.sessionKey,
+        objective: event.payload,
+        executor: route.executor
+          ?? (taskType === 'conversation'
+            ? 'session_actor'
+            : (payload.executor === 'codex' ? 'codex' : 'isolated_worker')),
+        workspaceAccess: route.workspaceAccess
+          ?? (payload.workspaceAccess === 'read' ? 'read' : 'write'),
+        priority: event.priority,
+      };
+      const routed = this.eventRouter.routeEvent(appended.event.id, {
+        decision: 'task_created',
+        reasonCode: decision.reasonCode,
+        tasks: [taskInput],
+      });
+      const taskId = routed.taskIds[0];
+      const task = taskId ? this.taskStore.get(taskId) : undefined;
+      if (!task) throw new Error(`Event ${appended.event.id} 路由未创建 Task`);
+      return { ...appended, task };
+    });
+  }
+
+  ensureConversationAuthority(event: EventEnvelope): ImmutableEvent {
+    return this.appendEvent({
+      id: event.id,
+      externalId: event.externalId,
+      source: event.source,
+      type: 'conversation.authority',
+      trust: event.trust,
+      actor: event.actor,
+      conversation: event.conversation,
+      payload: event.payload,
+      profileId: event.profileId,
+      replyRoute: event.replyRoute,
+      occurredAt: event.occurredAt,
+      receivedAt: event.receivedAt,
+    }).event;
   }
 
   listEventSummaries(requestedLimit = 50): MimiEventSummary[] {
     return (this.database.prepare(`
-      SELECT id, external_id, source, kind, trust, status, priority, attempts,
-        profile_id, session_key, occurred_at, received_at, updated_at, error
+      SELECT id, external_id, source, type, trust, subject_type, subject_id,
+        profile_id, occurred_at, received_at, created_at
       FROM events ORDER BY received_at DESC, rowid DESC LIMIT ?
     `).all(managementLimit(requestedLimit)) as Row[]).map((row) => ({
       id: String(row.id),
       externalId: String(row.external_id).slice(0, 500),
       source: String(row.source).slice(0, 200),
-      kind: String(row.kind) as StoredEvent['kind'],
-      trust: String(row.trust) as StoredEvent['trust'],
-      status: String(row.status) as EventStatus,
-      priority: Number(row.priority),
-      attempts: Number(row.attempts),
+      type: String(row.type),
+      trust: String(row.trust) as ImmutableEvent['trust'],
+      subjectType: optional(row.subject_type) as ImmutableEvent['subjectType'],
+      subjectId: optional(row.subject_id),
       profileId: String(row.profile_id).slice(0, 100),
-      sessionKey: optional(row.session_key),
       occurredAt: String(row.occurred_at),
       receivedAt: String(row.received_at),
-      updatedAt: String(row.updated_at),
-      error: optional(row.error)?.slice(0, 500),
+      createdAt: String(row.created_at),
     }));
   }
 
-  retryDeadLetterEvent(id: string, at = new Date()): StoredEvent {
+  retryDeadLetterTask(id: string, at = new Date()): TaskRecord {
     return this.transaction(() => {
-      const event = this.getEvent(id);
-      if (!event || event.status !== 'dead_letter') throw new Error(`事件 ${id} 不是 dead letter`);
+      const task = this.taskStore.get(id);
+      if (!task || task.status !== 'dead_letter') throw new Error(`Task ${id} 不是 dead letter`);
       const timestamp = at.toISOString();
       const updated = this.database.prepare(`
-        UPDATE events SET status = 'queued', attempts = 0, not_before = ?,
-          completion_deferrals = 0, completion_no_progress_deferrals = 0,
-          completion_progress_fingerprint = NULL, lease_owner = NULL, lease_until = NULL,
+        UPDATE tasks SET status = 'queued', max_attempts = attempt_count + 1, not_before = ?,
+          control_intent = NULL, control_reason = NULL, lease_owner = NULL, lease_until = NULL,
           result_json = NULL, error = NULL, updated_at = ?
         WHERE id = ? AND status = 'dead_letter'
       `).run(timestamp, timestamp, id);
-      if (Number(updated.changes) !== 1) throw new Error(`事件 ${id} dead letter 状态已变化`);
-      this.insertAudit('event.requeued', id, {
-        previousAttempts: event.attempts,
-        previousError: event.error,
-      }, timestamp);
-      return this.getEvent(id)!;
-    });
-  }
-
-  archiveDeadLetterEvent(id: string, at = new Date()): StoredEvent {
-    return this.transaction(() => {
-      const timestamp = at.toISOString();
-      const updated = this.database.prepare(`
-        UPDATE events SET status = 'archived', lease_owner = NULL, lease_until = NULL, updated_at = ?
-        WHERE id = ? AND status = 'dead_letter'
-      `).run(timestamp, id);
-      if (Number(updated.changes) !== 1) throw new Error(`事件 ${id} 不是 dead letter`);
-      this.insertAudit('event.archived', id, {}, timestamp);
-      return this.getEvent(id)!;
-    });
-  }
-
-  digestEvent(id: string, owner: string, reason: string): DigestItem {
-    return this.transaction(() => {
-      const event = this.getEvent(id);
-      if (!event || event.status !== 'running' || event.leaseOwner !== owner) {
-        throw new Error(`事件 ${id} 租约已失效`);
-      }
-      const timestamp = nowIso();
-      const digestId = randomUUID();
-      this.database.prepare(`
-        INSERT INTO digest_items (
-          id, event_id, source, kind, priority, payload_json, reason, occurred_at, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(event_id) DO NOTHING
-      `).run(
-        digestId, event.id, event.source, event.kind, event.priority, json(event.payload),
-        reason.slice(0, 1_000), event.occurredAt, timestamp,
-      );
-      const updated = this.database.prepare(`
-        UPDATE events SET status = 'digested', result_json = ?, error = NULL,
-          lease_owner = NULL, lease_until = NULL, task_control = NULL,
-          task_control_reason = NULL, updated_at = ?
-        WHERE id = ? AND status = 'running' AND lease_owner = ?
-          AND (execution_lane <> 'task' OR task_control IS NULL)
-      `).run(json({ reason }), timestamp, id, owner);
-      if (Number(updated.changes) !== 1) throw new Error(`事件 ${id} 租约已失效`);
-      this.insertAudit('event.digested', id, { reason }, timestamp);
-      const row = this.database.prepare('SELECT * FROM digest_items WHERE event_id = ?').get(id) as Row | undefined;
-      if (!row) throw new Error(`事件 ${id} 摘要写入失败`);
-      return digestFromRow(row);
+      if (Number(updated.changes) !== 1) throw new Error(`Task ${id} dead letter 状态已变化`);
+      const retried = this.taskStore.get(id)!;
+      this.appendTaskLifecycleEvent(retried, 'task.retried', timestamp, {
+        previousAttempts: task.attemptCount,
+        previousError: task.error,
+      });
+      return retried;
     });
   }
 
@@ -610,7 +917,7 @@ export class MimiStore {
     buildEvent: (items: DigestItem[]) => EventEnvelope,
     limit = 100,
     selectItems: (items: DigestItem[]) => DigestItem[] = (items) => items,
-  ): StoredEvent | undefined {
+  ): ImmutableEvent | undefined {
     return this.transaction(() => {
       const existing = this.database.prepare('SELECT value FROM attention_state WHERE key = ?')
         .get(checkpointKey) as Row | undefined;
@@ -619,7 +926,10 @@ export class MimiStore {
       this.database.prepare(`
         UPDATE digest_items SET briefing_event_id = NULL
         WHERE digested_at IS NULL AND briefing_event_id IN (
-          SELECT id FROM events WHERE status IN ('dead_letter', 'archived')
+          SELECT trigger_event_id FROM tasks
+          WHERE type = 'briefing'
+            AND status IN ('failed', 'cancelled', 'dead_letter')
+            AND trigger_event_id IS NOT NULL
         )
       `).run();
       const rows = this.database.prepare(`
@@ -637,7 +947,13 @@ export class MimiStore {
       if (!items.length || items.some((item) => !candidateIds.has(item.id))) {
         throw new Error('briefing selector 必须返回至少一个候选 digest item');
       }
-      const result = this.enqueueEvent(buildEvent(items));
+      const event = buildEvent(items);
+      const result = this.ingestEvent(event, {
+        type: 'briefing',
+        sessionKey: event.sessionKey,
+        executor: 'session_actor',
+        workspaceAccess: 'write',
+      });
       this.database.prepare(`
         UPDATE digest_items SET briefing_event_id = ?
         WHERE id IN (${items.map(() => '?').join(', ')})
@@ -651,7 +967,8 @@ export class MimiStore {
     const row = source
       ? this.database.prepare(`
           SELECT COUNT(*) AS count FROM runs
-          JOIN events ON events.id = runs.event_id
+          JOIN tasks ON tasks.id = runs.task_id
+          JOIN events ON events.id = tasks.authority_event_id
           WHERE runs.started_at >= ? AND events.source = ?
         `).get(since.toISOString(), source)
       : this.database.prepare('SELECT COUNT(*) AS count FROM runs WHERE started_at >= ?')
@@ -659,395 +976,21 @@ export class MimiStore {
     return Number((row as Row).count);
   }
 
-  claimEvent(
-    owner: string,
-    leaseMs = 60_000,
-    at = new Date(),
-    executionLane?: EventExecutionLane,
-    maxAttempts?: number,
-    excludedSessionKeys: readonly string[] = [],
-  ): StoredEvent | undefined {
-    return this.transaction(() => {
-      const timestamp = at.toISOString();
-      this.recoverExpiredEventLeases(timestamp, executionLane);
-      this.settleQueuedTaskControls(timestamp);
-      const exclusions = [...new Set(excludedSessionKeys)].slice(0, 16);
-      const exclusionSql = exclusions.length
-        ? ` AND (session_key IS NULL OR session_key NOT IN (${exclusions.map(() => '?').join(', ')}))`
-        : '';
-      for (let scanned = 0; scanned < 100; scanned += 1) {
-        const row = executionLane ? this.database.prepare(`
-          SELECT * FROM events
-          WHERE status = 'queued' AND not_before <= ? AND execution_lane = ?${exclusionSql}
-          ORDER BY priority DESC, received_at ASC LIMIT 1
-        `).get(timestamp, executionLane, ...exclusions) as Row | undefined : this.database.prepare(`
-          SELECT * FROM events
-          WHERE status = 'queued' AND not_before <= ?${exclusionSql}
-          ORDER BY priority DESC, received_at ASC LIMIT 1
-        `).get(timestamp, ...exclusions) as Row | undefined;
-        if (!row) return undefined;
-        try {
-          eventFromRow(row);
-        } catch (error) {
-          this.quarantineMalformedEvent(String(row.id), error, timestamp);
-          continue;
-        }
-        const leaseUntil = new Date(at.getTime() + leaseMs).toISOString();
-        const claimed = this.database.prepare(`
-          UPDATE events SET status = 'running', attempts = attempts + 1,
-            max_attempts = COALESCE(max_attempts, ?),
-            lease_owner = ?, lease_until = ?, updated_at = ?
-          WHERE id = ? AND status = 'queued'
-        `).run(maxAttempts ?? null, owner, leaseUntil, timestamp, String(row.id));
-        if (Number(claimed.changes) !== 1) continue;
-        this.clearEventPreemptionReservation(String(row.id));
-        return this.getEvent(String(row.id));
-      }
-      return undefined;
-    });
-  }
-
-  claimEventById(
-    id: string,
-    owner: string,
-    leaseMs = 60_000,
-    at = new Date(),
-    maxAttempts?: number,
-  ): StoredEvent | undefined {
-    return this.transaction(() => {
-      const timestamp = at.toISOString();
-      this.recoverExpiredEventLeases(timestamp, undefined, id);
-      this.settleQueuedTaskControls(timestamp);
-      const row = this.database.prepare('SELECT * FROM events WHERE id = ?').get(id) as Row | undefined;
-      if (!row) return undefined;
-      try {
-        eventFromRow(row);
-      } catch (error) {
-        this.quarantineMalformedEvent(id, error, timestamp);
-        return undefined;
-      }
-      const leaseUntil = new Date(at.getTime() + leaseMs).toISOString();
-      const claimed = this.database.prepare(`
-        UPDATE events SET status = 'running', attempts = attempts + 1,
-          max_attempts = COALESCE(max_attempts, ?),
-          lease_owner = ?, lease_until = ?, updated_at = ?
-        WHERE id = ? AND status = 'queued' AND not_before <= ?
-      `).run(maxAttempts ?? null, owner, leaseUntil, timestamp, id, timestamp);
-      if (Number(claimed.changes) !== 1) return undefined;
-      this.clearEventPreemptionReservation(id);
-      return this.getEvent(id);
-    });
-  }
-
-  bindRunningEventSession(id: string, owner: string, sessionKey: string): StoredEvent {
-    const resolvedSessionKey = assertSessionId(sessionKey);
-    return this.transaction(() => {
-      const event = this.getEvent(id);
-      if (!event || event.status !== 'running' || event.leaseOwner !== owner) {
-        throw new Error(`事件 ${id} 租约已失效`);
-      }
-      if (event.sessionKey && event.sessionKey !== resolvedSessionKey) {
-        throw new Error(`事件 ${id} 已绑定 Session ${event.sessionKey}，拒绝切换到 ${resolvedSessionKey}`);
-      }
-      if (!event.sessionKey) {
-        const updated = this.database.prepare(`
-          UPDATE events SET session_key = ?, updated_at = ?
-          WHERE id = ? AND status = 'running' AND lease_owner = ? AND session_key IS NULL
-        `).run(resolvedSessionKey, nowIso(), id, owner);
-        if (Number(updated.changes) !== 1) throw new Error(`事件 ${id} Session 绑定状态已变化`);
-      }
-      return this.getEvent(id)!;
-    });
-  }
-
-  readyBackgroundTasks(limit = 10, at = new Date(), maxAttempts?: number): StoredEvent[] {
-    return this.transaction(() => {
-      const timestamp = at.toISOString();
-      this.recoverExpiredEventLeases(timestamp, 'task');
-      this.settleQueuedTaskControls(timestamp);
-      const rows = this.database.prepare(`
-        SELECT * FROM events
-        WHERE execution_lane = 'task' AND status = 'queued' AND not_before <= ?
-        ORDER BY priority DESC, received_at ASC LIMIT ?
-      `).all(timestamp, Math.max(1, Math.min(50, limit))) as Row[];
-      const ready: StoredEvent[] = [];
-      for (const row of rows) {
-        try {
-          ready.push(eventFromRow(row));
-        } catch (error) {
-          this.quarantineMalformedEvent(String(row.id), error, timestamp);
-        }
-      }
-      return ready;
-    });
-  }
-
-  readyEventsAbove(minPriority: number, abovePriority: number, limit = 10, at = new Date()): StoredEvent[] {
-    return this.transaction(() => {
-      const timestamp = at.toISOString();
-      const rows = this.database.prepare(`
-        SELECT * FROM events
-        WHERE status = 'queued' AND not_before <= ? AND priority >= ? AND priority > ?
-        ORDER BY priority DESC, received_at ASC LIMIT ?
-      `).all(timestamp, minPriority, abovePriority, Math.max(1, Math.min(50, limit))) as Row[];
-      return this.decodeReadyEvents(rows, timestamp);
-    });
-  }
-
-  readyPreemptionCandidates(
-    urgentPriority: number,
-    activePriority: number,
-    limit = 10,
-    at = new Date(),
-    executionLane?: EventExecutionLane,
-  ): StoredEvent[] {
-    return this.transaction(() => {
-      const timestamp = at.toISOString();
-      const rows = executionLane ? this.database.prepare(`
-      SELECT * FROM events
-      WHERE status = 'queued' AND not_before <= ? AND execution_lane = ? AND (
-        (priority >= ? AND priority > ?)
-        OR (trust = 'owner' AND kind = 'command' AND priority >= ?)
-      )
-      ORDER BY priority DESC, received_at ASC LIMIT ?
-    `).all(
-      at.toISOString(),
-      executionLane,
-      urgentPriority,
-      activePriority,
-      activePriority,
-      Math.max(1, Math.min(50, limit)),
-    ) as Row[] : this.database.prepare(`
-      SELECT * FROM events
-      WHERE status = 'queued' AND not_before <= ? AND (
-        (priority >= ? AND priority > ?)
-        OR (trust = 'owner' AND kind = 'command' AND priority >= ?)
-      )
-      ORDER BY priority DESC, received_at ASC LIMIT ?
-    `).all(
-      at.toISOString(),
-      urgentPriority,
-      activePriority,
-      activePriority,
-      Math.max(1, Math.min(50, limit)),
-    ) as Row[];
-      return this.decodeReadyEvents(rows, timestamp);
-    });
-  }
-
-  private decodeReadyEvents(rows: Row[], timestamp: string): StoredEvent[] {
-    const events: StoredEvent[] = [];
-    for (const row of rows) {
-      try {
-        events.push(eventFromRow(row));
-      } catch (error) {
-        this.quarantineMalformedEvent(String(row.id), error, timestamp);
-      }
-    }
-    return events;
-  }
-
-  reserveEventPreemption(
-    candidateId: string,
-    victimId: string,
-    at = new Date(),
-    reservationMs = DEFAULT_PREEMPTION_RESERVATION_MS,
-  ): boolean {
-    return this.transaction(() => {
-      const timestamp = at.toISOString();
-      const candidate = this.database.prepare(`
-        SELECT id FROM events
-        WHERE id = ? AND status = 'queued' AND not_before <= ?
-      `).get(candidateId, timestamp) as Row | undefined;
-      if (!candidate) return false;
-      const resource = eventPreemptionResource(candidateId);
-      this.database.prepare(`
-        DELETE FROM leases WHERE resource = ? AND lease_until <= ?
-      `).run(resource, timestamp);
-      this.database.prepare(`
-        INSERT OR IGNORE INTO leases (resource, owner, fencing_token, lease_until, updated_at)
-        VALUES (?, ?, 1, ?, ?)
-      `).run(
-        resource,
-        victimId,
-        new Date(at.getTime() + Math.max(1_000, reservationMs)).toISOString(),
-        timestamp,
-      );
-      const reservation = this.database.prepare(`
-        SELECT owner FROM leases WHERE resource = ?
-      `).get(resource) as Row | undefined;
-      return reservation?.owner === victimId;
-    });
-  }
-
-  renewEventLease(id: string, owner: string, leaseMs: number, at = new Date()): boolean {
-    const result = this.database.prepare(`
-      UPDATE events SET lease_until = ?, updated_at = ?
-      WHERE id = ? AND status = 'running' AND lease_owner = ?
-    `).run(new Date(at.getTime() + leaseMs).toISOString(), at.toISOString(), id, owner);
-    return Number(result.changes) === 1;
-  }
-
-  completeEvent(
-    id: string,
-    owner: string,
-    result: unknown,
-    status: Extract<EventStatus, 'completed' | 'ignored'> = 'completed',
-    delivery?: { route: ReplyRoute; payload: unknown },
-    runId?: string,
-  ): void {
-    this.transaction(() => {
-      const timestamp = nowIso();
-      const updated = this.database.prepare(`
-        UPDATE events SET status = ?, result_json = ?, error = NULL,
-          lease_owner = NULL, lease_until = NULL, task_control = NULL,
-          task_control_reason = NULL, updated_at = ?
-        WHERE id = ? AND status = 'running' AND lease_owner = ?
-          AND (execution_lane <> 'task' OR task_control IS NULL)
-      `).run(status, json(result), timestamp, id, owner);
-      if (Number(updated.changes) !== 1) throw new Error(`事件 ${id} 租约已失效`);
-      if (runId) this.finishRun(runId, 'completed', result, undefined, timestamp);
-      this.database.prepare(`
-        UPDATE digest_items SET digested_at = ?
-        WHERE briefing_event_id = ? AND digested_at IS NULL
-      `).run(timestamp, id);
-      if (delivery) this.insertOutbox(id, delivery.route, delivery.payload, timestamp);
-      this.insertAudit('event.completed', id, { status, delivery: Boolean(delivery) }, timestamp);
-    });
-  }
-
-  failEvent(id: string, owner: string, error: unknown, maxAttempts = 5, at = new Date(), runId?: string): StoredEvent {
-    return this.transaction(() => {
-      const event = this.getEvent(id);
-      if (!event || event.status !== 'running' || event.leaseOwner !== owner) {
-        throw new Error(`事件 ${id} 租约已失效`);
-      }
-      if (event.executionLane === 'task' && event.taskControl) {
-        const cancelled = event.taskControl === 'cancel';
-        const reason = event.taskControlReason
-          ?? (cancelled ? 'owner 取消了后台任务' : 'owner 暂停了后台任务');
-        const status = cancelled ? 'archived' : 'paused';
-        const updated = this.database.prepare(`
-          UPDATE events SET status = ?, attempts = CASE WHEN ? = 'paused' THEN MAX(0, attempts - 1) ELSE attempts END,
-            error = ?, lease_owner = NULL, lease_until = NULL, task_control = NULL,
-            task_control_reason = NULL, updated_at = ?
-          WHERE id = ? AND status = 'running' AND execution_lane = 'task'
-            AND lease_owner = ? AND task_control = ?
-        `).run(status, status, reason, at.toISOString(), id, owner, event.taskControl);
-        if (Number(updated.changes) !== 1) throw new Error(`后台任务 ${id} 控制状态已变化`);
-        if (runId) this.finishRun(runId, 'interrupted', undefined, reason, at.toISOString());
-        this.insertAudit(cancelled ? 'event.cancelled' : 'event.paused', id, {
-          phase: 'worker_exit',
-          reason: reason.slice(0, 1_000),
-        }, at.toISOString());
-        return this.getEvent(id)!;
-      }
-      // The leased worker may deliberately classify the current failure as
-      // terminal by passing the current attempt. It may never broaden the
-      // durable limit fixed by the first claim.
-      const attemptLimit = Math.min(event.maxAttempts ?? maxAttempts, maxAttempts);
-      const terminal = event.attempts >= attemptLimit;
-      const delay = Math.min(60 * 60_000, 1_000 * 2 ** Math.max(0, event.attempts - 1));
-      const next = terminal ? at : new Date(at.getTime() + delay);
-      this.database.prepare(`
-        UPDATE events SET status = ?, error = ?, not_before = ?, max_attempts = COALESCE(max_attempts, ?),
-          lease_owner = NULL, lease_until = NULL, updated_at = ? WHERE id = ?
-      `).run(
-        terminal ? 'dead_letter' : 'queued',
-        (error instanceof Error ? error.message : String(error)).slice(0, 4_000),
-        next.toISOString(),
-        attemptLimit,
-        at.toISOString(),
-        id,
-      );
-      if (runId) this.finishRun(runId, 'failed', undefined, error, at.toISOString());
-      if (terminal) {
-        const delivery = eventFailureDelivery(event, error);
-        this.insertOutbox(event.id, delivery.route, delivery.payload, at.toISOString());
-      }
-      this.insertAudit(terminal ? 'event.dead_letter' : 'event.retry', id, { attempts: event.attempts }, at.toISOString());
-      return this.getEvent(id)!;
-    });
-  }
-
-  preemptEvent(
-    id: string,
-    owner: string,
-    reason: string,
-    at = new Date(),
-    runId?: string,
-    resumeAt = at,
-  ): StoredEvent {
-    return this.transaction(() => {
-      const timestamp = at.toISOString();
-      const updated = this.database.prepare(`
-        UPDATE events SET status = 'queued', attempts = MAX(0, attempts - 1), error = ?,
-          not_before = ?, lease_owner = NULL, lease_until = NULL, updated_at = ?
-        WHERE id = ? AND status = 'running' AND lease_owner = ? AND task_control IS NULL
-      `).run(reason.slice(0, 4_000), resumeAt.toISOString(), timestamp, id, owner);
-      if (Number(updated.changes) !== 1) throw new Error(`事件 ${id} 租约已失效`);
-      if (runId) this.finishRun(runId, 'interrupted', undefined, reason, timestamp);
-      this.insertAudit('event.preempted', id, { reason: reason.slice(0, 1_000) }, timestamp);
-      return this.getEvent(id)!;
-    });
-  }
-
-  deferEventForCompletion(
-    id: string,
-    owner: string,
-    reason: string,
-    at = new Date(),
-    runId?: string,
-    progressFingerprint = '',
-    _terminal = false,
-  ): StoredEvent {
-    return this.transaction(() => {
-      const event = this.getEvent(id);
-      if (!event || event.status !== 'running' || event.leaseOwner !== owner || event.taskControl) {
-        throw new Error(`事件 ${id} 租约已失效`);
-      }
-      const deferrals = (event.completionDeferrals ?? 0) + 1;
-      const noProgressDeferrals = 1;
-      const timestamp = at.toISOString();
-      const terminalReason = `Goal 未通过 Completion Gate；当前 Event 已结束且不会自动重放，Goal 与检查点可由 /resume 继续：${reason}`;
-      const updated = this.database.prepare(`
-        UPDATE events SET status = 'dead_letter', error = ?, completion_deferrals = ?,
-          completion_no_progress_deferrals = ?, completion_progress_fingerprint = ?,
-          not_before = ?, lease_owner = NULL, lease_until = NULL, updated_at = ?
-        WHERE id = ? AND status = 'running' AND lease_owner = ? AND task_control IS NULL
-      `).run(
-        terminalReason.slice(0, 4_000),
-        deferrals,
-        noProgressDeferrals,
-        progressFingerprint || null,
-        timestamp,
-        timestamp,
-        id,
-        owner,
-      );
-      if (Number(updated.changes) !== 1) throw new Error(`事件 ${id} 租约已失效`);
-      if (runId) this.finishRun(runId, 'failed', undefined, terminalReason, timestamp);
-      const delivery = eventFailureDelivery(event, terminalReason);
-      this.insertOutbox(event.id, delivery.route, delivery.payload, timestamp);
-      this.insertAudit('event.dead_letter', id, { completionDeferrals: deferrals }, timestamp);
-      return this.getEvent(id)!;
-    });
-  }
-
   handoffCodexTaskToMimi(
     id: string,
     owner: string,
     result: { threadId?: string; answer?: string; usage?: unknown; error?: string },
     at = new Date(),
-  ): StoredEvent {
+  ): TaskRecord {
     return this.transaction(() => {
-      const event = this.getEvent(id);
-      if (!event || event.executionLane !== 'task' || event.status !== 'running'
-        || event.leaseOwner !== owner || event.taskControl) {
+      const timestamp = at.toISOString();
+      const task = this.taskStore.get(id);
+      if (!task || task.status !== 'running' || task.leaseOwner !== owner || task.controlIntent
+        || !task.leaseUntil || task.leaseUntil <= timestamp) {
         throw new Error(`Codex Task ${id} 租约已失效`);
       }
-      const current = event.payload && typeof event.payload === 'object' && !Array.isArray(event.payload)
-        ? event.payload as Record<string, unknown>
+      const current = task.objective && typeof task.objective === 'object' && !Array.isArray(task.objective)
+        ? task.objective as Record<string, unknown>
         : {};
       const previousCodex = current.codex && typeof current.codex === 'object' && !Array.isArray(current.codex)
         ? current.codex as Record<string, unknown>
@@ -1062,7 +1005,7 @@ export class MimiStore {
         result.error ? `Codex 错误/不可用：${result.error.slice(0, 4_000)}` : '',
         '请检查真实工作区、运行验收测试并调用 finish_task。Codex 的自我声明不算完成证据；若它未完成则由 Mimi 继续完成。',
       ].filter(Boolean).join('\n\n');
-      const payload = {
+      const objective = {
         ...current,
         executor: 'mimi',
         prompt: `${originalPrompt}\n\n${codexSummary}`.slice(0, 24_000),
@@ -1075,251 +1018,65 @@ export class MimiStore {
           handedOffAt: at.toISOString(),
         },
       };
-      const timestamp = at.toISOString();
       const updated = this.database.prepare(`
-        UPDATE events SET status = 'queued', attempts = MAX(0, attempts - 1),
-          payload_json = ?, error = ?, not_before = ?, lease_owner = NULL,
+        UPDATE tasks SET status = 'queued', executor = 'isolated_worker',
+          objective_json = ?, error = ?, not_before = ?, lease_owner = NULL,
           lease_until = NULL, updated_at = ?
-        WHERE id = ? AND status = 'running' AND execution_lane = 'task'
-          AND lease_owner = ? AND task_control IS NULL
+        WHERE id = ? AND status = 'running' AND lease_owner = ?
+          AND lease_until > ? AND control_intent IS NULL
       `).run(
-        json(payload),
+        json(objective),
         result.error ? `Codex 已回退给 MimiAgent：${result.error}`.slice(0, 4_000) : 'Codex 已完成执行，等待 MimiAgent 验收',
         timestamp,
         timestamp,
         id,
         owner,
+        timestamp,
       );
       if (Number(updated.changes) !== 1) throw new Error(`Codex Task ${id} 租约已失效`);
-      this.insertAudit('event.executor_handoff', id, {
+      if (!this.taskStore.finishAttempt(
+        undefined,
+        id,
+        task.attemptCount,
+        'completed',
+        result,
+        result.error,
+        timestamp,
+      )) throw new Error(`Task ${id} 当前 Attempt 已终止或不存在`);
+      this.insertAudit('task.executor_handoff', id, {
         from: 'codex', to: 'mimi', threadId, fallback: Boolean(result.error),
       }, timestamp);
-      return this.getEvent(id)!;
+      const handedOff = this.taskStore.get(id)!;
+      this.appendTaskLifecycleEvent(handedOff, 'task.executor_handoff', timestamp, {
+        from: 'codex', to: 'isolated_worker', threadId, fallback: Boolean(result.error),
+      });
+      return handedOff;
     });
   }
 
-  checkpointCodexTask(id: string, owner: string, threadId: string, at = new Date()): StoredEvent {
+  checkpointCodexTask(id: string, owner: string, threadId: string, at = new Date()): TaskRecord {
     return this.transaction(() => {
-      const event = this.getEvent(id);
-      if (!event || event.executionLane !== 'task' || event.status !== 'running' || event.leaseOwner !== owner) {
+      const timestamp = at.toISOString();
+      const task = this.taskStore.get(id);
+      if (!task || task.status !== 'running' || task.leaseOwner !== owner || task.controlIntent
+        || !task.leaseUntil || task.leaseUntil <= timestamp) {
         throw new Error(`Codex Task ${id} 租约已失效`);
       }
-      const current = event.payload && typeof event.payload === 'object' && !Array.isArray(event.payload)
-        ? event.payload as Record<string, unknown>
+      const current = task.objective && typeof task.objective === 'object' && !Array.isArray(task.objective)
+        ? task.objective as Record<string, unknown>
         : {};
       const previousCodex = current.codex && typeof current.codex === 'object' && !Array.isArray(current.codex)
         ? current.codex as Record<string, unknown>
         : {};
-      const payload = { ...current, codex: { ...previousCodex, threadId, checkpointedAt: at.toISOString() } };
+      const objective = { ...current, codex: { ...previousCodex, threadId, checkpointedAt: at.toISOString() } };
       const updated = this.database.prepare(`
-        UPDATE events SET payload_json = ?, updated_at = ?
-        WHERE id = ? AND status = 'running' AND execution_lane = 'task' AND lease_owner = ?
-      `).run(json(payload), at.toISOString(), id, owner);
+        UPDATE tasks SET objective_json = ?, updated_at = ?
+        WHERE id = ? AND status = 'running' AND lease_owner = ?
+          AND lease_until > ? AND control_intent IS NULL
+      `).run(json(objective), timestamp, id, owner, timestamp);
       if (Number(updated.changes) !== 1) throw new Error(`Codex Task ${id} 租约已失效`);
-      this.insertAudit('event.executor_checkpoint', id, { executor: 'codex', threadId }, at.toISOString());
-      return this.getEvent(id)!;
-    });
-  }
-
-  pauseQueuedEvent(id: string, reason: string, at = new Date()): StoredEvent {
-    return this.transaction(() => {
-      const timestamp = at.toISOString();
-      const summary = reason.replace(/\s+/g, ' ').trim().slice(0, 4_000) || 'owner 暂停了后台任务';
-      const updated = this.database.prepare(`
-        UPDATE events SET status = 'paused', error = ?,
-          lease_owner = NULL, lease_until = NULL, task_control = NULL,
-          task_control_reason = NULL, updated_at = ?
-        WHERE id = ? AND status = 'queued' AND execution_lane = 'task'
-      `).run(summary, timestamp, id);
-      if (Number(updated.changes) !== 1) throw new Error(`后台任务 ${id} 不是可暂停的 queued 状态`);
-      this.insertAudit('event.paused', id, { phase: 'queued', reason: summary.slice(0, 1_000) }, timestamp);
-      return this.getEvent(id)!;
-    });
-  }
-
-  pauseRunningEvent(
-    id: string,
-    owner: string,
-    reason: string,
-    runId?: string,
-    at = new Date(),
-  ): StoredEvent {
-    return this.transaction(() => {
-      const timestamp = at.toISOString();
-      const summary = reason.replace(/\s+/g, ' ').trim().slice(0, 4_000) || 'owner 暂停了后台任务';
-      const updated = this.database.prepare(`
-        UPDATE events SET status = 'paused', attempts = MAX(0, attempts - 1), error = ?,
-          lease_owner = NULL, lease_until = NULL, task_control = NULL,
-          task_control_reason = NULL, updated_at = ?
-        WHERE id = ? AND status = 'running' AND execution_lane = 'task' AND lease_owner = ?
-          AND (task_control IS NULL OR task_control = 'pause')
-      `).run(summary, timestamp, id, owner);
-      if (Number(updated.changes) !== 1) throw new Error(`后台任务 ${id} 租约已失效`);
-      if (runId) this.finishRun(runId, 'interrupted', undefined, summary, timestamp);
-      this.insertAudit('event.paused', id, { phase: 'running', reason: summary.slice(0, 1_000) }, timestamp);
-      return this.getEvent(id)!;
-    });
-  }
-
-  blockRunningEvent(
-    id: string,
-    owner: string,
-    result: unknown,
-    reason: string,
-    delivery: { route: ReplyRoute; payload: unknown },
-    runId?: string,
-    at = new Date(),
-  ): StoredEvent {
-    return this.transaction(() => {
-      const timestamp = at.toISOString();
-      const summary = reason.replace(/\s+/g, ' ').trim().slice(0, 4_000) || '后台任务需要用户输入';
-      const updated = this.database.prepare(`
-        UPDATE events SET status = 'blocked', attempts = MAX(0, attempts - 1),
-          result_json = ?, error = ?, lease_owner = NULL, lease_until = NULL,
-          task_control = NULL, task_control_reason = NULL, updated_at = ?
-        WHERE id = ? AND status = 'running' AND execution_lane = 'task'
-          AND lease_owner = ? AND task_control IS NULL
-      `).run(json(result), summary, timestamp, id, owner);
-      if (Number(updated.changes) !== 1) throw new Error(`后台任务 ${id} 租约已失效`);
-      if (runId) this.finishRun(runId, 'interrupted', result, summary, timestamp);
-      this.insertOutbox(id, delivery.route, delivery.payload, timestamp);
-      this.insertAudit('event.blocked', id, { reason: summary.slice(0, 1_000), delivery: true }, timestamp);
-      return this.getEvent(id)!;
-    });
-  }
-
-  resumeBackgroundTask(id: string, additionalContext?: string, at = new Date()): StoredEvent {
-    return this.transaction(() => {
-      const event = this.getEvent(id);
-      if (!event || event.executionLane !== 'task' || (event.status !== 'paused' && event.status !== 'blocked')) {
-        throw new Error(`后台任务 ${id} 不是可恢复的 paused/blocked 状态`);
-      }
-      const timestamp = at.toISOString();
-      const payload = resumedTaskPayload(event.payload, additionalContext);
-      const updated = this.database.prepare(`
-        UPDATE events SET status = 'queued', payload_json = ?, result_json = NULL, error = NULL,
-          not_before = ?, lease_owner = NULL, lease_until = NULL,
-          task_control = NULL, task_control_reason = NULL, updated_at = ?
-        WHERE id = ? AND execution_lane = 'task' AND status IN ('paused', 'blocked')
-      `).run(json(payload), timestamp, timestamp, id);
-      if (Number(updated.changes) !== 1) throw new Error(`后台任务 ${id} 状态已变化`);
-      this.insertAudit('event.resumed', id, {
-        previousStatus: event.status,
-        additionalContext: Boolean(additionalContext?.trim()),
-      }, timestamp);
-      return this.getEvent(id)!;
-    });
-  }
-
-  supersedeEvent(
-    id: string,
-    owner: string,
-    supersededBy: string,
-    reason: string,
-    at = new Date(),
-    runId?: string,
-  ): StoredEvent {
-    return this.transaction(() => {
-      const timestamp = at.toISOString();
-      const summary = reason.replace(/\s+/g, ' ').trim().slice(0, 4_000)
-        || `被新的 owner 命令 ${supersededBy} 取代`;
-      const updated = this.database.prepare(`
-        UPDATE events SET status = 'archived', error = ?,
-          lease_owner = NULL, lease_until = NULL, updated_at = ?
-        WHERE id = ? AND status = 'running' AND lease_owner = ?
-      `).run(summary, timestamp, id, owner);
-      if (Number(updated.changes) !== 1) throw new Error(`事件 ${id} 租约已失效`);
-      if (runId) this.finishRun(runId, 'interrupted', undefined, summary, timestamp);
-      this.insertAudit('event.superseded', id, {
-        supersededBy,
-        reason: summary.slice(0, 1_000),
-      }, timestamp);
-      return this.getEvent(id)!;
-    });
-  }
-
-  cancelQueuedEvent(id: string, reason: string, at = new Date()): boolean {
-    return this.transaction(() => {
-      const event = this.getEvent(id);
-      if (!event || !['queued', 'paused', 'blocked'].includes(event.status)) return false;
-      const timestamp = at.toISOString();
-      const summary = reason.replace(/\s+/g, ' ').trim().slice(0, 4_000) || 'owner 取消了未执行的任务';
-      const updated = this.database.prepare(`
-        UPDATE events SET status = 'archived', error = ?,
-          lease_owner = NULL, lease_until = NULL, task_control = NULL,
-          task_control_reason = NULL, updated_at = ?
-        WHERE id = ? AND status IN ('queued', 'paused', 'blocked')
-      `).run(summary, timestamp, id);
-      if (Number(updated.changes) !== 1) return false;
-      this.insertAudit('event.cancelled', id, { phase: event.status, reason: summary.slice(0, 1_000) }, timestamp);
-      return true;
-    });
-  }
-
-  cancelRunningEvent(
-    id: string,
-    owner: string,
-    reason: string,
-    at = new Date(),
-    runId?: string,
-  ): StoredEvent {
-    return this.transaction(() => {
-      const timestamp = at.toISOString();
-      const summary = reason.replace(/\s+/g, ' ').trim().slice(0, 4_000) || 'owner 取消了正在执行的任务';
-      const updated = this.database.prepare(`
-        UPDATE events SET status = 'archived', error = ?,
-          lease_owner = NULL, lease_until = NULL, task_control = NULL,
-          task_control_reason = NULL, updated_at = ?
-        WHERE id = ? AND status = 'running' AND lease_owner = ?
-      `).run(summary, timestamp, id, owner);
-      if (Number(updated.changes) !== 1) throw new Error(`事件 ${id} 租约已失效`);
-      if (runId) this.finishRun(runId, 'interrupted', undefined, summary, timestamp);
-      this.insertAudit('event.cancelled', id, { phase: 'running', reason: summary.slice(0, 1_000) }, timestamp);
-      return this.getEvent(id)!;
-    });
-  }
-
-  cancelInterruptedSessionEvent(sessionKey: string, eventId: string, reason: string, at = new Date()): boolean {
-    return this.transaction(() => {
-      const timestamp = at.toISOString();
-      const summary = reason.replace(/\s+/g, ' ').trim().slice(0, 1_000) || 'owner 取消了已中断任务';
-      const updated = this.database.prepare(`
-        UPDATE events SET status = 'archived', error = ?, lease_owner = NULL, lease_until = NULL, updated_at = ?
-        WHERE id = ? AND status = 'queued' AND EXISTS (
-          SELECT 1 FROM runs
-          WHERE runs.event_id = events.id AND runs.session_key = ? AND runs.status = 'interrupted'
-        )
-      `).run(summary, timestamp, eventId, sessionKey);
-      if (Number(updated.changes) !== 1) return false;
-      this.insertAudit('event.cancelled', eventId, { sessionKey, reason: summary }, timestamp);
-      return true;
-    });
-  }
-
-  waitForEvent(id: string, timeoutMs = 120_000, signal?: AbortSignal): Promise<StoredEvent> {
-    const started = Date.now();
-    return new Promise((resolve, reject) => {
-      let timer: NodeJS.Timeout | undefined;
-      const done = (callback: () => void) => {
-        if (timer) clearTimeout(timer);
-        signal?.removeEventListener('abort', onAbort);
-        callback();
-      };
-      const onAbort = () => done(() => reject(signal?.reason ?? new Error('等待事件已取消')));
-      const poll = () => {
-        try {
-          const event = this.getEvent(id);
-          if (!event) return done(() => reject(new Error(`事件不存在：${id}`)));
-          if (TERMINAL_EVENT_STATUSES.has(event.status)) return done(() => resolve(event));
-          if (Date.now() - started >= timeoutMs) return done(() => reject(new Error(`等待事件超时：${id}`)));
-          timer = setTimeout(poll, 100);
-        } catch (error) {
-          done(() => reject(error));
-        }
-      };
-      signal?.addEventListener('abort', onAbort, { once: true });
-      if (signal?.aborted) onAbort();
-      else poll();
+      this.insertAudit('task.executor_checkpoint', id, { executor: 'codex', threadId }, timestamp);
+      return this.taskStore.get(id)!;
     });
   }
 
@@ -1353,7 +1110,7 @@ export class MimiStore {
         const fallback = message.channel !== 'system';
         const ownerRouteInvalidated = fallback ? this.clearOwnerReplyRouteForDelivery(message) : false;
         if (fallback) {
-          this.insertOutbox(message.eventId, { channel: 'system' }, deliveryFailurePayload(message, error), timestamp);
+          this.insertOutbox(message.taskId, { channel: 'system' }, deliveryFailurePayload(message, error), timestamp);
         }
         this.insertAudit('outbox.dead_letter', message.id, {
           attempts: message.attempts,
@@ -1427,7 +1184,7 @@ export class MimiStore {
         ? this.clearOwnerReplyRouteForDelivery(message)
         : false;
       if (terminal && message.channel !== 'system') {
-        this.insertOutbox(message.eventId, { channel: 'system' }, deliveryFailurePayload(message, error), timestamp);
+        this.insertOutbox(message.taskId, { channel: 'system' }, deliveryFailurePayload(message, error), timestamp);
       }
       this.insertAudit(terminal ? 'outbox.dead_letter' : 'outbox.retry', id, {
         attempts: message.attempts,
@@ -1444,11 +1201,11 @@ export class MimiStore {
 
   listOutboxSummaries(requestedLimit = 50): MimiOutboxSummary[] {
     return (this.database.prepare(`
-      SELECT id, event_id, channel, target, status, attempts, not_before, updated_at, error
+      SELECT id, task_id, channel, target, status, attempts, not_before, updated_at, error
       FROM outbox ORDER BY created_at DESC, rowid DESC LIMIT ?
     `).all(managementLimit(requestedLimit)) as Row[]).map((row) => ({
       id: String(row.id),
-      eventId: String(row.event_id),
+      taskId: String(row.task_id),
       channel: String(row.channel).slice(0, 200),
       target: optional(row.target)?.slice(0, 500),
       status: String(row.status) as OutboxStatus,
@@ -1491,16 +1248,6 @@ export class MimiStore {
     });
   }
 
-  beginRun(eventId: string, sessionKey: string): HostRunRecord {
-    const id = randomUUID();
-    const timestamp = nowIso();
-    this.database.prepare(`
-      INSERT INTO runs (id, event_id, session_key, status, started_at)
-      VALUES (?, ?, ?, 'running', ?)
-    `).run(id, eventId, sessionKey, timestamp);
-    return this.getRun(id)!;
-  }
-
   listRuns(limit = 50): HostRunRecord[] {
     return (this.database.prepare('SELECT * FROM runs ORDER BY started_at DESC LIMIT ?').all(limit) as Row[])
       .map(runFromRow);
@@ -1508,12 +1255,13 @@ export class MimiStore {
 
   listRunSummaries(requestedLimit = 50): MimiRunSummary[] {
     return (this.database.prepare(`
-      SELECT id, event_id, session_key, status, started_at, completed_at,
+      SELECT id, task_id, attempt_no, session_key, status, started_at, completed_at,
         answer_json IS NOT NULL AS answer_available, error
       FROM runs ORDER BY started_at DESC, rowid DESC LIMIT ?
     `).all(managementLimit(requestedLimit)) as Row[]).map((row) => ({
       id: String(row.id),
-      eventId: String(row.event_id),
+      taskId: String(row.task_id),
+      attemptNo: Number(row.attempt_no),
       sessionKey: String(row.session_key),
       status: String(row.status) as HostRunRecord['status'],
       startedAt: String(row.started_at),
@@ -1526,13 +1274,15 @@ export class MimiStore {
   sessionActivity(sessionKey: string, limit = 20): MimiSessionActivity[] {
     const boundedLimit = Math.max(1, Math.min(100, Math.trunc(limit)));
     return (this.database.prepare(`
-      SELECT e.id AS event_id, e.source, e.kind, e.status AS event_status, e.occurred_at,
+      SELECT t.id AS task_id, t.trigger_event_id AS event_id, e.source, e.type,
+        t.status AS task_status, e.occurred_at,
         r.status AS run_status, r.started_at, r.completed_at, r.answer_json, r.error
       FROM runs r
-      JOIN events e ON e.id = r.event_id
+      JOIN tasks t ON t.id = r.task_id
+      JOIN events e ON e.id = t.authority_event_id
       WHERE r.session_key = ? AND NOT EXISTS (
         SELECT 1 FROM runs newer
-        WHERE newer.event_id = r.event_id AND (
+        WHERE newer.task_id = r.task_id AND (
           newer.started_at > r.started_at OR (newer.started_at = r.started_at AND newer.id > r.id)
         )
       )
@@ -1544,10 +1294,11 @@ export class MimiStore {
         ? undefined
         : (typeof rawAnswer === 'string' ? rawAnswer : JSON.stringify(rawAnswer)).slice(0, 2_000);
       return {
-        eventId: String(row.event_id),
+        taskId: String(row.task_id),
+        eventId: optional(row.event_id),
         source: String(row.source),
-        kind: String(row.kind) as MimiSessionActivity['kind'],
-        eventStatus: String(row.event_status) as MimiSessionActivity['eventStatus'],
+        type: String(row.type),
+        taskStatus: String(row.task_status) as MimiSessionActivity['taskStatus'],
         runStatus: String(row.run_status) as MimiSessionActivity['runStatus'],
         occurredAt: String(row.occurred_at),
         startedAt: String(row.started_at),
@@ -1555,6 +1306,19 @@ export class MimiStore {
         answer,
         error: optional(row.error)?.slice(0, 1_000),
       };
+    });
+  }
+
+  cancelInterruptedSessionTask(sessionKey: string, taskId: string, reason: string, at = new Date()): boolean {
+    return this.transaction(() => {
+      const task = this.taskStore.get(taskId);
+      if (!task || task.sessionKey !== sessionKey || task.status !== 'queued') return false;
+      const interrupted = this.database.prepare(`
+        SELECT 1 FROM runs WHERE task_id = ? AND session_key = ? AND status = 'interrupted' LIMIT 1
+      `).get(taskId, sessionKey);
+      if (!interrupted) return false;
+      this.cancelTask(taskId, reason, at);
+      return true;
     });
   }
 
@@ -1572,12 +1336,8 @@ export class MimiStore {
         trust: input.trust, createdAt: timestamp,
       })).id;
     } else {
-      const authority = this.getEvent(authorityEventId);
-      if (
-        !isConversationAuthority(authority)
-        || authority.profileId !== input.profileId
-        || authority.trust !== input.trust
-      ) {
+      const authority = this.getImmutableEvent(authorityEventId);
+      if (!authority || authority.profileId !== input.profileId || authority.trust !== input.trust) {
         throw new Error('Schedule authority Event 缺失、不是 Conversation root，或 provenance 不匹配');
       }
     }
@@ -1664,11 +1424,25 @@ export class MimiStore {
       const timestamp = at.toISOString();
       const removed = Number(this.database.prepare('DELETE FROM schedules WHERE id = ?').run(id).changes) === 1;
       if (!removed) return false;
-      const cancelledEvents = Number(this.database.prepare(`
-        UPDATE events SET status = 'archived', error = 'schedule cancelled before execution', updated_at = ?
-        WHERE status = 'queued' AND kind = 'schedule' AND source = ?
+      const pendingTaskIds = (this.database.prepare(`
+        SELECT tasks.id FROM tasks JOIN events ON events.id = tasks.trigger_event_id
+        WHERE tasks.status = 'queued' AND events.source = ?
+      `).all(`schedule:${id}`) as Row[]).map((row) => String(row.id));
+      const cancelledTasks = Number(this.database.prepare(`
+        UPDATE tasks SET status = 'cancelled', error = 'schedule cancelled before execution', updated_at = ?
+        WHERE status = 'queued' AND trigger_event_id IN (
+          SELECT id FROM events WHERE source = ?
+        )
       `).run(timestamp, `schedule:${id}`).changes);
-      this.insertAudit('schedule.removed', id, { cancelledEvents }, timestamp);
+      for (const taskId of pendingTaskIds) {
+        const task = this.taskStore.get(taskId);
+        if (task?.status === 'cancelled') {
+          this.appendTaskLifecycleEvent(task, 'task.cancelled', timestamp, {
+            reason: 'schedule cancelled before execution',
+          });
+        }
+      }
+      this.insertAudit('schedule.removed', id, { cancelledTasks }, timestamp);
       return true;
     });
   }
@@ -1686,13 +1460,13 @@ export class MimiStore {
     });
   }
 
-  emitDueSchedules(at = new Date()): StoredEvent[] {
+  emitDueSchedules(at = new Date()): ImmutableEvent[] {
     return this.transaction(() => {
       const timestamp = at.toISOString();
       const due = this.database.prepare(`
         SELECT * FROM schedules WHERE enabled = 1 AND next_run_at <= ? ORDER BY next_run_at ASC
       `).all(timestamp) as Row[];
-      const events: StoredEvent[] = [];
+      const events: ImmutableEvent[] = [];
       for (const row of due) {
         const schedule = scheduleFromRow(row);
         if (!this.validScheduleAuthority(schedule)) {
@@ -1705,7 +1479,7 @@ export class MimiStore {
           continue;
         }
         const eventId = randomUUID();
-        const event = this.enqueueEvent({
+        const event = this.ingestEvent({
           id: eventId,
           externalId: `${schedule.id}:${schedule.nextRunAt}`,
           source: `schedule:${schedule.id}`,
@@ -1725,13 +1499,13 @@ export class MimiStore {
           receivedAt: timestamp,
           priority: 50,
           profileId: schedule.profileId,
-          sessionKey: `mimi-task-${eventId}`,
-          originSessionKey: schedule.sessionKey,
           replyRoute: schedule.replyRoute ?? { channel: 'system' },
-          executionLane: 'task',
-          parentEventId: schedule.authorityEventId,
-          rootEventId: schedule.authorityEventId,
-          taskDepth: 1,
+        }, {
+          type: 'scheduled',
+          authorityEventId: schedule.authorityEventId,
+          sessionKey: `mimi-task-${eventId}`,
+          executor: 'isolated_worker',
+          workspaceAccess: 'write',
         }).event;
         events.push(event);
         if (schedule.type === 'at') {
@@ -1756,24 +1530,28 @@ export class MimiStore {
   }
 
   counts(): {
-    events: Record<EventStatus, number>;
+    events: { total: number };
+    tasks: Record<TaskStatus, number>;
     outbox: Record<OutboxStatus, number>;
     enabledSchedules: number;
   } {
-    const eventStatuses: EventStatus[] = [
-      'queued', 'running', 'paused', 'blocked', 'completed', 'ignored', 'digested', 'dead_letter', 'archived',
+    const taskStatuses: TaskStatus[] = [
+      'queued', 'running', 'paused', 'blocked', 'completed', 'failed', 'cancelled', 'dead_letter',
     ];
     const outboxStatuses: OutboxStatus[] = ['pending', 'sending', 'sent', 'dead_letter', 'archived'];
-    const events = Object.fromEntries(eventStatuses.map((status) => [status, 0])) as Record<EventStatus, number>;
+    const events = {
+      total: Number((this.database.prepare('SELECT COUNT(*) AS count FROM events').get() as Row).count),
+    };
+    const tasks = Object.fromEntries(taskStatuses.map((status) => [status, 0])) as Record<TaskStatus, number>;
     const outbox = Object.fromEntries(outboxStatuses.map((status) => [status, 0])) as Record<OutboxStatus, number>;
-    for (const row of this.database.prepare('SELECT status, COUNT(*) AS count FROM events GROUP BY status').all() as Row[]) {
-      events[String(row.status) as EventStatus] = Number(row.count);
+    for (const row of this.database.prepare('SELECT status, COUNT(*) AS count FROM tasks GROUP BY status').all() as Row[]) {
+      tasks[String(row.status) as TaskStatus] = Number(row.count);
     }
     for (const row of this.database.prepare('SELECT status, COUNT(*) AS count FROM outbox GROUP BY status').all() as Row[]) {
       outbox[String(row.status) as OutboxStatus] = Number(row.count);
     }
     const enabledSchedules = Number((this.database.prepare('SELECT COUNT(*) AS count FROM schedules WHERE enabled = 1').get() as Row).count);
-    return { events, outbox, enabledSchedules };
+    return { events, tasks, outbox, enabledSchedules };
   }
 
   activitySnapshot(requestedLimit = 10): MimiActivitySnapshot {
@@ -1781,36 +1559,46 @@ export class MimiStore {
     const counts = this.counts();
     const pendingDigest = this.pendingDigestCount();
     const recentEvents = (this.database.prepare(`
-      SELECT id, source, kind, status, priority, attempts, occurred_at, updated_at, error
-      FROM events ORDER BY updated_at DESC, rowid DESC LIMIT ?
+      SELECT id, source, type, subject_type, subject_id, occurred_at, received_at
+      FROM events ORDER BY received_at DESC, rowid DESC LIMIT ?
     `).all(limit) as Row[]).map((row) => ({
       id: String(row.id),
       source: String(row.source),
-      kind: String(row.kind) as StoredEvent['kind'],
-      status: String(row.status) as EventStatus,
-      priority: Number(row.priority),
-      attempts: Number(row.attempts),
+      type: String(row.type),
+      subjectType: optional(row.subject_type) as ImmutableEvent['subjectType'],
+      subjectId: optional(row.subject_id),
       occurredAt: String(row.occurred_at),
+      receivedAt: String(row.received_at),
+    }));
+    const recentTasks = (this.database.prepare(`
+      SELECT id, type, status, priority, attempt_count, updated_at, error
+      FROM tasks ORDER BY updated_at DESC, rowid DESC LIMIT ?
+    `).all(limit) as Row[]).map((row) => ({
+      id: String(row.id),
+      type: String(row.type) as TaskRecord['type'],
+      status: String(row.status) as TaskRecord['status'],
+      priority: Number(row.priority),
+      attemptCount: Number(row.attempt_count),
       updatedAt: String(row.updated_at),
       error: optional(row.error)?.slice(0, 500),
     }));
     const recentRuns = (this.database.prepare(`
-      SELECT id, event_id, status, started_at, completed_at, error
+      SELECT id, task_id, status, started_at, completed_at, error
       FROM runs ORDER BY COALESCE(completed_at, started_at) DESC, rowid DESC LIMIT ?
     `).all(limit) as Row[]).map((row) => ({
       id: String(row.id),
-      eventId: String(row.event_id),
+      taskId: String(row.task_id),
       status: String(row.status) as HostRunRecord['status'],
       startedAt: String(row.started_at),
       completedAt: optional(row.completed_at),
       error: optional(row.error)?.slice(0, 500),
     }));
     const recentDeliveries = (this.database.prepare(`
-      SELECT id, event_id, channel, status, attempts, updated_at, error
+      SELECT id, task_id, channel, status, attempts, updated_at, error
       FROM outbox ORDER BY updated_at DESC, rowid DESC LIMIT ?
     `).all(limit) as Row[]).map((row) => ({
       id: String(row.id),
-      eventId: String(row.event_id),
+      taskId: String(row.task_id),
       channel: String(row.channel),
       status: String(row.status) as OutboxStatus,
       attempts: Number(row.attempts),
@@ -1828,14 +1616,16 @@ export class MimiStore {
     }));
     return {
       generatedAt: nowIso(),
-      needsAttention: counts.events.blocked > 0 || counts.events.dead_letter > 0 || counts.outbox.dead_letter > 0,
-      workPending: counts.events.queued + counts.events.running + counts.events.paused + counts.events.blocked
+      needsAttention: counts.tasks.blocked > 0 || counts.tasks.dead_letter > 0 || counts.outbox.dead_letter > 0,
+      workPending: counts.tasks.queued + counts.tasks.running + counts.tasks.paused + counts.tasks.blocked
         + counts.outbox.pending + counts.outbox.sending + pendingDigest,
       pendingDigest,
       enabledSchedules: counts.enabledSchedules,
       events: counts.events,
+      tasks: counts.tasks,
       outbox: counts.outbox,
       recentEvents,
+      recentTasks,
       recentRuns,
       recentDeliveries,
       recentTransitions,
@@ -1852,32 +1642,39 @@ export class MimiStore {
       const digestItems = Number(this.database.prepare(`
         DELETE FROM digest_items WHERE digested_at IS NOT NULL AND digested_at < ?
       `).run(timestamp).changes);
-      const candidateEvents = `
-        SELECT events.id FROM events
-        WHERE events.status IN ('completed', 'ignored', 'digested', 'archived')
-          AND events.updated_at < ?
-          AND NOT EXISTS (SELECT 1 FROM outbox WHERE outbox.event_id = events.id)
+      const candidateTasks = `
+        SELECT tasks.id FROM tasks
+        WHERE tasks.status IN ('completed', 'failed', 'cancelled')
+          AND tasks.updated_at < ?
+          AND NOT EXISTS (SELECT 1 FROM outbox WHERE outbox.task_id = tasks.id)
           AND NOT EXISTS (
-            SELECT 1 FROM digest_items
-            WHERE digest_items.event_id = events.id OR digest_items.briefing_event_id = events.id
-          )
-          AND NOT EXISTS (
-            SELECT 1 FROM events AS child
-            WHERE (child.parent_event_id = events.id OR child.root_event_id = events.id)
+            SELECT 1 FROM tasks child WHERE child.parent_task_id = tasks.id
               AND child.status IN ('queued', 'running', 'paused', 'blocked', 'dead_letter')
-          )
-          AND NOT EXISTS (
-            SELECT 1 FROM schedules WHERE schedules.authority_event_id = events.id
           )
       `;
       const runs = Number(this.database.prepare(`
         DELETE FROM runs
-        WHERE status != 'running' AND event_id IN (${candidateEvents})
+        WHERE status != 'running' AND task_id IN (${candidateTasks})
       `).run(timestamp).changes);
+      const tasks = Number(this.database.prepare(`
+        DELETE FROM tasks WHERE id IN (${candidateTasks})
+          AND NOT EXISTS (SELECT 1 FROM runs WHERE runs.task_id = tasks.id)
+      `).run(timestamp).changes);
+      const candidateEvents = `
+        SELECT events.id FROM events WHERE created_at < ?
+          AND NOT EXISTS (SELECT 1 FROM tasks WHERE tasks.trigger_event_id = events.id OR tasks.authority_event_id = events.id)
+          AND NOT EXISTS (SELECT 1 FROM schedules WHERE schedules.authority_event_id = events.id)
+          AND NOT EXISTS (
+            SELECT 1 FROM digest_items
+            WHERE digest_items.event_id = events.id OR digest_items.briefing_event_id = events.id
+          )
+          AND NOT EXISTS (SELECT 1 FROM events child WHERE child.causation_event_id = events.id)
+      `;
+      this.database.prepare(`
+        DELETE FROM event_route_receipts WHERE event_id IN (${candidateEvents})
+      `).run(timestamp);
       const events = Number(this.database.prepare(`
-        DELETE FROM events
-        WHERE id IN (${candidateEvents})
-          AND NOT EXISTS (SELECT 1 FROM runs WHERE runs.event_id = events.id)
+        DELETE FROM events WHERE id IN (${candidateEvents})
       `).run(timestamp).changes);
       const schedules = Number(this.database.prepare(`
         DELETE FROM schedules WHERE enabled = 0 AND updated_at < ?
@@ -1889,9 +1686,9 @@ export class MimiStore {
         DELETE FROM audit_events
         WHERE created_at < ?
           AND NOT EXISTS (
-            SELECT 1 FROM events
-            WHERE events.id = audit_events.entity_id
-              AND events.status IN ('queued', 'running', 'paused', 'blocked', 'dead_letter')
+            SELECT 1 FROM tasks
+            WHERE tasks.id = audit_events.entity_id
+              AND tasks.status IN ('queued', 'running', 'paused', 'blocked', 'dead_letter')
           )
           AND NOT EXISTS (
             SELECT 1 FROM outbox
@@ -1899,7 +1696,7 @@ export class MimiStore {
               AND outbox.status IN ('pending', 'sending', 'dead_letter')
           )
       `).run(timestamp).changes);
-      return { outbox, digestItems, runs, events, schedules, attentionState, auditEvents };
+      return { outbox, digestItems, runs, tasks, events, schedules, attentionState, auditEvents };
     });
     try {
       this.database.exec('PRAGMA optimize; PRAGMA wal_checkpoint(PASSIVE);');
@@ -1915,7 +1712,8 @@ export class MimiStore {
   }
 
   private clearOwnerReplyRouteForDelivery(message: OutboxMessage): boolean {
-    const event = this.getEvent(message.eventId);
+    const task = this.taskStore.get(message.taskId);
+    const event = task ? this.eventStore.get(task.authorityEventId) : undefined;
     if (!event) return false;
     const key = ownerRouteKey(event.profileId);
     const row = this.database.prepare('SELECT value FROM attention_state WHERE key = ?').get(key) as Row | undefined;
@@ -1958,14 +1756,24 @@ export class MimiStore {
     return row ? scheduleFromRow(row) : undefined;
   }
 
-  private insertOutbox(eventId: string, route: ReplyRoute, payload: unknown, timestamp: string): string {
+  private insertOutbox(subjectId: string, route: ReplyRoute, payload: unknown, timestamp: string): string {
     const id = randomUUID();
+    if (!this.taskStore.get(subjectId)) throw new Error(`Outbox Task 不存在：${subjectId}`);
     this.database.prepare(`
       INSERT INTO outbox (
-        id, event_id, channel, target, payload_json, status, attempts,
+        id, task_id, channel, target, payload_json, status, attempts,
         not_before, created_at, updated_at
       ) VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)
-    `).run(id, eventId, route.channel, route.target ?? null, json(payload), timestamp, timestamp, timestamp);
+    `).run(
+      id,
+      subjectId,
+      route.channel,
+      route.target ?? null,
+      json(payload),
+      timestamp,
+      timestamp,
+      timestamp,
+    );
     return id;
   }
 
@@ -1997,15 +1805,13 @@ export class MimiStore {
       profileId: input.profileId,
       sessionKey: input.sessionKey,
       replyRoute: input.replyRoute,
-      executionLane: 'conversation',
-      taskDepth: 0,
     };
   }
 
   private validScheduleAuthority(schedule: ScheduleRecord): boolean {
     try {
-      const authority = schedule.authorityEventId ? this.getEvent(schedule.authorityEventId) : undefined;
-      return isConversationAuthority(authority)
+      const authority = schedule.authorityEventId ? this.getImmutableEvent(schedule.authorityEventId) : undefined;
+      return authority !== undefined
         && authority.profileId === schedule.profileId
         && authority.trust === schedule.trust;
     } catch {
@@ -2013,7 +1819,132 @@ export class MimiStore {
     }
   }
 
+  private enqueueTaskRecord(input: TaskInput, timestamp: string): TaskRecord {
+    const authority = this.eventStore.get(input.authorityEventId);
+    if (!authority) throw new Error(`Task authority Event 不存在：${input.authorityEventId}`);
+    if (authority.profileId !== input.profileId) {
+      throw new Error(`Task ${input.id} 与 authority Event profile 不一致`);
+    }
+    if (input.triggerEventId) {
+      const trigger = this.eventStore.get(input.triggerEventId);
+      if (!trigger) throw new Error(`Task trigger Event 不存在：${input.triggerEventId}`);
+      if (trigger.profileId !== input.profileId) {
+        throw new Error(`Task ${input.id} 与 trigger Event profile 不一致`);
+      }
+    }
+    if (input.parentTaskId === input.id) throw new Error(`Task ${input.id} 不能以自身作为 parent`);
+    if (input.parentTaskId) {
+      const parent = this.taskStore.get(input.parentTaskId);
+      if (!parent) throw new Error(`Parent Task 不存在：${input.parentTaskId}`);
+      if (parent.profileId !== input.profileId) {
+        throw new Error(`Task ${input.id} 与 Parent Task profile 不一致`);
+      }
+      if (parent.authorityEventId !== input.authorityEventId) {
+        throw new Error(`Task ${input.id} 必须继承 Parent Task authority Event`);
+      }
+    }
+    const result = this.taskStore.enqueue(input, timestamp);
+    if (result.inserted) {
+      this.appendTaskLifecycleEvent(result.task, 'task.created', timestamp, {
+        type: result.task.type,
+        executor: result.task.executor,
+        workspaceAccess: result.task.workspaceAccess,
+      });
+    }
+    return result.task;
+  }
+
+  private appendTaskLifecycleEvent(
+    task: TaskRecord,
+    type: string,
+    timestamp: string,
+    payload: unknown,
+  ): ImmutableEvent {
+    const eventId = randomUUID();
+    const event = this.eventStore.append({
+      id: eventId,
+      externalId: `${task.id}:${type}:${eventId}`,
+      source: 'mimi:task',
+      type,
+      trust: 'system',
+      payload,
+      subjectType: 'task',
+      subjectId: task.id,
+      correlationId: task.triggerEventId ?? task.id,
+      causationEventId: task.triggerEventId,
+      profileId: task.profileId,
+      occurredAt: timestamp,
+      receivedAt: timestamp,
+    }, timestamp).event;
+    this.eventRouter.routeEvent(event.id);
+    return event;
+  }
+
+  private recoverExpiredTasks(timestamp: string): void {
+    const rows = this.database.prepare(`
+      SELECT id FROM tasks
+      WHERE status = 'running' AND lease_until IS NOT NULL AND lease_until <= ?
+      ORDER BY lease_until ASC LIMIT 100
+    `).all(timestamp) as Row[];
+    for (const row of rows) {
+      const task = this.taskStore.get(String(row.id));
+      if (!task || task.status !== 'running' || !task.leaseOwner) continue;
+      if (task.controlIntent) {
+        const cancelled = task.controlIntent === 'cancel';
+        const reason = task.controlReason
+          ?? (cancelled ? 'owner cancelled Task' : 'owner paused Task');
+        const updatedControl = this.database.prepare(`
+          UPDATE tasks SET status = ?, error = ?, lease_owner = NULL, lease_until = NULL, control_intent = NULL,
+            control_reason = NULL, updated_at = ?
+          WHERE id = ? AND status = 'running' AND lease_owner = ? AND control_intent = ?
+        `).run(
+          cancelled ? 'cancelled' : 'paused',
+          reason,
+          timestamp,
+          task.id,
+          task.leaseOwner,
+          task.controlIntent,
+        );
+        if (Number(updatedControl.changes) !== 1) continue;
+        this.database.prepare(`
+          UPDATE runs SET status = 'interrupted', completed_at = ?, error = ?
+          WHERE task_id = ? AND status = 'running'
+        `).run(timestamp, reason, task.id);
+        const controlled = this.taskStore.get(task.id)!;
+        this.appendTaskLifecycleEvent(
+          controlled,
+          cancelled ? 'task.cancelled' : 'task.paused',
+          timestamp,
+          { reason, phase: 'lease_recovery' },
+        );
+        continue;
+      }
+      const summary = 'Task lease expired';
+      const terminal = task.attemptCount >= task.maxAttempts;
+      if (!this.taskStore.recoverExpired(
+        task.id,
+        task.leaseOwner,
+        terminal,
+        summary,
+        timestamp,
+        timestamp,
+      )) continue;
+      this.database.prepare(`
+        UPDATE runs SET status = 'interrupted', completed_at = ?, error = ?
+        WHERE task_id = ? AND status = 'running'
+      `).run(timestamp, summary, task.id);
+      const updated = this.taskStore.get(task.id)!;
+      this.appendTaskLifecycleEvent(
+        updated,
+        terminal ? 'task.dead_letter' : 'task.retry_scheduled',
+        timestamp,
+        { error: summary, attemptNo: task.attemptCount, notBefore: updated.notBefore },
+      );
+    }
+  }
+
   private transaction<T>(operation: () => T): T {
+    if (this.database.isTransaction) return operation();
     this.database.exec('BEGIN IMMEDIATE');
     try {
       const result = operation();
@@ -2025,21 +1956,6 @@ export class MimiStore {
     }
   }
 
-  private clearEventPreemptionReservation(eventId: string): void {
-    this.database.prepare('DELETE FROM leases WHERE resource = ?')
-      .run(eventPreemptionResource(eventId));
-  }
-
-  private quarantineMalformedEvent(id: string, error: unknown, timestamp: string): void {
-    const summary = `持久 Event 解码失败，已隔离：${errorSummary(error, 1_000)}`;
-    this.database.prepare(`
-      UPDATE events SET status = 'dead_letter', error = ?, lease_owner = NULL,
-        lease_until = NULL, updated_at = ? WHERE id = ?
-    `).run(summary, timestamp, id);
-    this.clearEventPreemptionReservation(id);
-    this.insertAudit('event.quarantined', id, { error: summary }, timestamp);
-  }
-
   private quarantineMalformedOutbox(id: string, error: unknown, timestamp: string): void {
     const summary = `持久 Outbox 解码失败，已隔离：${errorSummary(error, 1_000)}`;
     this.database.prepare(`
@@ -2049,262 +1965,20 @@ export class MimiStore {
     this.insertAudit('outbox.quarantined', id, { error: summary }, timestamp);
   }
 
-  private settleQueuedTaskControls(timestamp: string): void {
-    const rows = this.database.prepare(`
-      SELECT * FROM events
-      WHERE execution_lane = 'task' AND status = 'queued'
-        AND task_control IN ('pause', 'cancel')
-      ORDER BY received_at ASC, rowid ASC
-    `).all() as Row[];
-    const requested: StoredEvent[] = [];
-    for (const row of rows) {
-      try {
-        requested.push(eventFromRow(row));
-      } catch (error) {
-        this.quarantineMalformedEvent(String(row.id), error, timestamp);
-      }
-    }
-    for (const event of requested) {
-      const control = event.taskControl;
-      if (!control) continue;
-      const cancelled = control === 'cancel';
-      const reason = event.taskControlReason
-        ?? (cancelled ? 'owner 取消了后台任务' : 'owner 暂停了后台任务');
-      const updated = this.database.prepare(`
-        UPDATE events SET status = ?, error = ?, lease_owner = NULL, lease_until = NULL,
-          task_control = NULL, task_control_reason = NULL, updated_at = ?
-        WHERE id = ? AND execution_lane = 'task' AND status = 'queued' AND task_control = ?
-      `).run(cancelled ? 'archived' : 'paused', reason, timestamp, event.id, control);
-      if (Number(updated.changes) !== 1) continue;
-      this.clearEventPreemptionReservation(event.id);
-      this.insertAudit(cancelled ? 'event.cancelled' : 'event.paused', event.id, {
-        phase: 'queued_control_recovery',
-        reason: reason.slice(0, 1_000),
-      }, timestamp);
-    }
-  }
-
-  private recoverExpiredEventLeases(
-    timestamp: string,
-    executionLane?: EventExecutionLane,
-    eventId?: string,
-  ): void {
-    const at = new Date(timestamp);
-    const laneSql = executionLane ? ' AND execution_lane = ?' : '';
-    const eventSql = eventId ? ' AND id = ?' : '';
-    const rows = this.database.prepare(`
-      SELECT * FROM events
-      WHERE status = 'running' AND lease_until <= ?${laneSql}${eventSql}
-      ORDER BY lease_until ASC, rowid ASC
-    `).all(timestamp, ...(executionLane ? [executionLane] : []), ...(eventId ? [eventId] : [])) as Row[];
-    const expired: StoredEvent[] = [];
-    for (const row of rows) {
-      try {
-        expired.push(eventFromRow(row));
-      } catch (error) {
-        this.quarantineMalformedEvent(String(row.id), error, timestamp);
-      }
-    }
-    for (const event of expired) {
-      if (event.executionLane === 'task' && event.taskControl) {
-        const cancelled = event.taskControl === 'cancel';
-        const reason = event.taskControlReason
-          ?? (cancelled ? 'owner 取消了后台任务' : 'owner 暂停了后台任务');
-        const status = cancelled ? 'archived' : 'paused';
-        const updated = this.database.prepare(`
-          UPDATE events SET status = ?,
-            attempts = CASE WHEN ? = 'paused' THEN MAX(0, attempts - 1) ELSE attempts END,
-            error = ?, lease_owner = NULL, lease_until = NULL,
-            task_control = NULL, task_control_reason = NULL, updated_at = ?
-          WHERE id = ? AND execution_lane = 'task' AND status = 'running'
-            AND lease_until <= ? AND task_control = ?
-        `).run(status, status, reason, timestamp, event.id, timestamp, event.taskControl);
-        if (Number(updated.changes) !== 1) continue;
-        this.database.prepare(`
-          UPDATE runs SET status = 'interrupted', completed_at = ?, error = ?
-          WHERE status = 'running' AND event_id = ?
-        `).run(timestamp, reason.slice(0, 4_000), event.id);
-        this.clearEventPreemptionReservation(event.id);
-        this.insertAudit(cancelled ? 'event.cancelled' : 'event.paused', event.id, {
-          phase: 'lease_recovery',
-          reason: reason.slice(0, 1_000),
-        }, timestamp);
-        continue;
-      }
-      const attemptLimit = event.maxAttempts ?? DEFAULT_EVENT_MAX_ATTEMPTS;
-      const terminal = event.attempts >= attemptLimit;
-      const reason = terminal
-        ? `事件租约过期，worker 未能在 ${attemptLimit} 次有界尝试内完成`
-        : '事件租约过期，worker 可能已崩溃，等待退避后重试';
-      const delay = Math.min(60 * 60_000, 1_000 * 2 ** Math.max(0, event.attempts - 1));
-      const notBefore = terminal ? timestamp : new Date(at.getTime() + delay).toISOString();
-      const updated = this.database.prepare(`
-        UPDATE events SET status = ?, error = ?, not_before = ?,
-          lease_owner = NULL, lease_until = NULL, updated_at = ?
-        WHERE id = ? AND status = 'running' AND lease_until <= ?
-      `).run(
-        terminal ? 'dead_letter' : 'queued',
-        reason,
-        notBefore,
-        timestamp,
-        event.id,
-        timestamp,
-      );
-      if (Number(updated.changes) !== 1) continue;
-      this.database.prepare(`
-        UPDATE runs SET status = 'interrupted', completed_at = ?, error = 'event lease expired'
-        WHERE status = 'running' AND event_id = ?
-      `).run(timestamp, event.id);
-      if (terminal) {
-        this.clearEventPreemptionReservation(event.id);
-        const delivery = eventFailureDelivery(event, reason);
-        this.insertOutbox(event.id, delivery.route, delivery.payload, timestamp);
-      }
-      this.insertAudit(terminal ? 'event.dead_letter' : 'event.retry', event.id, {
-        attempts: event.attempts,
-        reason: 'lease_expired',
-        ...(terminal ? {} : { notBefore }),
-      }, timestamp);
-    }
-  }
-
   private migrate(): void {
     const version = Number((this.database.prepare('PRAGMA user_version').get() as Row).user_version);
-    if (version > 11) throw new Error(`不支持的 MimiAgent 数据库版本：${version}`);
+    if (version > 12) throw new Error(`不支持的 MimiAgent 数据库版本：${version}`);
+    if (version === 12) {
+      if (this.hasFinalV12Schema()) return;
+      if (!this.hasLegacyEventSchema()) {
+        throw new Error('MimiAgent 数据库标记为 v12，但表结构既不是最终 v12 也不是可恢复的旧 Event schema');
+      }
+      this.assertEmptyPartialV12Tables();
+      this.cutoverEventTaskV12(true);
+      return;
+    }
     if (version === 0) {
-      this.database.exec(`
-        CREATE TABLE events (
-          id TEXT PRIMARY KEY,
-          external_id TEXT NOT NULL,
-          source TEXT NOT NULL,
-          kind TEXT NOT NULL,
-          trust TEXT NOT NULL,
-          actor_json TEXT NOT NULL,
-          conversation_json TEXT NOT NULL,
-          payload_json TEXT NOT NULL,
-          occurred_at TEXT NOT NULL,
-          received_at TEXT NOT NULL,
-          priority INTEGER NOT NULL,
-          profile_id TEXT NOT NULL,
-          session_key TEXT,
-          reply_route_json TEXT NOT NULL,
-          execution_lane TEXT NOT NULL DEFAULT 'conversation',
-          origin_session_key TEXT,
-          parent_event_id TEXT,
-          root_event_id TEXT,
-          task_depth INTEGER NOT NULL DEFAULT 0,
-          task_control TEXT,
-          task_control_reason TEXT,
-          status TEXT NOT NULL,
-          attempts INTEGER NOT NULL,
-          max_attempts INTEGER,
-          completion_deferrals INTEGER NOT NULL DEFAULT 0,
-          completion_no_progress_deferrals INTEGER NOT NULL DEFAULT 0,
-          completion_progress_fingerprint TEXT,
-          not_before TEXT NOT NULL,
-          lease_owner TEXT,
-          lease_until TEXT,
-          result_json TEXT,
-          error TEXT,
-          created_at TEXT NOT NULL,
-          updated_at TEXT NOT NULL,
-          UNIQUE(source, external_id)
-        ) STRICT;
-        CREATE INDEX events_ready_idx ON events(status, not_before, priority, received_at);
-        CREATE INDEX events_lane_ready_idx ON events(execution_lane, status, not_before, priority, received_at);
-        CREATE INDEX events_retention_idx ON events(status, updated_at);
-
-        CREATE TABLE runs (
-          id TEXT PRIMARY KEY,
-          event_id TEXT NOT NULL REFERENCES events(id),
-          session_key TEXT NOT NULL,
-          status TEXT NOT NULL,
-          started_at TEXT NOT NULL,
-          completed_at TEXT,
-          answer_json TEXT,
-          error TEXT
-        ) STRICT;
-        CREATE INDEX runs_event_status_idx ON runs(event_id, status);
-
-        CREATE TABLE outbox (
-          id TEXT PRIMARY KEY,
-          event_id TEXT NOT NULL REFERENCES events(id),
-          channel TEXT NOT NULL,
-          target TEXT,
-          payload_json TEXT NOT NULL,
-          status TEXT NOT NULL,
-          attempts INTEGER NOT NULL,
-          not_before TEXT NOT NULL,
-          lease_owner TEXT,
-          lease_until TEXT,
-          error TEXT,
-          created_at TEXT NOT NULL,
-          updated_at TEXT NOT NULL
-        ) STRICT;
-        CREATE INDEX outbox_ready_idx ON outbox(status, not_before, created_at);
-        CREATE INDEX outbox_retention_idx ON outbox(status, updated_at);
-
-        CREATE TABLE leases (
-          resource TEXT PRIMARY KEY,
-          owner TEXT NOT NULL,
-          fencing_token INTEGER NOT NULL,
-          lease_until TEXT NOT NULL,
-          updated_at TEXT NOT NULL
-        ) STRICT;
-        CREATE TABLE audit_events (
-          sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-          id TEXT NOT NULL UNIQUE,
-          event_type TEXT NOT NULL,
-          entity_id TEXT NOT NULL,
-          data_json TEXT NOT NULL,
-          created_at TEXT NOT NULL
-        ) STRICT;
-        CREATE INDEX audit_retention_idx ON audit_events(created_at);
-
-        CREATE TABLE schedules (
-          id TEXT PRIMARY KEY,
-          name TEXT NOT NULL,
-          schedule_type TEXT NOT NULL,
-          schedule_value TEXT NOT NULL,
-          prompt TEXT NOT NULL,
-          profile_id TEXT NOT NULL,
-          session_key TEXT,
-          authority_event_id TEXT,
-          reply_route_json TEXT NOT NULL,
-          trust TEXT NOT NULL,
-          enabled INTEGER NOT NULL,
-          next_run_at TEXT NOT NULL,
-          last_run_at TEXT,
-          created_at TEXT NOT NULL,
-          updated_at TEXT NOT NULL
-        ) STRICT;
-        CREATE INDEX schedules_due_idx ON schedules(enabled, next_run_at);
-        CREATE INDEX schedules_retention_idx ON schedules(enabled, updated_at);
-
-        CREATE TABLE digest_items (
-          id TEXT PRIMARY KEY,
-          event_id TEXT NOT NULL UNIQUE REFERENCES events(id),
-          source TEXT NOT NULL,
-          kind TEXT NOT NULL,
-          priority INTEGER NOT NULL,
-          payload_json TEXT NOT NULL,
-          reason TEXT NOT NULL,
-          occurred_at TEXT NOT NULL,
-          created_at TEXT NOT NULL,
-          digested_at TEXT,
-          briefing_event_id TEXT REFERENCES events(id)
-        ) STRICT;
-        CREATE INDEX digest_pending_idx ON digest_items(digested_at, briefing_event_id, priority, occurred_at);
-        CREATE INDEX digest_retention_idx ON digest_items(digested_at);
-
-        CREATE TABLE attention_state (
-          key TEXT PRIMARY KEY,
-          value TEXT NOT NULL,
-          updated_at TEXT NOT NULL
-        ) STRICT;
-        CREATE INDEX attention_retention_idx ON attention_state(updated_at);
-        PRAGMA user_version = 11;
-      `);
+      this.createFreshV12Schema();
       return;
     }
     if (version <= 2) {
@@ -2336,10 +2010,374 @@ export class MimiStore {
     this.addEventCompletionColumns();
     this.addEventAttemptColumns();
     this.addScheduleAuthorityColumns();
-    this.backfillScheduleAuthorities();
     this.createRetentionIndexes();
     this.createEventTaskIndexes();
-    this.database.exec('PRAGMA user_version = 11;');
+    this.cutoverEventTaskV12();
+  }
+
+  private tableColumns(table: string): Set<string> {
+    return new Set((this.database.prepare(`PRAGMA table_info(${table})`).all() as Row[])
+      .map((row) => String(row.name)));
+  }
+
+  private hasFinalV12Schema(): boolean {
+    const events = this.tableColumns('events');
+    const tasks = this.tableColumns('tasks');
+    const runs = this.tableColumns('runs');
+    const outbox = this.tableColumns('outbox');
+    return events.has('type') && !events.has('status')
+      && tasks.has('authority_event_id') && tasks.has('attempt_count')
+      && runs.has('task_id') && runs.has('attempt_no')
+      && outbox.has('task_id') && !outbox.has('event_id');
+  }
+
+  private hasLegacyEventSchema(): boolean {
+    const events = this.tableColumns('events');
+    const runs = this.tableColumns('runs');
+    const outbox = this.tableColumns('outbox');
+    return events.has('kind') && events.has('status') && events.has('execution_lane')
+      && !events.has('type') && runs.has('event_id') && outbox.has('event_id');
+  }
+
+  private assertEmptyPartialV12Tables(): void {
+    for (const table of ['events_v2', 'tasks', 'task_attempts', 'event_route_receipts']) {
+      const exists = this.database.prepare(
+        "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = ?",
+      ).get(table);
+      if (!exists) continue;
+      const count = Number((this.database.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as Row).count);
+      if (count > 0) {
+        throw new Error(`MimiAgent v12 半迁移表 ${table} 含 ${count} 行，拒绝自动覆盖；请先人工核对数据`);
+      }
+    }
+  }
+
+  private createFreshV12Schema(): void {
+    this.database.exec(`
+      BEGIN IMMEDIATE;
+      CREATE TABLE events (
+        id TEXT PRIMARY KEY, external_id TEXT NOT NULL, source TEXT NOT NULL, type TEXT NOT NULL,
+        trust TEXT NOT NULL, actor_json TEXT NOT NULL, conversation_json TEXT NOT NULL,
+        payload_json TEXT NOT NULL, subject_type TEXT, subject_id TEXT, correlation_id TEXT,
+        causation_event_id TEXT REFERENCES events(id), profile_id TEXT NOT NULL,
+        reply_route_json TEXT NOT NULL, occurred_at TEXT NOT NULL, received_at TEXT NOT NULL,
+        created_at TEXT NOT NULL, UNIQUE(source, external_id)
+      ) STRICT;
+      CREATE TABLE tasks (
+        id TEXT PRIMARY KEY, type TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE,
+        trigger_event_id TEXT REFERENCES events(id), authority_event_id TEXT NOT NULL REFERENCES events(id),
+        parent_task_id TEXT REFERENCES tasks(id), profile_id TEXT NOT NULL, session_key TEXT,
+        objective_json TEXT NOT NULL, executor TEXT NOT NULL, workspace_access TEXT NOT NULL,
+        priority INTEGER NOT NULL, status TEXT NOT NULL, not_before TEXT NOT NULL,
+        attempt_count INTEGER NOT NULL, max_attempts INTEGER NOT NULL, lease_owner TEXT,
+        lease_until TEXT, control_intent TEXT, control_reason TEXT, result_json TEXT, error TEXT,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      ) STRICT;
+      CREATE TABLE event_route_receipts (
+        event_id TEXT PRIMARY KEY REFERENCES events(id), router_version TEXT NOT NULL,
+        decision TEXT NOT NULL, task_ids_json TEXT NOT NULL, reason_code TEXT NOT NULL,
+        routed_at TEXT NOT NULL
+      ) STRICT;
+      CREATE TABLE runs (
+        id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), attempt_no INTEGER NOT NULL,
+        session_key TEXT NOT NULL, worker_id TEXT NOT NULL, status TEXT NOT NULL,
+        started_at TEXT NOT NULL, completed_at TEXT, answer_json TEXT, error TEXT,
+        UNIQUE(task_id, attempt_no)
+      ) STRICT;
+      CREATE TABLE outbox (
+        id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), channel TEXT NOT NULL,
+        target TEXT, payload_json TEXT NOT NULL, status TEXT NOT NULL, attempts INTEGER NOT NULL,
+        not_before TEXT NOT NULL, lease_owner TEXT, lease_until TEXT, error TEXT,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      ) STRICT;
+      CREATE TABLE leases (
+        resource TEXT PRIMARY KEY, owner TEXT NOT NULL, fencing_token INTEGER NOT NULL,
+        lease_until TEXT NOT NULL, updated_at TEXT NOT NULL
+      ) STRICT;
+      CREATE TABLE audit_events (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE,
+        event_type TEXT NOT NULL, entity_id TEXT NOT NULL, data_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      ) STRICT;
+      CREATE TABLE schedules (
+        id TEXT PRIMARY KEY, name TEXT NOT NULL, schedule_type TEXT NOT NULL,
+        schedule_value TEXT NOT NULL, prompt TEXT NOT NULL, profile_id TEXT NOT NULL,
+        session_key TEXT, authority_event_id TEXT REFERENCES events(id), reply_route_json TEXT NOT NULL,
+        trust TEXT NOT NULL, enabled INTEGER NOT NULL, next_run_at TEXT NOT NULL,
+        last_run_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      ) STRICT;
+      CREATE TABLE digest_items (
+        id TEXT PRIMARY KEY, event_id TEXT NOT NULL UNIQUE REFERENCES events(id),
+        source TEXT NOT NULL, kind TEXT NOT NULL, priority INTEGER NOT NULL,
+        payload_json TEXT NOT NULL, reason TEXT NOT NULL, occurred_at TEXT NOT NULL,
+        created_at TEXT NOT NULL, digested_at TEXT, briefing_event_id TEXT REFERENCES events(id)
+      ) STRICT;
+      CREATE TABLE attention_state (
+        key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL
+      ) STRICT;
+      CREATE INDEX events_timeline_idx ON events(received_at DESC, id);
+      CREATE INDEX events_subject_idx ON events(subject_type, subject_id, received_at DESC);
+      CREATE INDEX events_correlation_idx ON events(correlation_id, received_at ASC);
+      CREATE INDEX events_causation_idx ON events(causation_event_id);
+      CREATE TRIGGER events_immutable_update BEFORE UPDATE ON events
+      BEGIN SELECT RAISE(ABORT, 'immutable event cannot be updated'); END;
+      CREATE INDEX tasks_ready_idx ON tasks(status, not_before, priority DESC, created_at ASC);
+      CREATE INDEX tasks_ready_priority_idx ON tasks(priority DESC, created_at ASC, not_before)
+        WHERE status = 'queued';
+      CREATE INDEX tasks_recovery_idx ON tasks(status, lease_until);
+      CREATE INDEX tasks_session_idx ON tasks(session_key, status, updated_at DESC);
+      CREATE INDEX tasks_trigger_idx ON tasks(trigger_event_id);
+      CREATE INDEX tasks_authority_idx ON tasks(authority_event_id);
+      CREATE INDEX tasks_parent_idx ON tasks(parent_task_id);
+      CREATE INDEX tasks_retention_idx ON tasks(status, updated_at);
+      CREATE INDEX runs_task_status_idx ON runs(task_id, status);
+      CREATE INDEX outbox_ready_idx ON outbox(status, not_before, created_at);
+      CREATE INDEX outbox_task_idx ON outbox(task_id);
+      CREATE INDEX outbox_retention_idx ON outbox(status, updated_at);
+      CREATE INDEX audit_retention_idx ON audit_events(created_at);
+      CREATE INDEX schedules_due_idx ON schedules(enabled, next_run_at);
+      CREATE INDEX schedules_retention_idx ON schedules(enabled, updated_at);
+      CREATE INDEX digest_pending_idx ON digest_items(digested_at, briefing_event_id, priority, occurred_at);
+      CREATE INDEX digest_retention_idx ON digest_items(digested_at);
+      CREATE INDEX attention_retention_idx ON attention_state(updated_at);
+      PRAGMA user_version = 12;
+      COMMIT;
+    `);
+  }
+
+  private cutoverEventTaskV12(removePartialV12 = false): void {
+    const legacyCounts = {
+      events: Number((this.database.prepare('SELECT COUNT(*) AS count FROM events').get() as Row).count),
+      runs: Number((this.database.prepare('SELECT COUNT(*) AS count FROM runs').get() as Row).count),
+      outbox: Number((this.database.prepare('SELECT COUNT(*) AS count FROM outbox').get() as Row).count),
+    };
+    this.database.exec('PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE;');
+    try {
+      if (removePartialV12) {
+        this.database.exec(`
+          DROP TABLE IF EXISTS task_attempts;
+          DROP TABLE IF EXISTS event_route_receipts;
+          DROP TABLE IF EXISTS tasks;
+          DROP TABLE IF EXISTS events_v2;
+        `);
+      }
+      this.database.exec(`
+        CREATE TABLE events_v12 (
+          id TEXT PRIMARY KEY,
+          external_id TEXT NOT NULL,
+          source TEXT NOT NULL,
+          type TEXT NOT NULL,
+          trust TEXT NOT NULL,
+          actor_json TEXT NOT NULL,
+          conversation_json TEXT NOT NULL,
+          payload_json TEXT NOT NULL,
+          subject_type TEXT,
+          subject_id TEXT,
+          correlation_id TEXT,
+          causation_event_id TEXT REFERENCES events_v12(id),
+          profile_id TEXT NOT NULL,
+          reply_route_json TEXT NOT NULL,
+          occurred_at TEXT NOT NULL,
+          received_at TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          UNIQUE(source, external_id)
+        ) STRICT;
+        CREATE TABLE tasks_v12 (
+          id TEXT PRIMARY KEY,
+          type TEXT NOT NULL,
+          idempotency_key TEXT NOT NULL UNIQUE,
+          trigger_event_id TEXT REFERENCES events_v12(id),
+          authority_event_id TEXT NOT NULL REFERENCES events_v12(id),
+          parent_task_id TEXT REFERENCES tasks_v12(id),
+          profile_id TEXT NOT NULL,
+          session_key TEXT,
+          objective_json TEXT NOT NULL,
+          executor TEXT NOT NULL,
+          workspace_access TEXT NOT NULL,
+          priority INTEGER NOT NULL,
+          status TEXT NOT NULL,
+          not_before TEXT NOT NULL,
+          attempt_count INTEGER NOT NULL,
+          max_attempts INTEGER NOT NULL,
+          lease_owner TEXT,
+          lease_until TEXT,
+          control_intent TEXT,
+          control_reason TEXT,
+          result_json TEXT,
+          error TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        ) STRICT;
+        CREATE TABLE event_route_receipts_v12 (
+          event_id TEXT PRIMARY KEY REFERENCES events_v12(id),
+          router_version TEXT NOT NULL,
+          decision TEXT NOT NULL,
+          task_ids_json TEXT NOT NULL,
+          reason_code TEXT NOT NULL,
+          routed_at TEXT NOT NULL
+        ) STRICT;
+        CREATE TABLE runs_v12 (
+          id TEXT PRIMARY KEY,
+          task_id TEXT NOT NULL REFERENCES tasks_v12(id),
+          attempt_no INTEGER NOT NULL,
+          session_key TEXT NOT NULL,
+          worker_id TEXT NOT NULL,
+          status TEXT NOT NULL,
+          started_at TEXT NOT NULL,
+          completed_at TEXT,
+          answer_json TEXT,
+          error TEXT,
+          UNIQUE(task_id, attempt_no)
+        ) STRICT;
+        CREATE TABLE outbox_v12 (
+          id TEXT PRIMARY KEY,
+          task_id TEXT NOT NULL REFERENCES tasks_v12(id),
+          channel TEXT NOT NULL,
+          target TEXT,
+          payload_json TEXT NOT NULL,
+          status TEXT NOT NULL,
+          attempts INTEGER NOT NULL,
+          not_before TEXT NOT NULL,
+          lease_owner TEXT,
+          lease_until TEXT,
+          error TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        ) STRICT;
+
+        INSERT INTO events_v12 (
+          id, external_id, source, type, trust, actor_json, conversation_json, payload_json,
+          correlation_id, causation_event_id, profile_id, reply_route_json,
+          occurred_at, received_at, created_at
+        )
+        SELECT id, external_id, source,
+          CASE WHEN execution_lane = 'task' THEN 'task.migrated'
+            WHEN kind = 'schedule' THEN 'schedule.due' ELSE kind || '.received' END,
+          trust, actor_json, conversation_json, payload_json,
+          COALESCE(root_event_id, parent_event_id, id), parent_event_id, profile_id,
+          reply_route_json, occurred_at, received_at, created_at
+        FROM events;
+
+        INSERT INTO tasks_v12 (
+          id, type, idempotency_key, trigger_event_id, authority_event_id, parent_task_id,
+          profile_id, session_key, objective_json, executor, workspace_access, priority,
+          status, not_before, attempt_count, max_attempts, lease_owner, lease_until,
+          control_intent, control_reason, result_json, error, created_at, updated_at
+        )
+        SELECT e.id,
+          CASE WHEN e.execution_lane = 'task' AND e.kind = 'schedule' THEN 'scheduled'
+            WHEN e.execution_lane = 'task' THEN 'background' ELSE 'conversation' END,
+          'migration:event:' || e.id,
+          e.id,
+          COALESCE(e.root_event_id, e.parent_event_id, e.id),
+          e.parent_event_id,
+          e.profile_id, e.session_key, e.payload_json,
+          CASE WHEN e.execution_lane = 'task' AND json_extract(e.payload_json, '$.executor') = 'codex'
+            THEN 'codex' WHEN e.execution_lane = 'task' THEN 'isolated_worker' ELSE 'session_actor' END,
+          CASE WHEN json_extract(e.payload_json, '$.workspaceAccess') = 'read' THEN 'read' ELSE 'write' END,
+          e.priority,
+          CASE e.status WHEN 'archived' THEN 'cancelled' WHEN 'ignored' THEN 'completed'
+            WHEN 'digested' THEN 'completed' ELSE e.status END,
+          e.not_before, e.attempts, COALESCE(e.max_attempts, 5), e.lease_owner, e.lease_until,
+          e.task_control, e.task_control_reason, e.result_json, e.error, e.created_at, e.updated_at
+        FROM events e LEFT JOIN events parent ON parent.id = e.parent_event_id;
+
+        INSERT INTO events_v12 (
+          id, external_id, source, type, trust, actor_json, conversation_json, payload_json,
+          subject_type, subject_id, correlation_id, causation_event_id, profile_id,
+          reply_route_json, occurred_at, received_at, created_at
+        )
+        SELECT 'migration-task-' || id, 'task:' || id || ':migration-v12', 'mimi:migration',
+          'task.' || CASE status WHEN 'queued' THEN 'created' WHEN 'running' THEN 'started'
+            WHEN 'dead_letter' THEN 'dead_letter' WHEN 'cancelled' THEN 'cancelled'
+            ELSE status END,
+          'system', 'null', 'null', json_object('provenance', 'migration-v12'),
+          'task', id, COALESCE(root_event_id, parent_event_id, id), id, profile_id,
+          'null', updated_at, updated_at, updated_at
+        FROM events;
+
+        INSERT INTO event_route_receipts_v12 (
+          event_id, router_version, decision, task_ids_json, reason_code, routed_at
+        )
+        SELECT id, 'migration-v12',
+          'task_created', json_array(id),
+          'legacy_event_conversion', updated_at
+        FROM events;
+
+        INSERT INTO event_route_receipts_v12 (
+          event_id, router_version, decision, task_ids_json, reason_code, routed_at
+        )
+        SELECT 'migration-task-' || id, 'migration-v12', 'observe_only', '[]',
+          'task_lifecycle', updated_at
+        FROM events;
+
+        INSERT INTO runs_v12 (
+          id, task_id, attempt_no, session_key, worker_id, status,
+          started_at, completed_at, answer_json, error
+        )
+        SELECT r.id, r.event_id,
+          ROW_NUMBER() OVER (PARTITION BY r.event_id ORDER BY r.started_at, r.id),
+          r.session_key, COALESCE(e.lease_owner, 'migration'), r.status,
+          r.started_at, r.completed_at, r.answer_json, r.error
+        FROM runs r JOIN events e ON e.id = r.event_id;
+
+        INSERT INTO outbox_v12 (
+          id, task_id, channel, target, payload_json, status, attempts,
+          not_before, lease_owner, lease_until, error, created_at, updated_at
+        )
+        SELECT id, event_id, channel, target, payload_json, status, attempts,
+          not_before, lease_owner, lease_until, error, created_at, updated_at
+        FROM outbox;
+
+        DROP TABLE runs;
+        DROP TABLE outbox;
+        DROP TABLE events;
+        ALTER TABLE events_v12 RENAME TO events;
+        ALTER TABLE tasks_v12 RENAME TO tasks;
+        ALTER TABLE event_route_receipts_v12 RENAME TO event_route_receipts;
+        ALTER TABLE runs_v12 RENAME TO runs;
+        ALTER TABLE outbox_v12 RENAME TO outbox;
+
+        CREATE INDEX events_timeline_idx ON events(received_at DESC, id);
+        CREATE INDEX events_subject_idx ON events(subject_type, subject_id, received_at DESC);
+        CREATE INDEX events_correlation_idx ON events(correlation_id, received_at ASC);
+        CREATE TRIGGER events_immutable_update BEFORE UPDATE ON events
+        BEGIN SELECT RAISE(ABORT, 'immutable event cannot be updated'); END;
+        CREATE INDEX tasks_ready_idx ON tasks(status, not_before, priority DESC, created_at ASC);
+        CREATE INDEX tasks_ready_priority_idx ON tasks(priority DESC, created_at ASC, not_before) WHERE status = 'queued';
+        CREATE INDEX tasks_recovery_idx ON tasks(status, lease_until);
+        CREATE INDEX tasks_session_idx ON tasks(session_key, status, updated_at DESC);
+        CREATE INDEX tasks_trigger_idx ON tasks(trigger_event_id);
+        CREATE INDEX tasks_parent_idx ON tasks(parent_task_id);
+        CREATE UNIQUE INDEX runs_task_attempt_idx ON runs(task_id, attempt_no);
+        CREATE INDEX runs_task_status_idx ON runs(task_id, status);
+        CREATE INDEX outbox_ready_idx ON outbox(status, not_before, created_at);
+        CREATE INDEX outbox_retention_idx ON outbox(status, updated_at);
+      `);
+      this.backfillScheduleAuthorities();
+      const convertedCounts = {
+        tasks: Number((this.database.prepare('SELECT COUNT(*) AS count FROM tasks').get() as Row).count),
+        routes: Number((this.database.prepare('SELECT COUNT(*) AS count FROM event_route_receipts').get() as Row).count),
+        runs: Number((this.database.prepare('SELECT COUNT(*) AS count FROM runs').get() as Row).count),
+        outbox: Number((this.database.prepare('SELECT COUNT(*) AS count FROM outbox').get() as Row).count),
+      };
+      if (convertedCounts.tasks !== legacyCounts.events
+        || convertedCounts.routes !== legacyCounts.events * 2
+        || convertedCounts.runs !== legacyCounts.runs
+        || convertedCounts.outbox !== legacyCounts.outbox) {
+        throw new Error(`Event/Task v12 转换计数校验失败：${JSON.stringify({ legacyCounts, convertedCounts })}`);
+      }
+      const foreignKeyFailures = this.database.prepare('PRAGMA foreign_key_check').all();
+      if (foreignKeyFailures.length > 0) {
+        throw new Error(`Event/Task v12 转换引用校验失败：${JSON.stringify(foreignKeyFailures.slice(0, 20))}`);
+      }
+      this.database.exec('PRAGMA user_version = 12; COMMIT;');
+    } catch (error) {
+      this.database.exec('ROLLBACK;');
+      throw error;
+    } finally {
+      this.database.exec('PRAGMA foreign_keys=ON;');
+    }
   }
 
   private addEventAttemptColumns(): void {
@@ -2402,15 +2440,6 @@ export class MimiStore {
     const scheduleColumns = new Set((this.database.prepare('PRAGMA table_info(schedules)').all() as Row[])
       .map((row) => String(row.name)));
     if (!scheduleColumns.has('authority_event_id')) return;
-    const eventColumns = new Set((this.database.prepare('PRAGMA table_info(events)').all() as Row[])
-      .map((row) => String(row.name)));
-    const requiredEventColumns = [
-      'id', 'external_id', 'source', 'kind', 'trust', 'actor_json', 'conversation_json', 'payload_json',
-      'occurred_at', 'received_at', 'priority', 'profile_id', 'session_key', 'reply_route_json',
-      'execution_lane', 'origin_session_key', 'parent_event_id', 'root_event_id', 'task_depth',
-      'status', 'attempts', 'not_before', 'created_at', 'updated_at',
-    ];
-    const canPersistAuthority = requiredEventColumns.every((column) => eventColumns.has(column));
     const timestamp = nowIso();
     for (const row of this.database.prepare('SELECT * FROM schedules WHERE enabled = 1').all() as Row[]) {
       let schedule: ScheduleRecord;
@@ -2422,7 +2451,7 @@ export class MimiStore {
         continue;
       }
       if (this.validScheduleAuthority(schedule)) continue;
-      if (!canPersistAuthority || (schedule.trust !== 'owner' && schedule.trust !== 'system')) {
+      if (schedule.trust !== 'owner' && schedule.trust !== 'system') {
         this.database.prepare('UPDATE schedules SET enabled = 0, updated_at = ? WHERE id = ?')
           .run(timestamp, schedule.id);
         continue;

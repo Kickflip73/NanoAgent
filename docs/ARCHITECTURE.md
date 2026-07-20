@@ -139,22 +139,21 @@ Session 模型偏好同时记录 provider；切换 Provider 或读取没有 prov
 
 ```text
 Connector / CLI / Schedule
-  → EventEnvelope(source, externalId, trust, priority, replyRoute)
-  → SQLite Inbox 去重并持久化
-  → Kernel Attention: run / digest / notify / ignore
-      ├─ digest → 摘要池 → 定时 Briefing Event
-      └─ run → Policy 选择 Session / RunPolicy / execution lane
-  → conversation lane → Dispatcher claim + lease
-      → MimiHost Session actor（同 Session FIFO，跨 Session 并行）
-      → AgentRunService → MimiAgent bounded run
-  → task lane → TaskProcessSupervisor
-      → fork OS worker → 精确 claim Event → isolated Task Session run
-  → replyRoute = Event route ?? owner.replyRoute
-  → Event 终态 + Outbox 同事务提交
+  → append immutable Event（source + externalId 幂等）
+  → EventRouter + Attention 写 route receipt
+      ├─ digest → 摘要池 → Briefing Event + Task
+      ├─ observe_only / rejected → 不创建工作
+      └─ task_created → 0..N durable Tasks
+  → Task scheduler claim + lease
+      ├─ session_actor → MimiHost（同 Session FIFO，跨 Session 并行）
+      ├─ isolated_worker → TaskProcessSupervisor fork OS worker
+      └─ codex → bounded worker，完成后交回 Mimi 验收
+  → Run 记录一次 attempt
+  → Task 终态 + task.* lifecycle Event + Outbox 同事务提交
   → Kernel Notifier deliver；失败独立退避重试
 ```
 
-`MimiHost` 是 Session actor registry，而不是全局单工 lane。每个 actor 是其可变 Agent 的唯一所有者，Session 选择、模型/模式变更、清理和 Run 在该 Session 的 FIFO lane 内执行；Host 的 semaphore 只限制同时活跃的不同 Session 数。只读 `sessionSnapshot(id)` 直接读取指定 FileSession，不切换当前 Session。Conversation Dispatcher 可同时持有多个不同 Session 的 Event lease，但不会并发写同一个 transcript；Task Dispatcher 位于独立子进程并只领取 supervisor 指定的 task Event。Agent Run 期间有一个局部 ready Event 查询：达到 Attention `urgentPriority` 的高优先级候选可在没有 Tool 在途时 abort 当前模型思考；Tool 在途时等待结果落账。Event 的过期租约会回到待处理状态并依靠执行账本恢复；Outbox 的过期 `sending` 租约代表远端结果不确定，会直接进入 dead letter。明确可重试的普通失败才指数退避并在达到上限后 dead-letter。
+`MimiHost` 是 Session actor registry，而不是全局单工 lane。每个 actor 是其可变 Agent 的唯一所有者，Session 选择、模型/模式变更、清理和 Run 在该 Session 的 FIFO lane 内执行；Host 的 semaphore 只限制同时活跃的不同 Session 数。只读 `sessionSnapshot(id)` 直接读取指定 FileSession，不切换当前 Session。Dispatcher 可同时持有多个不同 Session 的 Task lease，但不会并发写同一个 transcript；isolated worker 只领取 supervisor 指定的 Task。Agent Run 期间查询 ready Task：达到 Attention `urgentPriority` 的高优先级候选可在没有 Tool 在途时 abort 当前模型思考；Tool 在途时等待结果落账。Task 的过期租约会回到待处理状态并依靠执行账本恢复；Outbox 的过期 `sending` 租约代表远端结果不确定，会直接进入 dead letter。明确可重试的普通失败才指数退避并在达到上限后 dead-letter。
 
 SDK Session 完成早于 SQLite Event/Outbox 事务时，执行账本会保留 `sessionId + executionKey` 的完成回执。回执同时保存由成功控制工具恢复并严格校验的 RuntimeAction；模型/模式/输出/Session 切换、清空、MCP 重载和退出效果通过独立 action ledger 至多执行一次。`clear_session` 会保留当前 execution root 及子账本，直到 Event 事务确认后统一清理，因此崩溃恢复不会把清空动作重放到后来数据。若进程在任一边界崩溃，重试读取回执、修复 checkpoint、复用原答案和 RuntimeEffect，不再次调用模型；SQLite 提交成功后才清理回执。该机制与 Tool at-most-once ledger 一起缩小跨存储崩溃窗口，但不把两种存储宣称为分布式 exactly-once 事务。
 
@@ -164,7 +163,7 @@ CLI 启动快照只携带有界的最近对话和当前 Plan，避免 7×24 Sess
 
 Dead letter 不是静默终态。Event 达到最大尝试次数时，状态更新、Host Run 失败、audit 和一个绑定原 Event 的 system Outbox 在同一事务提交；它绕过模型直接使用本机 Notifier。非 system Outbox 的普通可重试失败按退避耗尽后进入 dead letter；超时、进程中断、ACK 丢失或 Connector 显式 `uncertain:true` 则首个 attempt 直接 dead-letter，避免结果不确定的消息自动重放。sending 租约默认 180 秒，覆盖内置 Connector 最大 120 秒投递超时；崩溃恢复遇到真正过期的 sending 也原子 dead-letter，而不是重置 pending。投递最多使用四个有界 lane，lane key 是精确 `(channel,target)`：同一会话保持 FIFO，一个失联 QQ 群不会阻塞其他 QQ 私聊或微信会话。两种 dead letter 都在状态事务内插入 system fallback；若 fallback 本身也失败，只记录 system dead letter，不再生成下一层通知。载荷只含有界 ID/source/channel/attempts/error 摘要，不复制 Event payload、消息正文、投递内容或 target。owner 可通过窄 RPC/CLI 把 dead letter 原 ID 重排队或标记为 archived，四种变化都以状态 CAS 和 audit 原子提交；后台从不自动重放。owner 显式 Outbox 重投保持 at-least-once 语义，控制面明确提示远端确认丢失时可能重复。这里没有告警服务、失败 Agent、审批流或第二张升级表。
 
-Schema v7 在 v6 历史保留索引之上增加 Event `executionLane`、`originSessionKey`、`parentEventId`、`rootEventId`、`taskDepth` 与 ready-task 索引；v8 再增加 nullable `taskControl/taskControlReason`；v9 为 Schedule 增加 nullable `authorityEventId`，并为旧 owner/system 计划回填终态 Conversation authority root，旧外部计划缺根时禁用而不提升 provenance。运行中 Task 的 cancel/pause 必须先持久化控制意图，再尽力通过 IPC 提醒 worker；worker 在 Tool 安全边界和续租时消费它。若 Kernel 或 worker 先崩溃，claim/lease recovery 会把 cancel 收敛为 `archived`、把 pause 收敛为 `paused`，且 cancel 始终覆盖 pause，不会把已接受控制的工作重新排队。后台任务因此继续复用原 Event / Run / lease / retry / Outbox 状态机，不增加第二套 workflow 表。Dispatcher 低频调用 `pruneHistory(cutoff)`；Store 在一个 transaction 内先删除旧 sent/archived Outbox 和已归档 Digest，再删除无引用 completed/ignored/digested/archived Event 的非运行 Runs 与 Event，最后清理旧 disabled Schedule、Attention checkpoint 和普通 Audit。所有活状态、dead letter、未解决 Outbox/Digest、被活跃 Task 作为 parent/root 引用的来源 Event，以及仍被 Schedule 引用的 authority root 都由显式查询条件保护；这也保留了 Task 重新计算 owner source-policy 授权所需的 provenance 链。事务后只做轻量 optimize/passive checkpoint，不自动 VACUUM，也没有维护表、线程或服务。
+Schema v7 在 v6 历史保留索引之上增加旧 Event 执行字段；v8 增加运行控制；v9 增加 Schedule authority。Schema v12 一次性完成 Event / Task 分层：旧库在单个 `BEGIN IMMEDIATE` transaction 内转换为不可变 `events`、`event_route_receipts`、唯一 `tasks` 队列、仅引用 `task_id` 的 `runs` 与 `outbox`，校验失败即整体回滚；不存在 `events_v2`、`task_attempts`、双写或 legacy adapter。运行中 Task 的 cancel/pause 先持久化控制意图，再尽力通过 IPC 提醒 worker；worker 在 Tool 安全边界和续租时消费它。若 Kernel 或 worker 先崩溃，claim/lease recovery 会把 cancel 收敛为 `cancelled`、把 pause 收敛为 `paused`，且 cancel 始终覆盖 pause。Dispatcher 低频调用 `pruneHistory(cutoff)`；Store 先清理已解决 Outbox/Digest，再按 Task→Run 和 Event 引用关系执行保留清理，所有活跃 Task、dead letter、未解决 Outbox/Digest 与 Schedule authority 均受显式引用保护。事务后只做轻量 optimize/passive checkpoint，不自动 VACUUM。
 
 MimiAgent Event 获得一个只读运行自省 Host Tool 与四个 Schedule Host Tool。`inspect_mimi_activity` 直接从 Store 生成有界快照，包括 counts、积压、dead letter、Digest/Schedule 数量及近期 Event/Run/Outbox/Audit 元数据，不返回其他事务正文、答案、投递内容或 target。Schedule Tools 用于创建一次性 follow-up、周期 routine、查询和取消计划；新计划保留发起事件的 origin Session、profile、trust provenance、reply route 和不可变 Conversation authority root。到期 occurrence 总是进入独立 `mimi-task-*` Session 与 Task lane，由 OS worker 执行，不占用来源 Conversation actor；Task 每次从 durable root 与当前 source policy 重新计算权限。owner/system 的本机 CLI 计划使用可审计的合成 root；外部来源缺根、根被删除或 provenance 不匹配时失败关闭且不发出新 Task。撤销外部 work policy 后，一次性 follow-up 只能受限收尾，interval/watch 只获得绑定当前 authentic occurrence 的 `complete_current_mimi_schedule` 以停止轮询，伪造 occurrence 不获得该工具。非 command Event 额外获得 `finish_mimi_silently`：它只修改当前 attempt 的内存 DeliveryControl，成功提交时把 suppression reason 放入 Event result 并省略 Outbox；直接 command 没有该工具，失败/重试也不继承状态。所有能力继续位于同一个事务语境，不引入 RPC 回环或工作流引擎；创建/取消工具进入事件级语义账本，重试不会重复建立计划，静默控制不是外部副作用且不进入 ledger。
 

@@ -1,0 +1,19 @@
+{
+  "name": "3d-portfolio",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --open",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "earcut": "^3.0.0",
+    "gsap": "^3.12.5",
+    "html2canvas": "^1.4.1",
+    "three": "^0.185.0"
+  },
+  "devDependencies": {
+    "vite": "^6.0.0"
+  }
+}

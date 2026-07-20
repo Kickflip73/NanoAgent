@@ -34,10 +34,12 @@ import type {
   MimiMemoryContentChunk,
   MimiMemoryPage,
   MimiStreamEvent,
-  MimiStreamEventState,
+  MimiStreamTaskState,
   MimiStreamSnapshot,
-  StoredEvent,
+  ImmutableEvent,
+  TaskRecord,
 } from './types.js';
+import type { SessionSummary } from '../core/session.js';
 
 const CHAT_COMMANDS: CompletionItem[] = [...COMMANDS];
 const CHAT_RECONNECT_INITIAL_DELAY_MS = 50;
@@ -60,6 +62,8 @@ export interface MimiChatClientOptions {
 }
 
 async function defaultReconcileDaemon(config: AppConfig, status: DaemonStatus): Promise<DaemonStatus> {
+  const expectedPermissionMode = config.permissionMode ?? 'trusted';
+  if (daemonProtocolAction(status, expectedPermissionMode) === 'reuse') return status;
   const { reconcileMimiDaemon } = await import('./service.js');
   return reconcileMimiDaemon(config, status);
 }
@@ -74,7 +78,8 @@ const CHAT_HELP = `${commandHelp()}
 这些命令作用于后台唯一 MimiAgent。/exit 只关闭当前终端。`;
 
 interface SubmitResponse {
-  event: StoredEvent;
+  event: ImmutableEvent;
+  task?: TaskRecord;
   inserted: boolean;
 }
 
@@ -88,7 +93,7 @@ export type EventCancelResult =
   | { state: 'already_terminal' }
   | { state: 'not_found' };
 
-function eventAnswer(event: MimiStreamEventState): string {
+function eventAnswer(event: MimiStreamTaskState): string {
   const result = event.result;
   if (result && typeof result === 'object') {
     const answer = (result as Record<string, unknown>).answer;
@@ -96,12 +101,10 @@ function eventAnswer(event: MimiStreamEventState): string {
   }
   if (typeof result === 'string' && result.trim()) return result.trim();
   if (event.error) throw new Error(event.error);
-  return event.status === 'digested'
-    ? '该信息已进入 MimiAgent 摘要队列。'
-    : `任务已结束，状态：${event.status}`;
+  return `任务已结束，状态：${event.status}`;
 }
 
-export function eventEffects(event: MimiStreamEventState): RuntimeEffect[] {
+export function eventEffects(event: MimiStreamTaskState): RuntimeEffect[] {
   const result = event.result;
   if (!result || typeof result !== 'object') return [];
   const effects = (result as Record<string, unknown>).effects;
@@ -177,7 +180,7 @@ export class MimiChatClient {
   async connect(): Promise<DaemonStatus> {
     let status: DaemonStatus;
     try {
-      status = await mimiRpc<DaemonStatus>(this.socket, 'status', undefined, 750);
+      status = await mimiRpc<DaemonStatus>(this.socket, 'status', undefined, 2_000);
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       if (code !== 'ENOENT' && code !== 'ECONNREFUSED') throw error;
@@ -197,6 +200,14 @@ export class MimiChatClient {
     });
     this.assertWorkspace(snapshot.workspaceRoot);
     return snapshot;
+  }
+
+  async bootstrap(draftSessionId = `mimi-chat-${randomUUID()}`): Promise<MimiChatSnapshot> {
+    return await mimiRpc<MimiChatSnapshot>(this.socket, 'chat.bootstrap', { draftSessionId });
+  }
+
+  async listSessions(): Promise<SessionSummary[]> {
+    return await mimiRpc<SessionSummary[]>(this.socket, 'chat.sessions');
   }
 
   async history(sessionKey?: string): Promise<AgentInputItem[]> {
@@ -260,16 +271,22 @@ export class MimiChatClient {
           params,
           requestTimeoutMs,
         );
-        return { eventId: submitted.event.id, inserted: submitted.inserted };
+        if (!submitted.task) throw new Error('MimiAgent 没有为命令创建 Task');
+        return { eventId: submitted.task.id, inserted: submitted.inserted };
       } catch (error) {
         if (!isTransientIpcDisconnect(error)) throw error;
-        const accepted = await mimiRpc<StoredEvent | undefined>(
+        const acceptedEvent = await mimiRpc<ImmutableEvent | undefined>(
           this.socket,
           'event.get',
           { id: eventId },
           requestTimeoutMs,
         ).catch(() => undefined);
-        if (accepted) return { eventId: accepted.id, inserted: true };
+        if (acceptedEvent) {
+          const receipt = await mimiRpc<{ taskIds: string[] } | undefined>(
+            this.socket, 'event.route', { id: acceptedEvent.id }, requestTimeoutMs,
+          ).catch(() => undefined);
+          if (receipt?.taskIds[0]) return { eventId: receipt.taskIds[0], inserted: true };
+        }
         if (Date.now() >= deadline) throw error;
         const code = (error as NodeJS.ErrnoException).code;
         if (code === 'ENOENT' || code === 'ECONNREFUSED') {
@@ -287,7 +304,7 @@ export class MimiChatClient {
     eventId: string,
     signal?: AbortSignal,
     onStreamEvent?: (event: MimiStreamEvent) => void,
-  ): Promise<MimiStreamEventState> {
+  ): Promise<MimiStreamTaskState> {
     const deadline = Date.now() + 24 * 60 * 60_000;
     let sequence = 0;
     let reconnectDelayMs = CHAT_RECONNECT_INITIAL_DELAY_MS;
@@ -328,10 +345,10 @@ export class MimiChatClient {
       if (snapshot.nextSequence !== undefined && Number.isSafeInteger(snapshot.nextSequence)) {
         sequence = Math.max(sequence, snapshot.nextSequence);
       }
-      const event = snapshot.event;
-      if (!event) throw new Error(`MimiAgent 事件不存在：${eventId}`);
+      const event = snapshot.task;
+      if (!event) throw new Error(`MimiAgent Task 不存在：${eventId}`);
       const terminal = [
-        'paused', 'blocked', 'completed', 'ignored', 'digested', 'dead_letter', 'archived',
+        'paused', 'blocked', 'completed', 'failed', 'cancelled', 'dead_letter',
       ].includes(event.status);
       if (snapshot.hasMore && sequence > previousSequence) continue;
       if (terminal) return event;
@@ -341,7 +358,7 @@ export class MimiChatClient {
   }
 
   async cancel(eventId: string, reason?: string): Promise<EventCancelResult> {
-    return await mimiRpc<EventCancelResult>(this.socket, 'event.cancel', { id: eventId, reason });
+    return await mimiRpc<EventCancelResult>(this.socket, 'task.cancel', { id: eventId, reason });
   }
 
   async listBackgroundTasks(limit = 20): Promise<BackgroundTaskSummary[]> {
@@ -395,18 +412,34 @@ type CommandMethodResult<Key extends keyof CommandTarget> = CommandTarget[Key] e
   : never;
 
 export class RemoteCommandTarget implements CommandTarget {
+  private materialized: boolean;
+
   constructor(
     private readonly client: MimiChatClient,
     private sessionId: string,
-  ) {}
+    materialized = true,
+  ) {
+    this.materialized = materialized;
+  }
 
   get currentSessionId(): string {
     return this.sessionId;
   }
 
+  get sessionReady(): boolean {
+    return this.materialized;
+  }
+
+  markSessionReady(): void {
+    this.materialized = true;
+  }
+
   applyRuntimeEffects(effects: readonly RuntimeEffect[]): void {
     for (const effect of effects) {
-      if (effect.type === 'session_changed') this.sessionId = effect.sessionId;
+      if (effect.type === 'session_changed') {
+        this.sessionId = effect.sessionId;
+        this.materialized = true;
+      }
     }
   }
 
@@ -435,12 +468,20 @@ export class RemoteCommandTarget implements CommandTarget {
   }
 
   async switchSession(sessionId: string): Promise<void> {
+    const exists = (await this.client.listSessions()).some((session) => session.id === sessionId);
+    if (!exists) throw new Error(`Session ${sessionId} 不存在`);
     await this.client.invoke('runtime', undefined, sessionId);
     this.sessionId = sessionId;
+    this.materialized = true;
+  }
+
+  prepareNewSession(sessionId = `mimi-chat-${randomUUID()}`): void {
+    this.sessionId = sessionId;
+    this.materialized = false;
   }
 
   listSessionSummaries(): Promise<CommandMethodResult<'listSessionSummaries'>> {
-    return this.client.invoke('sessions');
+    return this.client.listSessions();
   }
 
   async history(): Promise<CommandMethodResult<'history'>> {
@@ -624,7 +665,7 @@ function renderBanner(version: string, snapshot: MimiChatSnapshot): string {
     `MimiAgent v${version}`,
     '全天候个人 Agent · CLI 已连接统一后台',
     `模型    ${snapshot.provider} · ${snapshot.model}`,
-    `对话    ${snapshot.sessionId}`,
+    `对话    ${snapshot.draft ? '新对话（发送消息后创建）' : snapshot.sessionId}`,
     `工作区  ${snapshot.workspaceRoot}`,
   ].join('\n');
 }
@@ -640,7 +681,9 @@ export async function runMimiCli(
   const configuredSession = preferredEnvironmentValue('MIMI_SESSION', 'AGENT_SESSION');
   const oneShotInput = args.join(' ').trim();
   if (oneShotInput) {
-    const current = await client.snapshot(30, configuredSession);
+    const current = configuredSession
+      ? await client.snapshot(30, configuredSession)
+      : await client.bootstrap();
     const renderer = new TerminalRenderer(process.stderr, process.stdout, normalizeOutputLevel(current.outputLevel));
     renderer.start('模型思考中', oneShotInput);
     let streamedAnswer = '';
@@ -665,8 +708,10 @@ export async function runMimiCli(
     return;
   }
 
-  let snapshot = await client.snapshot(30, configuredSession);
-  const target = new RemoteCommandTarget(client, snapshot.sessionId);
+  let snapshot = configuredSession
+    ? await client.snapshot(30, configuredSession)
+    : await client.bootstrap();
+  const target = new RemoteCommandTarget(client, snapshot.sessionId, !snapshot.draft);
   const terminal = new InteractiveTerminal(CHAT_COMMANDS);
   const queue: string[] = [];
   let activeAbort: AbortController | undefined;
@@ -681,7 +726,9 @@ export async function runMimiCli(
   const tty = Boolean(process.stdout.isTTY);
 
   const refresh = async () => {
-    snapshot = await client.snapshot(30, target.currentSessionId);
+    snapshot = target.sessionReady
+      ? await client.snapshot(30, target.currentSessionId)
+      : await client.bootstrap(target.currentSessionId);
     terminal.useSession(snapshot.sessionId);
     terminal.setRuntimeStatus({
       mode: snapshot.mode,
@@ -720,6 +767,8 @@ export async function runMimiCli(
     let streamedAnswer = '';
     try {
       const accepted = await client.submit(input, target.currentSessionId);
+      target.markSessionReady();
+      snapshot.draft = false;
       activeEventId = accepted.eventId;
       if (activeCancelRequested) cancelActiveEvent();
       const event = await client.wait(accepted.eventId, signal, (streamed) => {

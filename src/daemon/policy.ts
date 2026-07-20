@@ -5,7 +5,7 @@ import {
 } from '../runtime/mimi-agent.js';
 import type { ToolCapability } from '../runtime/tool-policy.js';
 import { assertSessionId, sessionIdSchema } from '../core/session-id.js';
-import type { EventEnvelope, StoredEvent } from './types.js';
+import type { EventEnvelope, TaskRecord } from './types.js';
 
 export interface EventDecision {
   action: 'ignore' | 'run';
@@ -113,7 +113,7 @@ function textPayload(payload: unknown): string {
   return JSON.stringify(payload, null, 2);
 }
 
-function lifeEventPlaybook(event: StoredEvent): string {
+function lifeEventPlaybook(event: EventEnvelope): string {
   if (event.source !== 'macos-life' || !event.payload || typeof event.payload !== 'object') return '';
   const type = (event.payload as Record<string, unknown>).type;
   if (typeof type !== 'string') return '';
@@ -146,7 +146,7 @@ function lifeEventPlaybook(event: StoredEvent): string {
   return '';
 }
 
-function mailEventPlaybook(event: StoredEvent): string {
+function mailEventPlaybook(event: EventEnvelope): string {
   if (event.source !== 'mail' || !event.payload || typeof event.payload !== 'object') return '';
   const payload = event.payload as Record<string, unknown>;
   if (payload.type !== 'unread_mail') return '';
@@ -158,7 +158,7 @@ function mailEventPlaybook(event: StoredEvent): string {
   ].join('\n');
 }
 
-function messagesEventPlaybook(event: StoredEvent): string {
+function messagesEventPlaybook(event: EventEnvelope): string {
   if (event.source !== 'messages' || !event.payload || typeof event.payload !== 'object') return '';
   const payload = event.payload as Record<string, unknown>;
   if (payload.type !== 'incoming_message') return '';
@@ -171,7 +171,7 @@ function messagesEventPlaybook(event: StoredEvent): string {
   ].join('\n');
 }
 
-function connectorHealthPlaybook(event: StoredEvent): string {
+function connectorHealthPlaybook(event: EventEnvelope): string {
   if (event.source !== 'system:connector-health' || event.trust !== 'system'
     || !event.payload || typeof event.payload !== 'object') return '';
   const health = (event.payload as Record<string, unknown>).connectorHealth;
@@ -194,7 +194,7 @@ function connectorHealthPlaybook(event: StoredEvent): string {
   return '';
 }
 
-function systemHealthPlaybook(event: StoredEvent): string {
+function systemHealthPlaybook(event: EventEnvelope): string {
   if (event.source !== 'macos-system' || event.trust !== 'system'
     || !event.payload || typeof event.payload !== 'object') return '';
   const type = (event.payload as Record<string, unknown>).type;
@@ -225,7 +225,7 @@ function systemHealthPlaybook(event: StoredEvent): string {
   return '';
 }
 
-function fileActivityPlaybook(event: StoredEvent): string {
+function fileActivityPlaybook(event: EventEnvelope): string {
   if (event.source !== 'file-radar' || !event.payload || typeof event.payload !== 'object') return '';
   const payload = event.payload as Record<string, unknown>;
   if (payload.type !== 'file_activity') return '';
@@ -237,8 +237,8 @@ function fileActivityPlaybook(event: StoredEvent): string {
   ].join('\n');
 }
 
-function backgroundTaskPlaybook(event: StoredEvent): string {
-  if (event.executionLane !== 'task') return '';
+function backgroundTaskPlaybook(backgroundTask: boolean): string {
+  if (!backgroundTask) return '';
   return [
     '## MimiAgent 后台 Task Lead 执行契约',
     '你是同一个 MimiAgent 的后台执行部分，不是另一个人格，也不负责维持闲聊。只专注完成当前已持久化目标；开始时建立或恢复 Goal/Plan，持续把关键进展写入 checkpoint。',
@@ -273,29 +273,27 @@ export function sessionIdFor(event: EventEnvelope, person?: ResolvedPerson): str
 }
 
 export function decideEvent(
-  event: StoredEvent,
+  event: EventEnvelope,
   standingOrders: readonly string[] = [],
   person?: ResolvedPerson,
   ownerSourcePolicyAccess?: SourcePolicyAccess,
   forceRestricted = false,
+  task?: TaskRecord,
+  triggerSource?: string,
 ): EventDecision {
   const content = textPayload(event.payload);
   if (!content) return { action: 'ignore', reason: '事件没有可处理内容' };
   const restrictedProvenance = forceRestricted || (event.trust !== 'owner' && event.trust !== 'system');
   const ownerDelegated = !forceRestricted && restrictedProvenance && ownerSourcePolicyAccess !== undefined;
   const mayAct = !restrictedProvenance || ownerDelegated;
-  const readOnlyTask = event.executionLane === 'task'
-    && event.payload !== null
-    && typeof event.payload === 'object'
-    && !Array.isArray(event.payload)
-    && (event.payload as Record<string, unknown>).workspaceAccess === 'read';
-  const backgroundTask = event.executionLane === 'task';
+  const backgroundTask = task !== undefined && task.type !== 'conversation';
+  const readOnlyTask = backgroundTask && task.workspaceAccess === 'read';
   const ownerWriteTask = backgroundTask && !readOnlyTask && event.trust === 'owner';
   const scheduleType = backgroundTask && event.payload && typeof event.payload === 'object' && !Array.isArray(event.payload)
     ? (event.payload as Record<string, unknown>).scheduleType
     : undefined;
   const restrictedRecurringScheduleTask = restrictedProvenance
-    && event.source.startsWith('schedule:')
+    && (triggerSource ?? event.source).startsWith('schedule:')
     && ownerSourcePolicyAccess !== 'work'
     && (scheduleType === 'interval' || scheduleType === 'watch');
   const trustedContext = [
@@ -335,7 +333,7 @@ export function decideEvent(
     connectorHealthPlaybook(event),
     systemHealthPlaybook(event),
     fileActivityPlaybook(event),
-    backgroundTaskPlaybook(event),
+    backgroundTaskPlaybook(backgroundTask),
   ].filter(Boolean).join('\n');
   const policy = restrictedRecurringScheduleTask
     ? {

@@ -1,7 +1,7 @@
 import { Buffer } from 'node:buffer';
 import type { RunStreamEvent } from '@openai/agents';
 import type { RuntimeEvent } from '../runtime/hooks.js';
-import type { MimiStreamEvent, MimiStreamEventState, StoredEvent } from './types.js';
+import type { MimiStreamEvent, MimiStreamTaskState, TaskRecord } from './types.js';
 
 type WithoutTransport<T> = T extends unknown ? Omit<T, 'sequence' | 'eventId'> : never;
 export type PendingMimiStreamEvent = WithoutTransport<MimiStreamEvent>;
@@ -137,13 +137,13 @@ function boundedResult(result: unknown): unknown {
   return Object.keys(bounded).length ? bounded : undefined;
 }
 
-export function mimiStreamEventState(event: StoredEvent | undefined): MimiStreamEventState | undefined {
-  if (!event) return undefined;
+export function mimiStreamTaskState(task: TaskRecord | undefined): MimiStreamTaskState | undefined {
+  if (!task) return undefined;
   return {
-    id: event.id,
-    status: event.status,
-    result: boundedResult(event.result),
-    error: event.error === undefined ? undefined : truncateJsonString(event.error, 16 * 1024),
+    id: task.id,
+    status: task.status,
+    result: boundedResult(task.result),
+    error: task.error === undefined ? undefined : truncateJsonString(task.error, 16 * 1024),
   };
 }
 

@@ -19,10 +19,11 @@ import { MimiStore } from './store.js';
 import type { BackgroundTaskBlockRequest, BackgroundTaskPauseResult } from './task-tools.js';
 import type {
   DaemonWorkerStatus,
-  EventExecutionLane,
+  ImmutableEvent,
   OutboxMessage,
   ReplyRoute,
-  StoredEvent,
+  TaskRecord,
+  TaskType,
 } from './types.js';
 
 type MaybePromise<T> = T | Promise<T>;
@@ -31,8 +32,8 @@ export interface DispatcherOptions {
   pollMs?: number;
   leaseMs?: number;
   maxAttempts?: number;
-  maxConcurrentEvents?: number;
-  claimExecutionLane?: EventExecutionLane;
+  maxConcurrentTasks?: number;
+  claimTaskTypes?: TaskType[];
   preemptPollMs?: number;
   runIdleTimeoutMs?: number;
   onStreamEvent?: (eventId: string, event: RunStreamEvent) => void;
@@ -43,7 +44,9 @@ export interface DispatcherOptions {
 }
 
 interface ActiveExecution {
-  event: StoredEvent;
+  task: TaskRecord;
+  event: ImmutableEvent;
+  authority: ImmutableEvent;
   tools: number;
   cancelRequested?: { reason: string };
   pauseRequested?: { reason: string };
@@ -86,8 +89,8 @@ export function eventFailureAttemptLimit(
   return configuredMaxAttempts;
 }
 
-const TERMINAL_EVENT_STATUSES = new Set<StoredEvent['status']>([
-  'completed', 'ignored', 'digested', 'dead_letter', 'archived',
+const TERMINAL_TASK_STATUSES = new Set<TaskRecord['status']>([
+  'completed', 'failed', 'cancelled', 'dead_letter',
 ]);
 
 function delay(ms: number, signal: AbortSignal): Promise<void> {
@@ -110,6 +113,7 @@ export class MimiDispatcher {
   private loopPromise?: Promise<void>;
   private readonly active = new Map<string, ActiveExecution>();
   private readonly activeSessions = new Set<string>();
+  private readonly reservedPreemptions = new Set<string>();
   private stopRequested = false;
   private forceStopReason?: Error;
   private preferOutbox = true;
@@ -149,7 +153,7 @@ export class MimiDispatcher {
       if (execution.runController && !execution.runController.signal.aborted) {
         execution.runController.abort(this.forceStopReason);
       }
-      this.host.cancel(execution.event.id, this.forceStopReason);
+      this.host.cancel(execution.task.id, this.forceStopReason);
     }
   }
 
@@ -158,7 +162,7 @@ export class MimiDispatcher {
       pid: process.pid,
       startedAt: this.startedAt,
       workerId: this.workerId,
-      activeEventId: this.active.values().next().value?.event.id,
+      activeEventId: this.active.values().next().value?.task.id,
       activeEventIds: [...this.active.keys()],
       activeEventCount: this.active.size,
       ...this.store.counts(),
@@ -166,20 +170,17 @@ export class MimiDispatcher {
   }
 
   cancel(eventId: string, reason = 'owner 取消了任务'): EventCancelResult {
-    const event = this.store.getEvent(eventId);
-    if (!event) return { state: 'not_found' };
-    if (TERMINAL_EVENT_STATUSES.has(event.status)) return { state: 'already_terminal' };
+    const task = this.store.getTask(eventId);
+    if (!task) return { state: 'not_found' };
+    if (TERMINAL_TASK_STATUSES.has(task.status)) return { state: 'already_terminal' };
     const summary = reason.replace(/\s+/g, ' ').trim().slice(0, 4_000) || 'owner 取消了任务';
-    if (event.status === 'queued') {
-      if (this.store.cancelQueuedEvent(eventId, summary)) return { state: 'cancelled' };
-      return this.cancelAfterStateChange(eventId, summary);
+    if (task.status !== 'running') {
+      this.store.cancelTask(eventId, summary);
+      return { state: 'cancelled' };
     }
     const active = this.active.get(eventId);
-    if (event.status === 'running' && active) {
-      if (event.executionLane === 'task') {
-        const requested = this.store.requestRunningTaskControl(eventId, 'cancel', summary);
-        if (!requested) return this.cancelAfterStateChange(eventId, summary);
-      }
+    if (active) {
+      this.store.cancelTask(eventId, summary);
       if (!active.cancelRequested) active.cancelRequested = { reason: summary };
       active.pauseRequested = undefined;
       this.abortForCancellationWhenSafe(active);
@@ -189,24 +190,19 @@ export class MimiDispatcher {
   }
 
   pause(eventId: string, reason = 'owner 暂停了后台任务'): BackgroundTaskPauseResult {
-    const event = this.store.getEvent(eventId);
-    if (!event || event.executionLane !== 'task') return { state: 'not_found' };
-    if (event.status === 'paused') return { state: 'already_paused' };
-    if (TERMINAL_EVENT_STATUSES.has(event.status)) return { state: 'already_terminal' };
+    const task = this.store.getTask(eventId);
+    if (!task || task.type === 'conversation') return { state: 'not_found' };
+    if (task.status === 'paused') return { state: 'already_paused' };
+    if (TERMINAL_TASK_STATUSES.has(task.status)) return { state: 'already_terminal' };
     const summary = reason.replace(/\s+/g, ' ').trim().slice(0, 4_000) || 'owner 暂停了后台任务';
-    if (event.status === 'queued') {
-      try {
-        this.store.pauseQueuedEvent(eventId, summary);
-        return { state: 'paused' };
-      } catch {
-        return this.pauseAfterStateChange(eventId, summary);
-      }
+    if (task.status === 'queued') {
+      this.store.pauseTask(eventId, summary);
+      return { state: 'paused' };
     }
     const active = this.active.get(eventId);
-    if (event.status === 'running' && active) {
-      const requested = this.store.requestRunningTaskControl(eventId, 'pause', summary);
-      if (!requested) return this.pauseAfterStateChange(eventId, summary);
-      if (requested.taskControl === 'cancel') return { state: 'not_pauseable' };
+    if (task.status === 'running' && active) {
+      const requested = this.store.pauseTask(eventId, summary);
+      if (requested.controlIntent === 'cancel') return { state: 'not_pauseable' };
       if (!active.pauseRequested) active.pauseRequested = { reason: summary };
       this.abortForPauseWhenSafe(active);
       return { state: 'paused' };
@@ -223,15 +219,14 @@ export class MimiDispatcher {
       this.preferOutbox = false;
       return true;
     }
-    const event = this.store.claimEvent(
+    const task = this.store.claimTask(
       this.workerId,
+      { types: this.options.claimTaskTypes, executor: 'session_actor' },
       this.options.leaseMs ?? 60_000,
       new Date(),
-      this.options.claimExecutionLane,
-      this.options.maxAttempts ?? 5,
     );
-    if (event) {
-      await this.runEvent(event);
+    if (task) {
+      await this.runTask(task);
       this.preferOutbox = true;
       return true;
     }
@@ -242,16 +237,15 @@ export class MimiDispatcher {
     return false;
   }
 
-  async processEventById(eventId: string): Promise<boolean> {
-    const event = this.store.claimEventById(
+  async processTaskById(eventId: string): Promise<boolean> {
+    const task = this.store.claimTaskById(
       eventId,
       this.workerId,
       this.options.leaseMs ?? 60_000,
       new Date(),
-      this.options.maxAttempts ?? 5,
     );
-    if (!event) return false;
-    await this.runEvent(event);
+    if (!task) return false;
+    await this.runTask(task);
     return true;
   }
 
@@ -342,21 +336,24 @@ export class MimiDispatcher {
       this.preferOutbox = false;
       worked = true;
     }
-    const limit = Math.max(1, Math.min(16, this.options.maxConcurrentEvents ?? 4));
+    const limit = Math.max(1, Math.min(16, this.options.maxConcurrentTasks ?? 4));
     while (!this.stopRequested && this.active.size < limit) {
-      const event = this.store.claimEvent(
+      const task = this.store.claimTask(
         this.workerId,
+        {
+          types: this.options.claimTaskTypes,
+          executor: 'session_actor',
+          excludedSessionKeys: [...this.activeSessions],
+        },
         this.options.leaseMs ?? 60_000,
         new Date(),
-        this.options.claimExecutionLane,
-        this.options.maxAttempts ?? 5,
-        [...this.activeSessions],
       );
-      if (!event) break;
+      if (!task) break;
+      this.reservedPreemptions.delete(task.id);
       worked = true;
       this.preferOutbox = true;
-      void this.runEvent(event).catch((error) => {
-        process.stderr.write(`[MimiAgent] event ${event.id} error: ${error instanceof Error ? error.message : String(error)}\n`);
+      void this.runTask(task).catch((error) => {
+        process.stderr.write(`[MimiAgent] task ${task.id} error: ${error instanceof Error ? error.message : String(error)}\n`);
       });
     }
     if (!worked && !this.preferOutbox && this.startDelivery()) {
@@ -366,88 +363,75 @@ export class MimiDispatcher {
     return worked;
   }
 
-  private runEvent(event: StoredEvent): Promise<void> {
-    if (this.active.has(event.id)) throw new Error(`事件 ${event.id} 已在执行`);
+  private runTask(task: TaskRecord): Promise<void> {
+    if (this.active.has(task.id)) throw new Error(`Task ${task.id} 已在执行`);
+    const authority = this.store.getImmutableEvent(task.authorityEventId);
+    const event = this.store.getImmutableEvent(task.triggerEventId ?? task.authorityEventId);
+    if (!event || !authority) {
+      this.store.failTask(task.id, this.workerId, new Error(`Task authority Event 不存在：${task.authorityEventId}`), undefined, new Date(), false);
+      return Promise.resolve();
+    }
     const active: ActiveExecution = {
+      task,
       event,
+      authority,
       tools: 0,
       pendingToolCalls: new Map(),
     };
-    this.active.set(event.id, active);
-    const promise = this.processEvent(active);
+    this.active.set(task.id, active);
+    const promise = this.processTask(active);
     active.promise = promise;
     return promise;
   }
 
-  private async processEvent(active: ActiveExecution): Promise<void> {
+  private async processTask(active: ActiveExecution): Promise<void> {
+    const task = active.task;
     const event = active.event;
-    let hostRunId: string | undefined;
+    let attemptId: string | undefined;
     let preemptTimer: NodeJS.Timeout | undefined;
+    let preemptedBy: { id: string; priority: number; ownerCorrection: boolean } | undefined;
     let runIdleTimer: NodeJS.Timeout | undefined;
-    let preemptedBy: (Pick<StoredEvent, 'id' | 'priority'> & { ownerCorrection: boolean }) | undefined;
     let execution: { sessionId: string; key: string } | undefined;
     let leaseFailure: Error | undefined;
     const leaseMs = this.options.leaseMs ?? 60_000;
     const renew = setInterval(() => {
       if (leaseFailure) return;
       try {
-        const renewed = this.store.renewEventLease(event.id, this.workerId, leaseMs);
+        const renewed = this.store.renewTaskLease(task.id, this.workerId, leaseMs);
         if (renewed) {
           this.synchronizeDurableTaskControl(active);
           return;
         }
-        leaseFailure = new Error(`事件 ${event.id} 租约已失效，旧 Run 已安全中止`);
+        leaseFailure = new Error(`Task ${task.id} 租约已失效，旧 Run 已安全中止`);
       } catch (error) {
         leaseFailure = new Error(
-          `事件 ${event.id} 续租失败，旧 Run 已安全中止：${error instanceof Error ? error.message : String(error)}`,
+          `Task ${task.id} 续租失败，旧 Run 已安全中止：${error instanceof Error ? error.message : String(error)}`,
           { cause: error },
         );
       }
       if (active.runController && !active.runController.signal.aborted) {
         active.runController.abort(leaseFailure);
       }
-      this.host.cancel(event.id, leaseFailure);
+      this.host.cancel(task.id, leaseFailure);
     }, Math.max(25, Math.floor(leaseMs / 3)));
     renew.unref();
     try {
-      this.attention.observeOwnerRoute(event);
-      const attention = this.attention.decide(event);
+      this.attention.observeOwnerRoute({
+        trust: event.trust,
+        kind: event.type === 'command.received' ? 'command' : 'ambient',
+        profileId: event.profileId,
+        replyRoute: event.replyRoute,
+      });
       const replyRoute = this.attention.replyRouteFor(event);
-      if (attention.action === 'ignore') {
-        this.store.completeEvent(event.id, this.workerId, { reason: attention.reason }, 'ignored');
-        return;
-      }
-      if (attention.action === 'digest') {
-        this.store.digestEvent(event.id, this.workerId, attention.reason);
-        return;
-      }
-      if (attention.action === 'notify') {
-        const text = typeof event.payload === 'string'
-          ? event.payload
-          : JSON.stringify(event.payload);
-        this.store.completeEvent(event.id, this.workerId, { reason: attention.reason, notified: true }, 'completed', {
-          route: replyRoute ?? { channel: 'system' },
-          payload: { text: text.slice(0, 4_000), eventId: event.id },
-        });
-        return;
-      }
-      const decision = attention.run;
+      const decision = this.attention.decideTask(task, event, active.authority);
       if (decision.action === 'ignore') {
-        this.store.completeEvent(event.id, this.workerId, { reason: decision.reason }, 'ignored');
+        this.store.completeTask(task.id, this.workerId, { reason: decision.reason });
         return;
       }
       const sessionId = decision.sessionId!;
-      this.store.bindRunningEventSession(event.id, this.workerId, sessionId);
+      this.store.bindRunningTaskSession(task.id, this.workerId, sessionId);
       if (this.activeSessions.has(sessionId)) {
-        const now = new Date();
-        this.store.preemptEvent(
-          event.id,
-          this.workerId,
-          `同 Session ${sessionId} 已有活动 Run，保持 FIFO 等待`,
-          now,
-          undefined,
-          new Date(now.getTime() + Math.max(25, this.options.pollMs ?? 250)),
-        );
+        this.store.requeueTask(task.id, this.workerId, `同 Session ${sessionId} 已有活动 Run，保持 FIFO 等待`);
         return;
       }
       active.sessionId = sessionId;
@@ -470,38 +454,47 @@ export class MimiDispatcher {
           runController.abort(new Error(`Agent 连续 ${runIdleTimeoutMs}ms 无进展，已中止并等待重试`));
         }, runIdleTimeoutMs);
       };
+      if (task.type !== 'scheduled') this.store.wakeWatches(decision.sessionId!, task.id);
+      const attempt = this.store.beginTaskAttempt(task.id, this.workerId, decision.sessionId!);
+      attemptId = attempt.id;
+      const executionKey = task.idempotencyKey.startsWith('migration:event:')
+        ? `event:${task.id}`
+        : `task:${task.id}`;
+      execution = { sessionId: decision.sessionId!, key: executionKey };
+      const deliveryControl: MimiDeliveryControl = { suppressed: false };
+      let completionDelivery: { suppressed: true; reason?: string } | undefined;
       const checkPreemption = () => {
-        if (runSignal.aborted || active.tools > 0) return;
+        if (!this.options.claimTaskTypes?.includes('conversation')) return;
+        if (preemptedBy || active.tools > 0 || runSignal.aborted) return;
         try {
-          const urgent = this.store.readyPreemptionCandidates(
-            this.attention.urgentPriority,
-            event.priority,
-            10,
-            new Date(),
-            event.executionLane ?? 'conversation',
-          )
-            .find((candidate) => {
-              const candidateDecision = this.attention.decide(candidate);
-              const ownerCorrection = candidate.trust === 'owner'
-                && candidate.kind === 'command'
-                && candidate.priority === event.priority
-                && candidateDecision.action === 'run'
-                && candidateDecision.run.sessionId === decision.sessionId;
-              const higherPriority = candidate.priority > event.priority
-                && candidate.priority >= this.attention.urgentPriority
-                && (candidateDecision.action === 'run' || candidateDecision.action === 'notify');
-              if (!ownerCorrection && !higherPriority) return false;
-              if (!this.store.reserveEventPreemption(candidate.id, event.id, new Date(), leaseMs)) return false;
-              preemptedBy = { id: candidate.id, priority: candidate.priority, ownerCorrection };
-              return true;
-          });
-          if (!urgent) return;
-          const reason = preemptedBy?.ownerCorrection
-            ? `当前任务被同 Session 的新 owner 命令 ${urgent.id} 打断`
-            : `当前任务被更高优先级事件 ${urgent.id}（priority ${urgent.priority}）抢占`;
-          runController.abort(preemptedBy?.ownerCorrection
-            ? new TerminalRunInterruptedError(reason)
-            : new Error(reason));
+          for (const reservedId of this.reservedPreemptions) {
+            if (this.store.getTask(reservedId)?.status !== 'queued') {
+              this.reservedPreemptions.delete(reservedId);
+            }
+          }
+          for (const candidate of this.store.readyTasks({ types: this.options.claimTaskTypes }, 50)) {
+            if (candidate.id === task.id || this.active.has(candidate.id)
+              || this.reservedPreemptions.has(candidate.id)) continue;
+            const candidateEvent = this.store.getImmutableEvent(candidate.triggerEventId ?? candidate.authorityEventId);
+            const candidateAuthority = this.store.getImmutableEvent(candidate.authorityEventId);
+            if (!candidateEvent || !candidateAuthority) continue;
+            const candidateDecision = this.attention.decideTask(candidate, candidateEvent, candidateAuthority);
+            if (candidateDecision.action !== 'run') continue;
+            const ownerCorrection = candidateEvent.trust === 'owner'
+              && candidateEvent.type === 'command.received'
+              && candidate.priority === task.priority
+              && candidateDecision.sessionId === decision.sessionId;
+            const urgent = candidate.priority > task.priority
+              && candidate.priority >= this.attention.urgentPriority;
+            if (!ownerCorrection && !urgent) continue;
+            this.reservedPreemptions.add(candidate.id);
+            preemptedBy = { id: candidate.id, priority: candidate.priority, ownerCorrection };
+            const reason = ownerCorrection
+              ? `当前任务被同 Session 的新 owner 命令 ${candidate.id} 打断`
+              : `当前任务被更高优先级 Task ${candidate.id}（priority ${candidate.priority}）抢占`;
+            runController.abort(ownerCorrection ? new TerminalRunInterruptedError(reason) : new Error(reason));
+            break;
+          }
         } catch (error) {
           process.stderr.write(`[MimiAgent] preemption check error: ${error instanceof Error ? error.message : String(error)}\n`);
         }
@@ -509,16 +502,9 @@ export class MimiDispatcher {
       checkPreemption();
       preemptTimer = setInterval(checkPreemption, this.options.preemptPollMs ?? 250);
       preemptTimer.unref();
-      if (event.kind !== 'schedule') this.store.wakeWatches(decision.sessionId!, event.id);
-      const hostRun = this.store.beginRun(event.id, decision.sessionId!);
-      hostRunId = hostRun.id;
-      const executionKey = `event:${event.id}`;
-      execution = { sessionId: decision.sessionId!, key: executionKey };
-      const deliveryControl: MimiDeliveryControl = { suppressed: false };
-      let completionDelivery: { suppressed: true; reason?: string } | undefined;
       refreshRunIdleWatchdog();
       const hostedRun = this.host.execute({
-        executionId: event.id,
+        executionId: task.id,
         sessionId: decision.sessionId!,
         input: decision.input!,
         signal: runSignal,
@@ -554,6 +540,7 @@ export class MimiDispatcher {
             attention: this.attention,
             connectors: this.connectors,
             connectorRuntime: this.options.connectorRuntime,
+            task,
             event,
             deliveryControl,
             replyRoute,
@@ -569,7 +556,7 @@ export class MimiDispatcher {
         },
       }, {
         onStreamEvent: (streamEvent) => {
-          this.options.onStreamEvent?.(event.id, streamEvent);
+          this.options.onStreamEvent?.(task.id, streamEvent);
           if (streamEvent.type === 'run_item_stream_event' && streamEvent.name === 'tool_called') {
             active.tools += 1;
             const item = streamEvent.item as unknown as Record<string, unknown>;
@@ -625,7 +612,7 @@ export class MimiDispatcher {
         },
         onRuntimeEvent: (runtimeEvent) => {
           refreshRunIdleWatchdog();
-          this.options.onRuntimeEvent?.(event.id, runtimeEvent);
+          this.options.onRuntimeEvent?.(task.id, runtimeEvent);
         },
       });
       this.abortForCancellationWhenSafe(active);
@@ -645,31 +632,26 @@ export class MimiDispatcher {
         if (active.blockRequested) {
           const blocked = active.blockRequested;
           const reason = blocked.reason ?? '后台任务需要用户输入';
-          this.store.blockRunningEvent(
-            event.id,
+          this.store.blockTask(
+            task.id,
             this.workerId,
             { answer: result.answer, question: blocked.question, reason, usage: result.usage },
             reason,
+            attempt.id,
+            new Date(),
             {
-              route: replyRoute ?? event.replyRoute ?? { channel: 'system' },
+              route: replyRoute ?? { channel: 'system' },
               payload: {
                 type: 'background_task_blocked',
-                eventId: event.id,
-                originSessionId: event.originSessionKey,
+                taskId: task.id,
                 question: blocked.question,
-                text: `MimiAgent 后台任务需要你的输入（${event.id}）：${blocked.question}`.slice(0, 4_000),
+                text: `MimiAgent 后台任务需要你的输入（${task.id}）：${blocked.question}`.slice(0, 4_000),
               },
             },
-            hostRun.id,
           );
           return;
         }
-        this.store.pauseRunningEvent(
-          event.id,
-          this.workerId,
-          active.pauseRequested!.reason,
-          hostRun.id,
-        );
+        this.store.settleTaskControl(task.id, this.workerId, attempt.id);
         return;
       }
       pauseRunIdleWatchdog();
@@ -677,20 +659,19 @@ export class MimiDispatcher {
         ? {
             route: replyRoute,
             payload: {
-              text: event.executionLane === 'task'
-                ? `MimiAgent 后台任务已完成（${event.id}）：${result.answer}`.slice(0, 4_000)
+              text: task.type !== 'conversation'
+                ? `MimiAgent 后台任务已完成（${task.id}）：${result.answer}`.slice(0, 4_000)
                 : result.answer,
-              eventId: event.id,
-              ...(event.executionLane === 'task' ? {
+              taskId: task.id,
+              ...(task.type !== 'conversation' ? {
                 type: 'background_task_completed',
-                originSessionId: event.originSessionKey,
               } : {}),
             },
           }
         : undefined;
       const sessionEffect = [...result.effects].reverse()
         .find((effect) => effect.type === 'session_changed');
-      this.store.completeEvent(event.id, this.workerId, {
+      this.store.completeTask(task.id, this.workerId, {
         answer: result.answer,
         sessionId: sessionEffect?.type === 'session_changed' ? sessionEffect.sessionId : decision.sessionId,
         effects: result.effects,
@@ -698,7 +679,7 @@ export class MimiDispatcher {
         ...(deliveryControl.suppressed ? {
           delivery: { suppressed: true, reason: deliveryControl.reason },
         } : {}),
-      }, 'completed', delivery, hostRun.id);
+      }, attempt.id, new Date(), delivery);
       await this.host.finalizeExecutionLedger(decision.sessionId!, executionKey).catch(() => undefined);
     } catch (error) {
       this.synchronizeDurableTaskControl(active);
@@ -707,9 +688,7 @@ export class MimiDispatcher {
         // Another worker may already own or recover this Event. Never mutate
         // durable state after losing the fencing lease.
       } else if (pendingCancellation) {
-        this.store.cancelRunningEvent(
-          event.id, this.workerId, pendingCancellation.reason, new Date(), hostRunId,
-        );
+        this.store.settleTaskControl(task.id, this.workerId, attemptId);
         if (execution) {
           const cancelledExecution = execution;
           await this.host.finalizeExecutionLedger(
@@ -723,78 +702,56 @@ export class MimiDispatcher {
         }
         const blocked = active.blockRequested;
         const reason = blocked.reason ?? '后台任务需要用户输入';
-        this.store.blockRunningEvent(
-          event.id,
+        this.store.blockTask(
+          task.id,
           this.workerId,
           { question: blocked.question, reason },
           reason,
+          attemptId,
+          new Date(),
           {
             route: event.replyRoute ?? { channel: 'system' },
             payload: {
               type: 'background_task_blocked',
-              eventId: event.id,
-              originSessionId: event.originSessionKey,
+              taskId: task.id,
               question: blocked.question,
-              text: `MimiAgent 后台任务需要你的输入（${event.id}）：${blocked.question}`.slice(0, 4_000),
+              text: `MimiAgent 后台任务需要你的输入（${task.id}）：${blocked.question}`.slice(0, 4_000),
             },
           },
-          hostRunId,
         );
       } else if (active.pauseRequested) {
         if (execution) {
           await this.host.reopenExecutionLedger(execution.sessionId, execution.key).catch(() => undefined);
         }
-        this.store.pauseRunningEvent(
-          event.id,
-          this.workerId,
-          active.pauseRequested.reason,
-          hostRunId,
-        );
+        this.store.settleTaskControl(task.id, this.workerId, attemptId);
       } else if (preemptedBy) {
         const reason = preemptedBy.ownerCorrection
           ? `被当前 Session 的新 owner 命令 ${preemptedBy.id} 取代`
-          : `被紧急事件 ${preemptedBy.id}（priority ${preemptedBy.priority}）抢占`;
+          : `被紧急 Task ${preemptedBy.id}（priority ${preemptedBy.priority}）抢占`;
         if (preemptedBy.ownerCorrection) {
-          this.store.supersedeEvent(
-            event.id, this.workerId, preemptedBy.id, reason, new Date(), hostRunId,
-          );
+          this.store.cancelTask(task.id, reason);
+          this.store.settleTaskControl(task.id, this.workerId, attemptId);
           if (execution) {
-            const interruptedExecution = execution;
-            await this.host.finalizeExecutionLedger(
-              interruptedExecution.sessionId,
-              interruptedExecution.key,
-            ).catch(() => undefined);
+            await this.host.finalizeExecutionLedger(execution.sessionId, execution.key).catch(() => undefined);
           }
         } else {
-          this.store.preemptEvent(event.id, this.workerId, reason, new Date(), hostRunId);
+          this.store.preemptTask(task.id, this.workerId, reason, attemptId);
         }
       } else if (error instanceof CompletionGateError) {
-        this.store.deferEventForCompletion(
-          event.id,
-          this.workerId,
-          `Completion Gate 未通过：${error.message}`,
-          new Date(),
-          hostRunId,
-          error.progressFingerprint,
-          true,
-        );
+        this.store.failTask(task.id, this.workerId, error, attemptId, new Date(), false);
       } else if (this.stopRequested && active.runController?.signal.aborted) {
-        this.store.preemptEvent(
-          event.id,
-          this.workerId,
-          'MimiAgent Dispatcher 正在停止，任务已安全重排队',
-          new Date(),
-          hostRunId,
-        );
+        this.store.requeueTask(task.id, this.workerId, 'MimiAgent Dispatcher 正在停止，任务已安全重排队', attemptId);
       } else {
         const configuredMaxAttempts = this.options.maxAttempts ?? 5;
-        this.store.failEvent(
-          event.id,
+        const attemptLimit = eventFailureAttemptLimit(error, task.attemptCount, configuredMaxAttempts);
+        this.store.failTask(
+          task.id,
           this.workerId,
           error,
-          eventFailureAttemptLimit(error, event.attempts, configuredMaxAttempts),
+          attemptId,
           new Date(),
-          hostRunId,
+          task.attemptCount < attemptLimit,
+          'dead_letter',
         );
       }
     } finally {
@@ -802,7 +759,7 @@ export class MimiDispatcher {
       if (runIdleTimer) clearTimeout(runIdleTimer);
       clearInterval(renew);
       active.tools = 0;
-      this.active.delete(event.id);
+      this.active.delete(task.id);
       if (active.sessionId) {
         this.activeSessions.delete(active.sessionId);
       }
@@ -816,44 +773,9 @@ export class MimiDispatcher {
     }
   }
 
-  private cancelAfterStateChange(eventId: string, reason: string): EventCancelResult {
-    const event = this.store.getEvent(eventId);
-    if (!event) return { state: 'not_found' };
-    if (TERMINAL_EVENT_STATUSES.has(event.status)) return { state: 'already_terminal' };
-    const active = this.active.get(eventId);
-    if (event.status === 'running' && active) {
-      if (event.executionLane === 'task') {
-        const requested = this.store.requestRunningTaskControl(eventId, 'cancel', reason);
-        if (!requested) return { state: 'not_found' };
-      }
-      if (!active.cancelRequested) active.cancelRequested = { reason };
-      active.pauseRequested = undefined;
-      this.abortForCancellationWhenSafe(active);
-      return { state: 'cancelled' };
-    }
-    return { state: 'not_found' };
-  }
-
-  private pauseAfterStateChange(eventId: string, reason: string): BackgroundTaskPauseResult {
-    const event = this.store.getEvent(eventId);
-    if (!event || event.executionLane !== 'task') return { state: 'not_found' };
-    if (event.status === 'paused') return { state: 'already_paused' };
-    if (TERMINAL_EVENT_STATUSES.has(event.status)) return { state: 'already_terminal' };
-    const active = this.active.get(eventId);
-    if (event.status === 'running' && active) {
-      const requested = this.store.requestRunningTaskControl(eventId, 'pause', reason);
-      if (!requested || requested.taskControl === 'cancel') return { state: 'not_pauseable' };
-      if (!active.pauseRequested) active.pauseRequested = { reason };
-      this.abortForPauseWhenSafe(active);
-      return { state: 'paused' };
-    }
-    return { state: 'not_pauseable' };
-  }
-
   private synchronizeDurableTaskControl(active: ActiveExecution): void {
-    if (active.event.executionLane !== 'task') return;
     try {
-      const control = this.store.taskControl(active.event.id);
+      const control = this.store.taskControl(active.task.id);
       if (!control) return;
       if (control.intent === 'cancel') {
         active.cancelRequested = { reason: control.reason };
@@ -867,7 +789,7 @@ export class MimiDispatcher {
       }
     } catch (error) {
       process.stderr.write(
-        `[MimiAgent] task control sync error ${active.event.id}: ${error instanceof Error ? error.message : String(error)}\n`,
+        `[MimiAgent] task control sync error ${active.task.id}: ${error instanceof Error ? error.message : String(error)}\n`,
       );
     }
   }
@@ -876,7 +798,7 @@ export class MimiDispatcher {
     const cancellation = active.cancelRequested;
     if (!cancellation || active.tools > 0) return;
     active.runController?.abort(new TerminalRunInterruptedError(cancellation.reason));
-    this.host.cancel(active.event.id, new TerminalRunInterruptedError(cancellation.reason));
+    this.host.cancel(active.task.id, new TerminalRunInterruptedError(cancellation.reason));
   }
 
   private abortForPauseWhenSafe(active: ActiveExecution): void {
@@ -884,7 +806,7 @@ export class MimiDispatcher {
     if (!pause || active.tools > 0) return;
     const reason = new Error(pause.reason);
     active.runController?.abort(reason);
-    this.host.cancel(active.event.id, reason);
+    this.host.cancel(active.task.id, reason);
   }
 
   private abortForBlockWhenSafe(active: ActiveExecution): void {
@@ -892,7 +814,7 @@ export class MimiDispatcher {
     if (!blocked || active.tools > 0) return;
     const reason = new Error(blocked.reason ?? '后台任务正在等待用户输入');
     active.runController?.abort(reason);
-    this.host.cancel(active.event.id, reason);
+    this.host.cancel(active.task.id, reason);
   }
 
   private runMaintenanceIfDue(now = new Date()): void {

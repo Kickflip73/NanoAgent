@@ -1,9 +1,7 @@
-import { isDeepStrictEqual } from 'node:util';
 import { tool, type Tool } from '@openai/agents';
 import { z } from 'zod';
-import { sessionIdFor } from './policy.js';
 import { MimiStore } from './store.js';
-import type { ReplyRoute, ScheduleRecord, StoredEvent } from './types.js';
+import type { ImmutableEvent, ReplyRoute, ScheduleRecord, TaskRecord } from './types.js';
 
 const MAX_ENABLED_SCHEDULES = 100;
 const MIN_FOLLOW_UP_DELAY_MS = 5_000;
@@ -17,17 +15,9 @@ function assertScheduleCapacity(store: MimiStore): void {
   }
 }
 
-function conversationAuthority(store: MimiStore, event: StoredEvent): StoredEvent {
-  const authorityId = event.executionLane === 'task'
-    ? event.rootEventId ?? event.parentEventId
-    : event.id;
-  const authority = authorityId ? store.getEvent(authorityId) : undefined;
-  if (
-    !authority
-    || (authority.executionLane ?? 'conversation') !== 'conversation'
-    || authority.parentEventId !== undefined
-    || authority.rootEventId !== undefined
-  ) {
+function conversationAuthority(store: MimiStore, task: TaskRecord): ImmutableEvent {
+  const authority = store.getImmutableEvent(task.authorityEventId);
+  if (!authority) {
     throw new Error('创建 Schedule 需要仍可验证的原始 Conversation authority Event');
   }
   return authority;
@@ -35,14 +25,18 @@ function conversationAuthority(store: MimiStore, event: StoredEvent): StoredEven
 
 function baseSchedule(
   store: MimiStore,
-  event: StoredEvent,
+  task: TaskRecord,
+  event: ImmutableEvent,
   fallbackRoute?: ReplyRoute,
   activeSessionKey?: string,
 ) {
-  const authority = conversationAuthority(store, event);
-  const sessionKey = event.executionLane === 'task'
-    ? event.originSessionKey ?? authority.sessionKey ?? sessionIdFor(authority)
-    : activeSessionKey ?? sessionIdFor(authority);
+  const authority = conversationAuthority(store, task);
+  const objective = task.objective && typeof task.objective === 'object'
+    ? task.objective as Record<string, unknown>
+    : {};
+  const sessionKey = typeof objective.originSessionId === 'string'
+    ? objective.originSessionId
+    : activeSessionKey ?? task.sessionKey;
   return {
     profileId: authority.profileId,
     sessionKey,
@@ -56,46 +50,24 @@ function sameRoute(left: ReplyRoute | undefined, right: ReplyRoute | undefined):
   return left?.channel === right?.channel && left?.target === right?.target;
 }
 
-function sameScheduleEventIdentity(stored: StoredEvent, event: StoredEvent): boolean {
-  return stored.id === event.id
-    && stored.externalId === event.externalId
-    && stored.source === event.source
-    && stored.kind === event.kind
-    && stored.trust === event.trust
-    && isDeepStrictEqual(stored.actor, event.actor)
-    && isDeepStrictEqual(stored.conversation, event.conversation)
-    && isDeepStrictEqual(stored.payload, event.payload)
-    && stored.occurredAt === event.occurredAt
-    && stored.receivedAt === event.receivedAt
-    && stored.priority === event.priority
-    && stored.profileId === event.profileId
-    && stored.sessionKey === event.sessionKey
-    && stored.originSessionKey === event.originSessionKey
-    && stored.parentEventId === event.parentEventId
-    && stored.rootEventId === event.rootEventId
-    && stored.taskDepth === event.taskDepth
-    && isDeepStrictEqual(stored.replyRoute, event.replyRoute)
-    && stored.executionLane === event.executionLane;
-}
-
 export function isAuthenticScheduleTask(
   store: MimiStore,
   schedule: ScheduleRecord,
-  event: StoredEvent,
+  task: TaskRecord,
+  event: ImmutableEvent,
 ): boolean {
-  const stored = store.getEvent(event.id);
-  if (!stored || !sameScheduleEventIdentity(stored, event)) return false;
-  if (event.kind !== 'schedule' || !event.payload || typeof event.payload !== 'object') return false;
-  const payload = event.payload as Record<string, unknown>;
+  const storedTask = store.getTask(task.id);
+  const storedEvent = store.getImmutableEvent(event.id);
+  if (!storedTask || !storedEvent || task.type !== 'scheduled') return false;
+  const payload = task.objective && typeof task.objective === 'object'
+    ? task.objective as Record<string, unknown>
+    : {};
   return event.source === `schedule:${schedule.id}`
     && event.externalId === `${schedule.id}:${event.occurredAt}`
-    && event.executionLane === 'task'
-    && event.sessionKey === `mimi-task-${event.id}`
-    && event.originSessionKey === schedule.sessionKey
-    && event.parentEventId === schedule.authorityEventId
-    && event.rootEventId === schedule.authorityEventId
-    && event.taskDepth === 1
-    && event.profileId === schedule.profileId
+    && task.triggerEventId === event.id
+    && task.authorityEventId === schedule.authorityEventId
+    && task.sessionKey === `mimi-task-${task.id}`
+    && task.profileId === schedule.profileId
     && event.trust === schedule.trust
     && sameRoute(event.replyRoute, schedule.replyRoute ?? { channel: 'system' })
     && payload.type === 'scheduled_task'
@@ -108,19 +80,20 @@ export function isAuthenticScheduleTask(
     && payload.workspaceAccess === 'write';
 }
 
-function currentSchedule(store: MimiStore, event: StoredEvent): ScheduleRecord | undefined {
-  const payload = event.payload && typeof event.payload === 'object'
-    ? event.payload as Record<string, unknown>
+function currentSchedule(store: MimiStore, task: TaskRecord, event: ImmutableEvent): ScheduleRecord | undefined {
+  const payload = task.objective && typeof task.objective === 'object'
+    ? task.objective as Record<string, unknown>
     : undefined;
   if (typeof payload?.scheduleId !== 'string') return undefined;
   const schedule = store.getSchedule(payload.scheduleId);
   if (!schedule || (schedule.type !== 'interval' && schedule.type !== 'watch')) return undefined;
-  return isAuthenticScheduleTask(store, schedule, event) ? schedule : undefined;
+  return isAuthenticScheduleTask(store, schedule, task, event) ? schedule : undefined;
 }
 
 export function createMimiScheduleTools(
   store: MimiStore,
-  event: StoredEvent,
+  task: TaskRecord,
+  event: ImmutableEvent,
   fallbackRoute?: ReplyRoute,
   activeSessionKey?: string,
 ): Tool[] {
@@ -140,7 +113,7 @@ export function createMimiScheduleTools(
       if (target < now + MIN_FOLLOW_UP_DELAY_MS) throw new Error('后续唤醒至少应在 5 秒之后');
       if (target > now + MAX_FOLLOW_UP_DELAY_MS) throw new Error('后续唤醒不能超过 5 年');
       return store.addSchedule({
-        ...baseSchedule(store, event, fallbackRoute, activeSessionKey),
+        ...baseSchedule(store, task, event, fallbackRoute, activeSessionKey),
         name, prompt, type: 'at', value: new Date(target).toISOString(),
         nextRunAt: new Date(target).toISOString(),
       });
@@ -159,7 +132,7 @@ export function createMimiScheduleTools(
       assertScheduleCapacity(store);
       const interval = everyMinutes * 60_000;
       return store.addSchedule({
-        ...baseSchedule(store, event, fallbackRoute, activeSessionKey),
+        ...baseSchedule(store, task, event, fallbackRoute, activeSessionKey),
         name, prompt, type: 'interval', value: String(interval),
         nextRunAt: new Date(Date.now() + interval).toISOString(),
       });
@@ -185,7 +158,7 @@ export function createMimiScheduleTools(
         '直接使用可用工具完成能推进的步骤。若结束条件已成立，调用 complete_current_mimi_schedule 停止后续检查并汇报结果；若尚未成立且没有值得 owner 关注的新变化，调用 finish_mimi_silently。',
       ].join('\n');
       return store.addSchedule({
-        ...baseSchedule(store, event, fallbackRoute, activeSessionKey),
+        ...baseSchedule(store, task, event, fallbackRoute, activeSessionKey),
         name, prompt, type: 'watch', value: String(interval),
         nextRunAt: new Date(Date.now() + interval).toISOString(),
       });
@@ -206,7 +179,7 @@ export function createMimiScheduleTools(
     execute: async ({ id }) => ({ id, removed: store.removeSchedule(id) }),
   });
 
-  const activeSchedule = currentSchedule(store, event);
+  const activeSchedule = currentSchedule(store, task, event);
   const completeCurrent = activeSchedule ? [tool({
     name: 'complete_current_mimi_schedule',
     description: '仅当本次周期巡检的目标或结束条件已经明确达成时，完成并停止当前计划，防止继续无意义轮询。无需查找或传入计划 ID。',

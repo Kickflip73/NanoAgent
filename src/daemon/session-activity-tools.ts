@@ -15,20 +15,20 @@ export function createMimiSessionActivityTools(store: MimiStore, sessionKey: str
       if (!query) return activities.slice(0, limit);
       const wanted = query.toLocaleLowerCase();
       return activities.filter((activity) => [
-        activity.source, activity.answer, activity.error, activity.eventStatus, activity.runStatus,
+        activity.source, activity.answer, activity.error, activity.taskStatus, activity.runStatus,
       ].some((value) => value?.toLocaleLowerCase().includes(wanted))).slice(0, limit);
     },
   });
   const cancelInterrupted = tool({
     name: 'cancel_interrupted_mimi_task',
-    description: '取消当前 Session 中已被新 owner 命令打断并重新排队的旧任务。先用 inspect_mimi_session_activity 找到 eventId；只能取消当前 Session 的 interrupted 任务，不能影响其他会话或正在执行的事务。',
+    description: '取消当前 Session 中已被新 owner 命令打断并重新排队的旧任务。先用 inspect_mimi_session_activity 找到 taskId；只能取消当前 Session 的 interrupted 任务，不能影响其他会话或正在执行的事务。',
     parameters: z.object({
-      eventId: z.string().uuid(),
+      taskId: z.string().uuid(),
       reason: z.string().trim().min(1).max(500),
     }),
-    execute: async ({ eventId, reason }) => ({
-      eventId,
-      cancelled: store.cancelInterruptedSessionEvent(sessionKey, eventId, reason),
+    execute: async ({ taskId, reason }) => ({
+      taskId,
+      cancelled: store.cancelInterruptedSessionTask(sessionKey, taskId, reason),
     }),
   });
   return [inspect, cancelInterrupted];

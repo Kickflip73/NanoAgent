@@ -14,7 +14,7 @@ export interface BackgroundTaskSummary {
   workspaceAccess?: 'read' | 'write';
   sessionId?: string;
   originSessionId?: string;
-  parentEventId?: string;
+  parentTaskId?: string;
   depth?: number;
   attempts?: number;
   createdAt?: string;
@@ -70,6 +70,7 @@ export type BackgroundTaskResumeResult =
 
 export interface CommandTarget {
   readonly currentSessionId: string;
+  readonly sessionReady?: boolean;
   readonly toolNames: MaybePromise<string[]>;
   runtimeInfo(): ReturnType<MimiAgent['runtimeInfo']>;
   availableModels(): MaybePromise<ReturnType<MimiAgent['availableModels']>>;
@@ -77,6 +78,7 @@ export interface CommandTarget {
   availableModes(): MaybePromise<ReturnType<MimiAgent['availableModes']>>;
   switchMode(mode: string): ReturnType<MimiAgent['switchMode']>;
   switchSession(sessionId: string): ReturnType<MimiAgent['switchSession']>;
+  prepareNewSession?(sessionId?: string): MaybePromise<void>;
   listSessionSummaries(): ReturnType<MimiAgent['listSessionSummaries']>;
   history(): ReturnType<MimiAgent['history']>;
   clearSession(): ReturnType<MimiAgent['clearSession']>;
@@ -240,7 +242,7 @@ function taskDetails(task: BackgroundTaskSummary): string {
     task.workspaceAccess ? `工作区    ${task.workspaceAccess === 'read' ? '只读' : '可写（独占）'}` : '',
     task.sessionId ? `任务会话  ${task.sessionId}` : '',
     task.originSessionId ? `来源会话  ${task.originSessionId}` : '',
-    task.parentEventId ? `父任务    ${task.parentEventId}` : '',
+    task.parentTaskId ? `父任务    ${task.parentTaskId}` : '',
     task.depth !== undefined ? `委派深度  ${task.depth}` : '',
     task.attempts !== undefined ? `尝试次数  ${task.attempts}` : '',
     task.worker ? `工作进程  ${task.worker.pid ?? task.worker.workerId ?? '启动中'}` : '',
@@ -273,6 +275,10 @@ export class CommandHandler {
 
     if (command === '/exit') return 'exit';
     if (command === '/help') return this.handled(HELP);
+    const draftSafeCommands = new Set(['/new', '/sessions', '/session', '/switch', '/tasks', '/task']);
+    if (this.agent.sessionReady === false && !draftSafeCommands.has(command ?? '')) {
+      return this.handled('当前是尚未创建的新对话。发送第一条消息后才会创建 Session；也可以先用 /sessions 切换到已有对话。');
+    }
     if (command === '/status') {
       const info = await this.agent.runtimeInfo();
       const executionAccess = info.mode.id === 'plan'
@@ -324,7 +330,8 @@ export class CommandHandler {
       return this.handled(`已切换输出等级：${level.label}（${level.id}）`);
     }
     if (command === '/new') {
-      await this.agent.switchSession(argument || randomUUID().slice(0, 8));
+      if (this.agent.prepareNewSession) await this.agent.prepareNewSession(argument || undefined);
+      else await this.agent.switchSession(argument || randomUUID().slice(0, 8));
       await this.ui.resetScreen?.();
       return this.handled('新对话已就绪。');
     }

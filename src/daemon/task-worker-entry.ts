@@ -62,8 +62,8 @@ async function run(raw: unknown): Promise<void> {
   }, 10_000);
   heartbeat.unref();
   try {
-    const task = store.getEvent(init.taskId);
-    if (!task || task.executionLane !== 'task' || !task.sessionKey) {
+    const task = store.getTask(init.taskId);
+    if (!task || !task.sessionKey) {
       throw new Error(`后台任务不存在或缺少 Task Session：${init.taskId}`);
     }
     if (init.executor === 'codex') {
@@ -102,14 +102,14 @@ async function run(raw: unknown): Promise<void> {
       for (const name of Object.keys(init.mcpEnvironment)) init.mcpEnvironment[name] = '';
       for (const name of Object.keys(mcpEnvironment)) mcpEnvironment[name] = '';
     }
-    const payload = task.payload && typeof task.payload === 'object'
-      ? task.payload as Record<string, unknown>
+    const payload = task.objective && typeof task.objective === 'object'
+      ? task.objective as Record<string, unknown>
       : {};
     if (payload.strategy === 'team') await agent.switchMode('ultra');
     host = new MimiHost(agent, undefined, { maxConcurrentSessions: 1 });
     dispatcher = new MimiDispatcher(store, host, attention, undefined, undefined, {
-      maxConcurrentEvents: 1,
-      claimExecutionLane: 'task',
+      maxConcurrentTasks: 1,
+      claimTaskTypes: ['background', 'scheduled', 'briefing', 'memory_maintenance'],
       connectorRuntime: new KernelConnectorRuntime(init.socket, init.taskId, init.workerToken),
       onStreamEvent: (eventId, event) => {
         const streamed = mimiStreamEvent(event);
@@ -132,21 +132,21 @@ async function run(raw: unknown): Promise<void> {
       workerId: dispatcher.workerId,
       pid: process.pid,
     });
-    const processed = await dispatcher.processEventById(init.taskId);
+    const processed = await dispatcher.processTaskById(init.taskId);
     await send({
       type: 'done',
       taskId: init.taskId,
       processed,
-      status: store.getEvent(init.taskId)?.status,
+      status: store.getTask(init.taskId)?.status,
     });
   } catch (error) {
     try {
-      const task = store.getEvent(init.taskId);
-      if (task?.executionLane === 'task' && task.status === 'queued') {
+      const task = store.getTask(init.taskId);
+      if (task?.status === 'queued') {
         const bootstrapOwner = `task-bootstrap-${process.pid}`;
-        const claimed = store.claimEventById(init.taskId, bootstrapOwner);
+        const claimed = store.claimTaskById(init.taskId, bootstrapOwner);
         if (claimed) {
-          store.failEvent(
+          store.failTask(
             init.taskId,
             bootstrapOwner,
             new Error(`Task worker 初始化失败：${safeError(error)}`),
@@ -179,17 +179,18 @@ async function runCodexTask(
   store: MimiStore,
 ): Promise<void> {
   const workerId = `codex-${process.pid}-${init.taskId.slice(0, 8)}`;
-  const claimed = store.claimEventById(init.taskId, workerId, 60_000);
+  const claimed = store.claimTaskById(init.taskId, workerId, 60_000);
   if (!claimed) {
     throw new Error(`Codex Task ${init.taskId} 无法取得执行租约`);
   }
+  store.beginTaskAttempt(init.taskId, workerId, claimed.sessionKey ?? `mimi-task-${init.taskId}`);
   await send({ type: 'started', taskId: init.taskId, workerId, pid: process.pid });
   const lease = setInterval(() => {
     try {
       const control = store.taskControl(init.taskId);
       if (control) {
         codexController?.abort(new Error(control.reason));
-      } else if (!store.renewEventLease(init.taskId, workerId, 60_000)) {
+      } else if (!store.renewTaskLease(init.taskId, workerId, 60_000)) {
         codexController?.abort(new Error('Codex Task 租约已失效'));
       }
     } catch (error) {
@@ -198,8 +199,8 @@ async function runCodexTask(
   }, 10_000);
   lease.unref();
   codexController = new AbortController();
-  const payload = claimed.payload && typeof claimed.payload === 'object'
-    ? claimed.payload as Record<string, unknown>
+  const payload = claimed.objective && typeof claimed.objective === 'object'
+    ? claimed.objective as Record<string, unknown>
     : {};
   const codexState = payload.codex && typeof payload.codex === 'object' && !Array.isArray(payload.codex)
     ? payload.codex as Record<string, unknown>
@@ -234,11 +235,11 @@ async function runCodexTask(
     });
     store.handoffCodexTaskToMimi(init.taskId, workerId, result);
   } catch (error) {
-    const current = store.getEvent(init.taskId);
-    if (current?.taskControl) {
-      store.failEvent(init.taskId, workerId, error);
+    const current = store.getTask(init.taskId);
+    if (current?.controlIntent) {
+      store.settleTaskControl(init.taskId, workerId);
     } else if (shutdownRequested) {
-      store.preemptEvent(init.taskId, workerId, 'Codex worker 正在停止，任务已安全重排队');
+      store.failTask(init.taskId, workerId, new Error('Codex worker 正在停止，任务已安全重排队'));
     } else {
       store.handoffCodexTaskToMimi(init.taskId, workerId, {
         error: error instanceof Error ? error.message : String(error),
@@ -250,7 +251,7 @@ async function runCodexTask(
   }
   await send({
     type: 'done', taskId: init.taskId, processed: true,
-    status: store.getEvent(init.taskId)?.status,
+    status: store.getTask(init.taskId)?.status,
   });
 }
 

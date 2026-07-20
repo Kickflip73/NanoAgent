@@ -15,7 +15,6 @@ export function createMimiBriefingTools(attention: AttentionEngine): Tool[] {
       return {
         created: true,
         eventId: event.id,
-        sessionKey: event.sessionKey,
         replyChannel: event.replyRoute?.channel,
       };
     },

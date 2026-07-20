@@ -23,13 +23,14 @@ import {
   type BackgroundTaskPauseResult,
 } from './task-tools.js';
 import { MimiStore } from './store.js';
-import type { ReplyRoute, StoredEvent } from './types.js';
+import type { ImmutableEvent, ReplyRoute, TaskRecord } from './types.js';
 import type { EventCancelResult } from './dispatcher.js';
 
 export interface MimiHostToolContext {
   store: MimiStore;
   attention: AttentionEngine;
-  event: StoredEvent;
+  task: TaskRecord;
+  event: ImmutableEvent;
   deliveryControl: MimiDeliveryControl;
   sessionId: string;
   connectors?: ConnectorManager;
@@ -49,16 +50,17 @@ export function createMimiHostTools(context: MimiHostToolContext): Tool[] {
     ...createMimiActivityTools(context.store),
     ...createMimiAttentionRuleTools(context.attention),
     ...createMimiBriefingTools(context.attention),
-    ...createMimiDeliveryTools(context.event, context.deliveryControl),
+    ...createMimiDeliveryTools(context.task, context.event, context.deliveryControl),
     ...createMimiPeopleTools(context.attention),
     ...createMimiRoutineTools(context.attention),
-    ...createMimiScheduleTools(context.store, context.event, context.replyRoute, context.sessionId),
+    ...createMimiScheduleTools(context.store, context.task, context.event, context.replyRoute, context.sessionId),
     ...createMimiSessionActivityTools(context.store, context.sessionId),
     ...createMimiSettingsTools(context.attention),
     ...createMimiSourcePolicyTools(context.attention),
     ...createMimiStandingOrderTools(context.attention),
     ...createBackgroundTaskTools({
       store: context.store,
+      task: context.task,
       event: context.event,
       sessionId: context.sessionId,
       replyRoute: context.replyRoute,
@@ -93,21 +95,33 @@ export function createMimiCommandHostTools(
   sessionId: string,
 ): Tool[] {
   const timestamp = new Date().toISOString();
-  const event: StoredEvent = {
+  const event: ImmutableEvent = {
     id: 'mimi-cli-tool-catalog',
     externalId: 'mimi-cli-tool-catalog',
     source: 'local-cli',
-    kind: 'command',
+    type: 'command.received',
     trust: 'owner',
     payload: {},
     occurredAt: timestamp,
     receivedAt: timestamp,
-    priority: 100,
+    profileId: 'owner',
+    createdAt: timestamp,
+  };
+  const task: TaskRecord = {
+    id: 'mimi-cli-tool-catalog-task',
+    type: 'conversation',
+    idempotencyKey: 'mimi-cli-tool-catalog-task',
+    authorityEventId: event.id,
     profileId: 'owner',
     sessionKey: sessionId,
+    objective: {},
+    executor: 'session_actor',
+    workspaceAccess: 'write',
+    priority: 100,
     status: 'running',
-    attempts: 1,
     notBefore: timestamp,
+    attemptCount: 1,
+    maxAttempts: 1,
     createdAt: timestamp,
     updatedAt: timestamp,
   };
@@ -115,6 +129,7 @@ export function createMimiCommandHostTools(
     store,
     attention,
     connectors,
+    task,
     event,
     deliveryControl: { suppressed: false },
     sessionId,

@@ -6,13 +6,13 @@ export function daemonHelp(): string {
   mimi daemon status                      查看状态
   mimi daemon doctor                      检查本机就绪度与下一步
   mimi daemon activity [数量]              查看积压、失败与近期活动
-  mimi daemon events [数量]                查看事件
+  mimi daemon events [数量]                查看不可变事件时间线
+  mimi daemon tasks [数量]                 查看任务队列与执行状态
   mimi daemon runs [数量]                  查看执行尝试
   mimi daemon outbox [数量]                查看待投递与投递历史
-  mimi daemon show <类型> <id>             查看 event/run/outbox/schedule 完整详情
-  mimi daemon retry event <id>             重新排队失败事件
+  mimi daemon show <类型> <id>             查看 event/task/run/outbox/schedule 完整详情
+  mimi daemon retry task <id>              重新排队 dead-letter Task
   mimi daemon retry outbox <id>            重新投递失败消息（可能重复）
-  mimi daemon archive event <id>           归档失败事件
   mimi daemon archive outbox <id>          归档失败投递
   mimi daemon connectors [reload]          查看或重载 Connector 在线状态和可执行能力
   mimi daemon attention [reload]           查看或重载注意力策略
@@ -97,17 +97,22 @@ export async function runDaemonCommand(config: AppConfig, args: string[]): Promi
     const wait = args.includes('--wait');
     const text = args.slice(1).filter((arg) => arg !== '--wait').join(' ').trim();
     if (!text) throw new Error('请提供要提交的任务');
-    const submitted = await mimiRpc<{ event: { id: string }; inserted: boolean }>(socket, 'submit', { text });
+    const submitted = await mimiRpc<{ event: { id: string }; task?: { id: string }; inserted: boolean }>(socket, 'submit', { text });
     if (!wait) {
       output(submitted);
       return;
     }
-    const { waitForRemoteEvent } = await import('./service.js');
-    output(await waitForRemoteEvent(config, submitted.event.id));
+    if (!submitted.task) throw new Error('MimiAgent 没有为命令创建 Task');
+    const { waitForRemoteTask } = await import('./service.js');
+    output(await waitForRemoteTask(config, submitted.task.id));
     return;
   }
   if (command === 'events') {
     output(await mimiRpc(socket, 'events.list', { limit: Number(args[1] ?? 20) }));
+    return;
+  }
+  if (command === 'tasks') {
+    output(await mimiRpc(socket, 'tasks.list', { limit: Number(args[1] ?? 20) }));
     return;
   }
   if (command === 'runs') {
@@ -122,12 +127,13 @@ export async function runDaemonCommand(config: AppConfig, args: string[]): Promi
     const entity = args[1];
     const methods = {
       event: 'event.get',
+      task: 'tasks.get',
       run: 'run.get',
       outbox: 'outbox.get',
       schedule: 'schedule.get',
     } as const;
     if (!entity || !Object.hasOwn(methods, entity)) {
-      throw new Error('show 仅支持 event、run、outbox 或 schedule');
+      throw new Error('show 仅支持 event、task、run、outbox 或 schedule');
     }
     const id = args[2]?.trim();
     if (!id) throw new Error(`请提供要查看的 ${entity} id`);
@@ -138,7 +144,8 @@ export async function runDaemonCommand(config: AppConfig, args: string[]): Promi
   }
   if (command === 'retry' || command === 'archive') {
     const entity = args[1];
-    if (entity !== 'event' && entity !== 'outbox') throw new Error(`${command} 仅支持 event 或 outbox`);
+    const supported = command === 'retry' ? ['task', 'outbox'] : ['outbox'];
+    if (!entity || !supported.includes(entity)) throw new Error(`${command} 仅支持 ${supported.join(' 或 ')}`);
     const id = args[2]?.trim();
     if (!id) throw new Error(`请提供要${command === 'retry' ? '重试' : '归档'}的 ${entity} id`);
     output(await mimiRpc(socket, `${entity}.${command}`, { id }));

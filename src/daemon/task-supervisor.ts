@@ -57,7 +57,7 @@ export interface TaskWorkerSnapshot {
   workspaceAccess: 'read' | 'write';
 }
 
-const TERMINAL = new Set(['completed', 'ignored', 'digested', 'dead_letter', 'archived']);
+const TERMINAL = new Set(['completed', 'failed', 'cancelled', 'dead_letter']);
 const TASK_SAFE_BASE_ENVIRONMENT = new Set((process.platform === 'win32'
   ? ['PATH', 'SYSTEMROOT', 'COMSPEC', 'PATHEXT', 'TEMP', 'TMP', 'USERPROFILE']
   : ['PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'TMPDIR', 'LANG', 'LC_ALL'])
@@ -94,15 +94,9 @@ function taskEmbeddingCredential(
 }
 
 function hasOwnerConversationRoot(store: MimiStore, taskId: string): boolean {
-  const task = store.getEvent(taskId);
-  if (!task || task.executionLane !== 'task') return false;
-  const authorityId = task.rootEventId ?? task.parentEventId;
-  if (!authorityId) return false;
-  const authority = store.getEvent(authorityId);
-  return authority?.trust === 'owner'
-    && (authority.executionLane ?? 'conversation') === 'conversation'
-    && authority.parentEventId === undefined
-    && authority.rootEventId === undefined;
+  const task = store.getTask(taskId);
+  return task !== undefined
+    && store.getImmutableEvent(task.authorityEventId)?.trust === 'owner';
 }
 
 function equalWorkerToken(left: string, right: string): boolean {
@@ -213,11 +207,10 @@ export class TaskProcessSupervisor {
   authorizeWorker(taskId: string, workerToken: string): boolean {
     const worker = this.workers.get(taskId);
     if (!worker || !worker.workerId || !equalWorkerToken(worker.workerToken, workerToken)) return false;
-    const event = this.store.getEvent(taskId);
-    const leaseUntil = Date.parse(event?.leaseUntil ?? '');
-    return event?.executionLane === 'task'
-      && event.status === 'running'
-      && event.leaseOwner === worker.workerId
+    const task = this.store.getTask(taskId);
+    const leaseUntil = Date.parse(task?.leaseUntil ?? '');
+    return task?.status === 'running'
+      && task.leaseOwner === worker.workerId
       && Number.isFinite(leaseUntil)
       && leaseUntil > Date.now();
   }
@@ -230,67 +223,25 @@ export class TaskProcessSupervisor {
   }
 
   cancel(taskId: string, reason = 'owner 取消了后台任务'): EventCancelResult {
-    const event = this.store.getEvent(taskId);
-    if (!event || event.executionLane !== 'task') return { state: 'not_found' };
-    if (TERMINAL.has(event.status)) return { state: 'already_terminal' };
-    if (['queued', 'paused', 'blocked'].includes(event.status)) {
-      if (this.store.cancelQueuedEvent(taskId, reason)) {
-        const worker = this.workers.get(taskId);
-        if (worker) this.sendControl(worker, { type: 'cancel', taskId, reason });
-        return { state: 'cancelled' };
-      }
-      const changed = this.store.getEvent(taskId);
-      if (!changed) return { state: 'not_found' };
-      if (TERMINAL.has(changed.status) || changed.status === 'paused' || changed.status === 'blocked') {
-        return { state: 'already_terminal' };
-      }
-    }
-    const requested = this.store.requestRunningTaskControl(taskId, 'cancel', reason);
-    if (!requested) {
-      const changed = this.store.getEvent(taskId);
-      if (!changed) return { state: 'not_found' };
-      if (TERMINAL.has(changed.status) || changed.status === 'paused' || changed.status === 'blocked') {
-        return { state: 'already_terminal' };
-      }
-      return { state: 'not_found' };
-    }
+    const task = this.store.getTask(taskId);
+    if (!task) return { state: 'not_found' };
+    if (TERMINAL.has(task.status)) return { state: 'already_terminal' };
+    this.store.cancelTask(taskId, reason);
     const worker = this.workers.get(taskId);
     if (worker) this.sendControl(worker, { type: 'cancel', taskId, reason });
     return { state: 'cancelled' };
   }
 
   pause(taskId: string, reason = 'owner 暂停了后台任务'): BackgroundTaskPauseResult {
-    let event = this.store.getEvent(taskId);
-    if (!event || event.executionLane !== 'task') return { state: 'not_found' };
-    if (event.status === 'paused') return { state: 'already_paused' };
-    if (TERMINAL.has(event.status)) return { state: 'already_terminal' };
-    if (event.status === 'queued') {
-      try {
-        this.store.pauseQueuedEvent(taskId, reason);
-        const worker = this.workers.get(taskId);
-        if (worker) this.sendControl(worker, { type: 'pause', taskId, reason });
-        return { state: 'paused' };
-      } catch {
-        const changed = this.store.getEvent(taskId);
-        if (!changed) return { state: 'not_found' };
-        if (changed.status === 'paused') return { state: 'already_paused' };
-        if (TERMINAL.has(changed.status) || changed.status === 'blocked') return { state: 'already_terminal' };
-        event = changed;
-      }
-    }
-    if (event.status !== 'running') return { state: 'not_pauseable' };
-    const requested = this.store.requestRunningTaskControl(taskId, 'pause', reason);
-    if (!requested) {
-      const changed = this.store.getEvent(taskId);
-      if (!changed) return { state: 'not_found' };
-      if (changed.status === 'paused') return { state: 'already_paused' };
-      if (TERMINAL.has(changed.status) || changed.status === 'blocked') return { state: 'already_terminal' };
-      return { state: 'not_pauseable' };
-    }
-    if (requested.taskControl === 'cancel') return { state: 'not_pauseable' };
+    const task = this.store.getTask(taskId);
+    if (!task) return { state: 'not_found' };
+    if (task.status === 'paused') return { state: 'already_paused' };
+    if (TERMINAL.has(task.status) || task.status === 'blocked') return { state: 'already_terminal' };
+    const requested = this.store.pauseTask(taskId, reason);
+    if (requested.controlIntent === 'cancel') return { state: 'not_pauseable' };
     const worker = this.workers.get(taskId);
     if (worker) this.sendControl(worker, { type: 'pause', taskId, reason });
-    return { state: 'pause_requested' };
+    return { state: requested.status === 'paused' ? 'paused' : 'pause_requested' };
   }
 
   private async safePump(): Promise<void> {
@@ -337,14 +288,14 @@ export class TaskProcessSupervisor {
       if (activeWorkers.some((worker) => worker.workspaceAccess === 'write')) return;
       const available = limit - activeWorkers.length;
       if (available <= 0) return;
-      const ready = this.store.readyBackgroundTasks(50)
+      const ready = this.store.readyTasks({
+        types: ['background', 'scheduled', 'briefing', 'memory_maintenance'],
+        executor: 'isolated_worker',
+      }, 50)
         .filter((task) => !this.workers.has(task.id));
       if (ready.length === 0) return;
       const workspaceAccess = (task: (typeof ready)[number]): 'read' | 'write' => {
-        const payload = task.payload && typeof task.payload === 'object'
-          ? task.payload as Record<string, unknown>
-          : {};
-        return payload.workspaceAccess === 'read' ? 'read' : 'write';
+        return task.workspaceAccess === 'read' ? 'read' : 'write';
       };
       if (activeWorkers.length > 0) {
         if (ready.some((task) => workspaceAccess(task) === 'write')) return;
@@ -375,11 +326,8 @@ export class TaskProcessSupervisor {
     let mcpEnvironment: Record<string, string>;
     let enableMcp: boolean;
     let mcpEnvironmentKeys: string[];
-    const task = this.store.getEvent(taskId);
-    const taskPayload = task?.payload && typeof task.payload === 'object'
-      ? task.payload as Record<string, unknown>
-      : {};
-    const executor = taskPayload.executor === 'codex' ? 'codex' as const : 'mimi' as const;
+    const task = this.store.getTask(taskId);
+    const executor = task?.executor === 'codex' ? 'codex' as const : 'mimi' as const;
     try {
       providerCredential = executor === 'mimi' ? taskProviderCredential(this.config) : undefined;
       embeddingCredential = executor === 'mimi' ? taskEmbeddingCredential(this.config) : undefined;
@@ -403,7 +351,7 @@ export class TaskProcessSupervisor {
       mcpEnvironment = enableMcp ? declaredMcpEnvironment : {};
       if (providerCredential) delete mcpEnvironment[taskProviderEnvironmentName(providerCredential.provider)];
       if (embeddingCredential) delete mcpEnvironment.OPENAI_API_KEY;
-      if (this.stopping || this.store.getEvent(taskId)?.status !== 'queued') return;
+      if (this.stopping || this.store.getTask(taskId)?.status !== 'queued') return;
       child = fork(entry, [], {
         execArgv: taskWorkerExecArgv(process.execArgv),
         env: taskWorkerEnvironment(process.env, [
@@ -496,20 +444,19 @@ export class TaskProcessSupervisor {
 
   private persistWorkerExit(record: WorkerRecord, code: number | null, signal: NodeJS.Signals | null): void {
     if (record.gracefulExit) return;
-    const event = this.store.getEvent(record.taskId);
-    if (!event || event.executionLane !== 'task' || TERMINAL.has(event.status)
-      || event.status === 'paused' || event.status === 'blocked') return;
+    const task = this.store.getTask(record.taskId);
+    if (!task || TERMINAL.has(task.status) || task.status === 'paused' || task.status === 'blocked') return;
     const reason = record.failureReason
       ?? (record.terminating ? 'Task worker 被运行时回收' : `Task worker 意外退出（code=${code ?? 'null'}, signal=${signal ?? 'none'}）`);
     try {
-      if (event.status === 'queued') {
+      if (task.status === 'queued') {
         const bootstrapOwner = `task-supervisor-${process.pid}-${randomBytes(6).toString('hex')}`;
-        const claimed = this.store.claimEventById(record.taskId, bootstrapOwner);
-        if (claimed) this.store.failEvent(record.taskId, bootstrapOwner, new Error(reason), 5);
+        const claimed = this.store.claimTaskById(record.taskId, bootstrapOwner);
+        if (claimed) this.store.failTask(record.taskId, bootstrapOwner, new Error(reason));
         return;
       }
-      if (event.status === 'running' && record.workerId && event.leaseOwner === record.workerId) {
-        this.store.failEvent(record.taskId, record.workerId, new Error(reason), 5);
+      if (task.status === 'running' && record.workerId && task.leaseOwner === record.workerId) {
+        this.store.failTask(record.taskId, record.workerId, new Error(reason));
       }
     } catch (error) {
       process.stderr.write(`[MimiAgent] cannot persist task worker exit ${record.taskId}: ${error instanceof Error ? error.message : String(error)}\n`);
@@ -519,8 +466,8 @@ export class TaskProcessSupervisor {
   private persistLaunchFailure(taskId: string, error: unknown): void {
     const owner = `task-supervisor-${process.pid}-${randomBytes(6).toString('hex')}`;
     try {
-      const claimed = this.store.claimEventById(taskId, owner);
-      if (claimed) this.store.failEvent(taskId, owner, error, 5);
+      const claimed = this.store.claimTaskById(taskId, owner);
+      if (claimed) this.store.failTask(taskId, owner, error);
     } catch (failure) {
       process.stderr.write(`[MimiAgent] cannot persist task worker launch failure ${taskId}: ${failure instanceof Error ? failure.message : String(failure)}\n`);
     }

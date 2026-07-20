@@ -1,6 +1,6 @@
 import { tool, type Tool } from '@openai/agents';
 import { z } from 'zod';
-import type { StoredEvent } from './types.js';
+import type { ImmutableEvent, TaskRecord } from './types.js';
 
 export interface MimiDeliveryControl {
   suppressed: boolean;
@@ -8,10 +8,11 @@ export interface MimiDeliveryControl {
 }
 
 export function createMimiDeliveryTools(
-  event: StoredEvent,
+  task: TaskRecord,
+  _event: ImmutableEvent,
   control: MimiDeliveryControl,
 ): Tool[] {
-  if (event.kind === 'command') return [];
+  if (task.type === 'conversation') return [];
   return [tool({
     name: 'finish_mimi_silently',
     description: '仅用于自主巡检已完成、确认没有新变化、风险、已执行动作或需要 owner 关注事项时，安静结束本次任务。调用后本次成功结果仍保留在 MimiAgent 记录中，但不主动推送。不要用它隐藏错误，也不要在仍有值得汇报的信息时调用。',

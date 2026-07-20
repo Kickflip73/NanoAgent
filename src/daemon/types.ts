@@ -6,18 +6,7 @@ import type { RunCheckpoint } from '../core/session.js';
 
 export type EventTrust = 'owner' | 'trusted' | 'external' | 'public' | 'system';
 export type EventKind = 'command' | 'alert' | 'ambient' | 'schedule' | 'webhook';
-export type EventExecutionLane = 'conversation' | 'task';
 export type TaskControlIntent = 'pause' | 'cancel';
-export type EventStatus =
-  | 'queued'
-  | 'running'
-  | 'paused'
-  | 'blocked'
-  | 'completed'
-  | 'ignored'
-  | 'digested'
-  | 'dead_letter'
-  | 'archived';
 
 export interface EventActor {
   id: string;
@@ -49,36 +38,129 @@ export interface EventEnvelope {
   profileId: string;
   sessionKey?: string;
   replyRoute?: ReplyRoute;
-  executionLane?: EventExecutionLane;
-  originSessionKey?: string;
-  parentEventId?: string;
-  rootEventId?: string;
-  taskDepth?: number;
 }
 
-export interface StoredEvent extends EventEnvelope {
-  taskControl?: TaskControlIntent;
-  taskControlReason?: string;
-  status: EventStatus;
-  attempts: number;
+export type EventSubjectType = 'task' | 'schedule' | 'connector';
+
+export interface ImmutableEventInput {
+  id: string;
+  externalId: string;
+  source: string;
+  type: string;
+  trust: EventTrust;
+  actor?: EventActor;
+  conversation?: EventConversation;
+  payload: unknown;
+  subjectType?: EventSubjectType;
+  subjectId?: string;
+  correlationId?: string;
+  causationEventId?: string;
+  profileId: string;
+  replyRoute?: ReplyRoute;
+  occurredAt: string;
+  receivedAt: string;
+}
+
+export interface ImmutableEvent extends ImmutableEventInput {
+  createdAt: string;
+}
+
+export type EventRouteDecision = 'observe_only' | 'digest' | 'task_created' | 'rejected';
+
+export interface EventRouteReceipt {
+  eventId: string;
+  routerVersion: string;
+  decision: EventRouteDecision;
+  taskIds: string[];
+  reasonCode: string;
+  routedAt: string;
+}
+
+export type TaskType = 'conversation' | 'background' | 'scheduled' | 'briefing' | 'memory_maintenance';
+export type TaskExecutor = 'session_actor' | 'isolated_worker' | 'codex';
+export type TaskWorkspaceAccess = 'none' | 'read' | 'write';
+export type TaskStatus =
+  | 'queued'
+  | 'running'
+  | 'paused'
+  | 'blocked'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  | 'dead_letter';
+
+export interface TaskInput {
+  id: string;
+  type: TaskType;
+  idempotencyKey: string;
+  triggerEventId?: string;
+  authorityEventId: string;
+  parentTaskId?: string;
+  profileId: string;
+  sessionKey?: string;
+  objective: unknown;
+  executor: TaskExecutor;
+  workspaceAccess: TaskWorkspaceAccess;
+  priority: number;
+  notBefore?: string;
   maxAttempts?: number;
-  completionDeferrals?: number;
-  completionNoProgressDeferrals?: number;
-  completionProgressFingerprint?: string;
+}
+
+export interface TaskRecord extends TaskInput {
+  status: TaskStatus;
   notBefore: string;
+  attemptCount: number;
+  maxAttempts: number;
   leaseOwner?: string;
   leaseUntil?: string;
+  controlIntent?: TaskControlIntent;
+  controlReason?: string;
   result?: unknown;
   error?: string;
   createdAt: string;
   updatedAt: string;
 }
 
+export interface TaskSelector {
+  types?: TaskType[];
+  executor?: TaskExecutor;
+  excludedSessionKeys?: string[];
+}
+
+export interface TaskRouteInput {
+  routerVersion: string;
+  decision: EventRouteDecision;
+  reasonCode: string;
+  tasks?: TaskInput[];
+}
+
+export interface IngressTaskRoute {
+  type?: TaskType;
+  authorityEventId?: string;
+  parentTaskId?: string;
+  sessionKey?: string;
+  executor?: TaskExecutor;
+  workspaceAccess?: TaskWorkspaceAccess;
+}
+
+export interface TaskAttemptRecord {
+  id: string;
+  taskId: string;
+  attemptNo: number;
+  sessionKey: string;
+  workerId: string;
+  status: HostRunStatus;
+  startedAt: string;
+  completedAt?: string;
+  answer?: unknown;
+  error?: string;
+}
+
 export type OutboxStatus = 'pending' | 'sending' | 'sent' | 'dead_letter' | 'archived';
 
 export interface OutboxMessage {
   id: string;
-  eventId: string;
+  taskId: string;
   channel: string;
   target?: string;
   payload: unknown;
@@ -96,7 +178,9 @@ export type HostRunStatus = 'running' | 'completed' | 'failed' | 'interrupted';
 
 export interface HostRunRecord {
   id: string;
-  eventId: string;
+  taskId: string;
+  attemptNo: number;
+  workerId: string;
   sessionKey: string;
   status: HostRunStatus;
   startedAt: string;
@@ -109,22 +193,20 @@ export interface MimiEventSummary {
   id: string;
   externalId: string;
   source: string;
-  kind: EventKind;
+  type: string;
   trust: EventTrust;
-  status: EventStatus;
-  priority: number;
-  attempts: number;
+  subjectType?: EventSubjectType;
+  subjectId?: string;
   profileId: string;
-  sessionKey?: string;
   occurredAt: string;
   receivedAt: string;
-  updatedAt: string;
-  error?: string;
+  createdAt: string;
 }
 
 export interface MimiRunSummary {
   id: string;
-  eventId: string;
+  taskId: string;
+  attemptNo: number;
   sessionKey: string;
   status: HostRunStatus;
   startedAt: string;
@@ -135,7 +217,7 @@ export interface MimiRunSummary {
 
 export interface MimiOutboxSummary {
   id: string;
-  eventId: string;
+  taskId: string;
   channel: string;
   target?: string;
   status: OutboxStatus;
@@ -189,7 +271,10 @@ export interface MimiSchedulePage {
   total: number;
 }
 
-export const DAEMON_PROTOCOL_VERSION = 6;
+// Protocol 7 separates immutable Events from executable Tasks. This changes
+// both the status payload and several RPC method/result shapes, so a v6 daemon
+// must be replaced instead of being reused by a v7 CLI.
+export const DAEMON_PROTOCOL_VERSION = 7;
 
 export interface DaemonTaskWorkerStatus {
   taskId: string;
@@ -215,7 +300,8 @@ export interface DaemonStatus {
   webhookAddress?: string;
   connectorCount?: number;
   attention?: Record<string, unknown>;
-  events: Record<EventStatus, number>;
+  events: { total: number };
+  tasks: Record<TaskStatus, number>;
   outbox: Record<OutboxStatus, number>;
   enabledSchedules: number;
 }
@@ -228,18 +314,26 @@ export type DaemonWorkerStatus = Omit<
 export interface MimiActivityEvent {
   id: string;
   source: string;
-  kind: EventKind;
-  status: EventStatus;
-  priority: number;
-  attempts: number;
+  type: string;
+  subjectType?: EventSubjectType;
+  subjectId?: string;
   occurredAt: string;
+  receivedAt: string;
+}
+
+export interface MimiActivityTask {
+  id: string;
+  type: TaskType;
+  status: TaskStatus;
+  priority: number;
+  attemptCount: number;
   updatedAt: string;
   error?: string;
 }
 
 export interface MimiActivityRun {
   id: string;
-  eventId: string;
+  taskId: string;
   status: HostRunStatus;
   startedAt: string;
   completedAt?: string;
@@ -248,7 +342,7 @@ export interface MimiActivityRun {
 
 export interface MimiActivityDelivery {
   id: string;
-  eventId: string;
+  taskId: string;
   channel: string;
   status: OutboxStatus;
   attempts: number;
@@ -269,19 +363,22 @@ export interface MimiActivitySnapshot {
   workPending: number;
   pendingDigest: number;
   enabledSchedules: number;
-  events: Record<EventStatus, number>;
+  events: { total: number };
+  tasks: Record<TaskStatus, number>;
   outbox: Record<OutboxStatus, number>;
   recentEvents: MimiActivityEvent[];
+  recentTasks: MimiActivityTask[];
   recentRuns: MimiActivityRun[];
   recentDeliveries: MimiActivityDelivery[];
   recentTransitions: MimiActivityTransition[];
 }
 
 export interface MimiSessionActivity {
-  eventId: string;
+  taskId: string;
+  eventId?: string;
   source: string;
-  kind: EventKind;
-  eventStatus: EventStatus;
+  type: string;
+  taskStatus: TaskStatus;
   runStatus: HostRunStatus;
   occurredAt: string;
   startedAt: string;
@@ -292,6 +389,7 @@ export interface MimiSessionActivity {
 
 export interface MimiChatSnapshot {
   sessionId: string;
+  draft?: boolean;
   workspaceRoot: string;
   provider: string;
   model: string;
@@ -350,14 +448,14 @@ export type MimiStreamEvent = {
 
 export interface MimiStreamSnapshot {
   events: MimiStreamEvent[];
-  event?: MimiStreamEventState;
+  task?: MimiStreamTaskState;
   nextSequence?: number;
   hasMore?: boolean;
 }
 
-export interface MimiStreamEventState {
+export interface MimiStreamTaskState {
   id: string;
-  status: EventStatus;
+  status: TaskStatus;
   result?: unknown;
   error?: string;
 }

@@ -11,14 +11,28 @@ import {
   type ResolvedPerson,
   type SourcePolicyAccess,
 } from './policy.js';
-import { isAuthenticScheduleTask } from './schedule-tools.js';
 import { MimiStore } from './store.js';
-import type { DigestItem, EventKind, ReplyRoute, StoredEvent } from './types.js';
+import type {
+  DigestItem,
+  EventEnvelope,
+  EventKind,
+  ImmutableEvent,
+  ReplyRoute,
+  TaskRecord,
+} from './types.js';
 
 const timeSchema = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/);
 const eventKindSchema = z.enum(['command', 'alert', 'ambient', 'schedule', 'webhook']);
 const RECENT_OWNER_ROUTE_MS = 7 * 24 * 60 * 60_000;
 const MAX_BRIEFING_PROMPT_CHARS = 48_000;
+
+function eventKindForType(type: string): EventKind {
+  if (type === 'schedule.due') return 'schedule';
+  if (type.includes('alert') || type.endsWith('.failed')) return 'alert';
+  if (type.includes('webhook')) return 'webhook';
+  if (type.includes('ambient') || type.startsWith('task.')) return 'ambient';
+  return 'command';
+}
 export const mimiInstructionSchema = z.string().trim().min(1).max(1_000);
 const replyRouteSchema = z.object({
   channel: z.string().trim().min(1).max(100),
@@ -534,7 +548,7 @@ export class AttentionEngine {
     return this.config.maintenance;
   }
 
-  observeOwnerRoute(event: Pick<StoredEvent, 'trust' | 'kind' | 'profileId' | 'replyRoute'>, at = new Date()): boolean {
+  observeOwnerRoute(event: Pick<EventEnvelope, 'trust' | 'kind' | 'profileId' | 'replyRoute'>, at = new Date()): boolean {
     const route = event.replyRoute;
     if (
       event.trust !== 'owner'
@@ -553,67 +567,92 @@ export class AttentionEngine {
   }
 
   replyRouteFor(): ReplyRoute;
-  replyRouteFor(event: Pick<StoredEvent, 'replyRoute' | 'source' | 'profileId'>): ReplyRoute | undefined;
-  replyRouteFor(event?: Pick<StoredEvent, 'replyRoute' | 'source' | 'profileId'>): ReplyRoute | undefined {
+  replyRouteFor(event: Pick<ImmutableEvent, 'replyRoute' | 'source' | 'profileId'>): ReplyRoute | undefined;
+  replyRouteFor(event?: Pick<ImmutableEvent, 'replyRoute' | 'source' | 'profileId'>): ReplyRoute | undefined {
     if (event?.replyRoute) return { ...event.replyRoute };
     if (event?.source === 'local-cli' || event?.source.startsWith('webhook:')) return undefined;
     return this.store.recentOwnerReplyRoute(event?.profileId ?? 'owner', RECENT_OWNER_ROUTE_MS)
       ?? { ...this.config.owner.replyRoute };
   }
 
-  decide(event: StoredEvent, now = new Date()): AttentionDecision {
-    if (event.source === 'attention:routine' && !this.isCurrentRoutineEvent(event)) {
+  decideTask(task: TaskRecord, eventFact: ImmutableEvent, authority: ImmutableEvent): EventDecision {
+    if (eventFact.source === 'attention:routine' && !this.isCurrentRoutineTask(task, eventFact, authority)) {
       return { action: 'ignore', reason: 'Daily Routine 已删除、禁用、更新或触发身份无效' };
     }
-    if (event.executionLane === 'task') {
-      return { action: 'run', reason: '已接受的 Task 使用独立执行队列，不受注意力打扰预算终态化', run: this.runDecision(event) };
-    }
+    const event: EventEnvelope = {
+      id: task.id,
+      externalId: task.idempotencyKey,
+      source: authority.source,
+      kind: eventKindForType(authority.type),
+      trust: authority.trust,
+      actor: authority.actor,
+      conversation: authority.conversation,
+      payload: task.objective,
+      occurredAt: eventFact.occurredAt,
+      receivedAt: eventFact.receivedAt,
+      priority: task.priority,
+      profileId: task.profileId,
+      sessionKey: task.sessionKey,
+      replyRoute: eventFact.replyRoute ?? authority.replyRoute,
+    };
+    const decisionContext = this.instructionsFor(event);
+    return decideEvent(
+      event,
+      decisionContext.instructions,
+      this.personFor(event),
+      decisionContext.sourcePolicyAccess,
+      false,
+      task,
+      eventFact.source,
+    );
+  }
+
+  routeIngress(event: EventEnvelope, now = new Date()): {
+    decision: 'task_created' | 'digest' | 'observe_only';
+    reasonCode: string;
+  } {
     const snoozed = this.snoozeStatus(now).active;
     if (
       (event.trust === 'owner' && event.kind === 'command')
       || event.source === 'attention:briefing'
       || (event.trust === 'owner' && (!snoozed || event.priority >= this.config.quietHours.urgentPriority))
-    ) {
-      return { action: 'run', reason: '所有者命令或内部简报不受注意力预算阻塞', run: this.runDecision(event) };
-    }
+    ) return { decision: 'task_created', reasonCode: 'owner_or_internal' };
     if (snoozed && event.priority < this.config.quietHours.urgentPriority) {
-      return { action: 'digest', reason: '临时免打扰期间的非紧急事件进入摘要' };
+      return { decision: 'digest', reasonCode: 'snoozed' };
     }
     const rule = this.config.rules.find((candidate) => this.matchesRule(candidate, event));
     if (rule) {
-      const reason = rule.reason ?? `命中注意力规则 ${rule.id}`;
-      return rule.action === 'run'
-        ? { action: 'run', reason, run: this.runDecision(event) }
-        : { action: rule.action, reason };
+      return {
+        decision: rule.action === 'run' ? 'task_created' : rule.action === 'digest' ? 'digest' : 'observe_only',
+        reasonCode: `rule:${rule.id}`,
+      };
     }
-    if (event.kind === 'ambient') return { action: 'digest', reason: '环境信号进入摘要池，不单独唤醒模型' };
+    if (event.kind === 'ambient') return { decision: 'digest', reasonCode: 'ambient_digest' };
     if (this.isQuiet(now) && event.priority < this.config.quietHours.urgentPriority) {
-      return { action: 'digest', reason: '静默时段内非紧急事件延后到主动简报' };
+      return { decision: 'digest', reasonCode: 'quiet_hours' };
     }
     const hourAgo = new Date(now.getTime() - 60 * 60_000);
     const dayAgo = new Date(now.getTime() - 24 * 60 * 60_000);
     if (this.store.countRunsSince(hourAgo) >= this.config.budgets.maxRunsPerHour) {
-      return { action: 'digest', reason: '达到每小时自治运行预算' };
+      return { decision: 'digest', reasonCode: 'hourly_budget' };
     }
     if (this.store.countRunsSince(dayAgo) >= this.config.budgets.maxRunsPerDay) {
-      return { action: 'digest', reason: '达到每日自治运行预算' };
+      return { decision: 'digest', reasonCode: 'daily_budget' };
     }
     if (this.store.countRunsSince(hourAgo, event.source) >= this.config.budgets.maxRunsPerSourcePerHour) {
-      return { action: 'digest', reason: '该来源达到每小时运行预算' };
+      return { decision: 'digest', reasonCode: 'source_hourly_budget' };
     }
-    if (event.kind === 'command') {
-      return { action: 'run', reason: '直接消息需要及时响应', run: this.runDecision(event) };
-    }
+    if (event.kind === 'command') return { decision: 'task_created', reasonCode: 'direct_command' };
     if (event.kind === 'alert' && event.priority >= this.config.thresholds.alertPriority) {
-      return { action: 'run', reason: '高优先级告警需要即时判断', run: this.runDecision(event) };
+      return { decision: 'task_created', reasonCode: 'alert_threshold' };
     }
     if (event.kind === 'webhook' && event.priority >= this.config.thresholds.webhookPriority) {
-      return { action: 'run', reason: '高优先级 Webhook 需要即时判断', run: this.runDecision(event) };
+      return { decision: 'task_created', reasonCode: 'webhook_threshold' };
     }
-    return { action: 'digest', reason: '低于即时唤醒阈值，进入下一次简报' };
+    return { decision: 'digest', reasonCode: 'below_wakeup_threshold' };
   }
 
-  emitDueBriefings(now = new Date()): StoredEvent[] {
+  emitDueBriefings(now = new Date()): ImmutableEvent[] {
     if (!this.config.briefings.enabled || this.snoozeStatus(now).active) return [];
     const local = localParts(now, this.config.timezone);
     const time = [...new Set(this.config.briefings.times)]
@@ -624,13 +663,13 @@ export class AttentionEngine {
     return event ? [event] : [];
   }
 
-  emitDueRoutines(now = new Date()): StoredEvent[] {
+  emitDueRoutines(now = new Date()): ImmutableEvent[] {
     const local = localParts(now, this.config.timezone);
     if (this.routineCheckpointDate !== local.date) {
       this.routineCheckpointDate = local.date;
       this.routineCheckpoints.clear();
     }
-    const events: StoredEvent[] = [];
+    const events: ImmutableEvent[] = [];
     for (const routine of this.config.routines) {
       if (!routine.enabled || minuteOf(routine.time) > local.minute) continue;
       if (routine.weekdays && !new Set(routine.weekdays).has(local.weekday)) continue;
@@ -654,10 +693,9 @@ export class AttentionEngine {
         profileId: 'owner',
         sessionKey,
         replyRoute,
-        executionLane: 'conversation',
       });
       const eventId = randomUUID();
-      const result = this.store.enqueueEvent({
+      const result = this.store.ingestEvent({
         id: eventId,
         externalId: checkpoint,
         source: 'attention:routine',
@@ -667,18 +705,19 @@ export class AttentionEngine {
         payload: {
           type: 'proactive_routine', prompt: routine.prompt, routineId: routine.id, scheduledLocal,
           revision, objective: routine.prompt, strategy: 'single', workspaceAccess: 'write',
+          originSessionId: sessionKey,
         },
         occurredAt: now.toISOString(),
         receivedAt: now.toISOString(),
         priority: routine.priority,
         profileId: 'owner',
-        sessionKey: `mimi-task-${eventId}`,
-        originSessionKey: sessionKey,
         replyRoute,
-        executionLane: 'task',
-        parentEventId: authority.id,
-        rootEventId: authority.id,
-        taskDepth: 1,
+      }, {
+        type: 'scheduled',
+        authorityEventId: authority.id,
+        sessionKey: `mimi-task-${eventId}`,
+        executor: 'isolated_worker',
+        workspaceAccess: 'write',
       });
       this.routineCheckpoints.add(checkpoint);
       if (result.inserted) events.push(result.event);
@@ -686,66 +725,7 @@ export class AttentionEngine {
     return events;
   }
 
-  private isCurrentRoutineEvent(event: StoredEvent): boolean {
-    if (
-      event.kind !== 'schedule'
-      || event.trust !== 'owner'
-      || event.executionLane !== 'task'
-      || !event.conversation
-    ) return false;
-    if (typeof event.payload !== 'object' || event.payload === null || Array.isArray(event.payload)) return false;
-    const payload = event.payload as Record<string, unknown>;
-    if (
-      payload.type !== 'proactive_routine'
-      || typeof payload.routineId !== 'string'
-      || typeof payload.scheduledLocal !== 'string'
-      || typeof payload.revision !== 'string'
-      || payload.objective !== payload.prompt
-      || payload.strategy !== 'single'
-      || payload.workspaceAccess !== 'write'
-    ) return false;
-    const routine = this.config.routines.find((candidate) => candidate.id === payload.routineId);
-    if (!routine?.enabled || payload.revision !== routineRevision(routine)) return false;
-    const scheduled = /^(\d{4}-\d{2}-\d{2}) ([01]\d|2[0-3]):[0-5]\d$/.exec(payload.scheduledLocal);
-    if (!scheduled) return false;
-    const sessionKey = routine.sessionKey ?? derivedSessionId('routine', routine.id);
-    const replyRoute = this.overrideReplyRoute(routine.replyChannel, routine.replyTarget);
-    if (
-      event.sessionKey !== `mimi-task-${event.id}`
-      || event.originSessionKey !== sessionKey
-      || event.parentEventId === undefined
-      || event.parentEventId !== event.rootEventId
-      || event.taskDepth !== 1
-      || !sameReplyRoute(event.replyRoute, replyRoute)
-    ) return false;
-    const authority = this.store.getEvent(event.rootEventId);
-    const authorityPayload = authority?.payload && typeof authority.payload === 'object' && !Array.isArray(authority.payload)
-      ? authority.payload as Record<string, unknown>
-      : undefined;
-    if (
-      !authority
-      || authority.source !== 'attention:routine-authority'
-      || authority.externalId !== `routine-authority:${routine.id}:${payload.scheduledLocal}:${payload.revision}`
-      || authority.kind !== 'command'
-      || authority.trust !== 'owner'
-      || (authority.executionLane ?? 'conversation') !== 'conversation'
-      || authority.parentEventId !== undefined
-      || authority.rootEventId !== undefined
-      || authority.sessionKey !== sessionKey
-      || authority.profileId !== 'owner'
-      || authority.conversation?.id !== `routine-${routine.id}`
-      || !sameReplyRoute(authority.replyRoute, replyRoute)
-      || authorityPayload?.type !== 'routine_authority'
-      || authorityPayload.routineId !== routine.id
-      || authorityPayload.scheduledLocal !== payload.scheduledLocal
-      || authorityPayload.revision !== payload.revision
-    ) return false;
-    return event.externalId === `routine:${routine.id}:${scheduled[1]}:${routine.time}`
-      && payload.scheduledLocal === `${scheduled[1]} ${routine.time}`
-      && event.conversation.id === `routine-${routine.id}`;
-  }
-
-  forceBriefing(now = new Date()): StoredEvent | undefined {
+  forceBriefing(now = new Date()): ImmutableEvent | undefined {
     return this.createBriefing(`briefing:manual:${randomUUID()}`, '手动简报', now);
   }
 
@@ -786,7 +766,7 @@ export class AttentionEngine {
     };
   }
 
-  private createBriefing(checkpoint: string, label: string, now: Date): StoredEvent | undefined {
+  private createBriefing(checkpoint: string, label: string, now: Date): ImmutableEvent | undefined {
     const buildPrompt = (items: DigestItem[]): string => {
       const focus = this.config.owner.focus.length
         ? `所有者当前关注：${this.config.owner.focus.join('；')}。`
@@ -846,52 +826,14 @@ export class AttentionEngine {
     };
   }
 
-  private runDecision(event: StoredEvent): EventDecision {
-    const authorityEvent = this.authorityEvent(event);
-    if (!authorityEvent) return decideEvent(event, [], undefined, undefined, true);
-    const decisionContext = this.instructionsFor(authorityEvent);
-    const authorizedEvent = event.executionLane === 'task'
-      ? { ...event, trust: authorityEvent.trust, profileId: authorityEvent.profileId }
-      : event;
-    return decideEvent(
-      authorizedEvent,
-      decisionContext.instructions,
-      this.personFor(authorityEvent),
-      decisionContext.sourcePolicyAccess,
-    );
-  }
-
-  private authorityEvent(event: StoredEvent): StoredEvent | undefined {
-    if (event.executionLane !== 'task') return event;
-    if (event.source.startsWith('schedule:')) {
-      const payload = event.payload && typeof event.payload === 'object' && !Array.isArray(event.payload)
-        ? event.payload as Record<string, unknown>
-        : undefined;
-      const schedule = typeof payload?.scheduleId === 'string'
-        ? this.store.getSchedule(payload.scheduleId)
-        : undefined;
-      if (!schedule || !isAuthenticScheduleTask(this.store, schedule, event)) return undefined;
-    }
-    const authorityId = event.rootEventId ?? event.parentEventId;
-    if (!authorityId) return undefined;
-    const authority = this.store.getEvent(authorityId);
-    if (
-      !authority
-      || (authority.executionLane ?? 'conversation') !== 'conversation'
-      || authority.parentEventId !== undefined
-      || authority.rootEventId !== undefined
-    ) return undefined;
-    return authority;
-  }
-
-  private personFor(event: StoredEvent): ResolvedPerson | undefined {
+  private personFor(event: EventEnvelope): ResolvedPerson | undefined {
     if (!event.actor) return undefined;
     const person = this.config.people.find((candidate) => candidate.aliases.some((alias) =>
       globMatches(alias.source, event.source) && globMatches(alias.actor, event.actor!.id)));
     return person ? { id: person.id, displayName: person.displayName, context: person.context } : undefined;
   }
 
-  private instructionsFor(event: StoredEvent): {
+  private instructionsFor(event: EventEnvelope): {
     instructions: string[];
     sourcePolicyAccess?: SourcePolicyAccess;
   } {
@@ -908,12 +850,57 @@ export class AttentionEngine {
     return { instructions: [...new Set(instructions)], sourcePolicyAccess };
   }
 
-  private matchesRule(rule: AttentionConfig['rules'][number], event: StoredEvent): boolean {
+  private matchesRule(rule: AttentionConfig['rules'][number], event: EventEnvelope): boolean {
     if (!globMatches(rule.source, event.source)) return false;
     if (rule.kinds && !rule.kinds.includes(event.kind as EventKind)) return false;
     if (rule.minPriority !== undefined && event.priority < rule.minPriority) return false;
     if (rule.maxPriority !== undefined && event.priority > rule.maxPriority) return false;
     return true;
+  }
+
+  private isCurrentRoutineTask(
+    task: TaskRecord,
+    event: ImmutableEvent,
+    authority: ImmutableEvent,
+  ): boolean {
+    if (task.type !== 'scheduled' || event.trust !== 'owner' || !event.conversation) return false;
+    if (!task.objective || typeof task.objective !== 'object' || Array.isArray(task.objective)) return false;
+    const payload = task.objective as Record<string, unknown>;
+    if (
+      payload.type !== 'proactive_routine'
+      || typeof payload.routineId !== 'string'
+      || typeof payload.scheduledLocal !== 'string'
+      || typeof payload.revision !== 'string'
+      || payload.objective !== payload.prompt
+      || payload.strategy !== 'single'
+      || task.workspaceAccess !== 'write'
+    ) return false;
+    const routine = this.config.routines.find((candidate) => candidate.id === payload.routineId);
+    if (!routine?.enabled || payload.revision !== routineRevision(routine)) return false;
+    const scheduled = /^(\d{4}-\d{2}-\d{2}) ([01]\d|2[0-3]):[0-5]\d$/.exec(payload.scheduledLocal);
+    if (!scheduled) return false;
+    const sessionKey = routine.sessionKey ?? derivedSessionId('routine', routine.id);
+    const replyRoute = this.overrideReplyRoute(routine.replyChannel, routine.replyTarget);
+    const authorityPayload = authority.payload && typeof authority.payload === 'object' && !Array.isArray(authority.payload)
+      ? authority.payload as Record<string, unknown>
+      : undefined;
+    return task.sessionKey === `mimi-task-${task.id}`
+      && task.authorityEventId === authority.id
+      && sameReplyRoute(event.replyRoute, replyRoute)
+      && authority.source === 'attention:routine-authority'
+      && authority.externalId === `routine-authority:${routine.id}:${payload.scheduledLocal}:${payload.revision}`
+      && authority.trust === 'owner'
+      && authority.profileId === 'owner'
+      && authority.conversation?.id === `routine-${routine.id}`
+      && sameReplyRoute(authority.replyRoute, replyRoute)
+      && authorityPayload?.type === 'routine_authority'
+      && authorityPayload.routineId === routine.id
+      && authorityPayload.scheduledLocal === payload.scheduledLocal
+      && authorityPayload.revision === payload.revision
+      && event.externalId === `routine:${routine.id}:${scheduled[1]}:${routine.time}`
+      && payload.scheduledLocal === `${scheduled[1]} ${routine.time}`
+      && event.conversation.id === `routine-${routine.id}`
+      && payload.originSessionId === sessionKey;
   }
 
   private async mutateConfig(mutator: (config: AttentionConfig) => AttentionConfig): Promise<void> {

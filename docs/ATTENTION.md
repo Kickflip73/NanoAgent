@@ -30,7 +30,7 @@ owner 也可先调用 `get_mimi_settings` 读取完整快照，再用 `update_mi
 
 `quietHours.urgentPriority` 同时是单 Dispatcher 的抢占阈值，默认 95。长期任务运行中，新 Event 必须同时满足以下条件才会让当前任务让路：已经 ready、priority 达到该阈值、严格高于当前 Event，并且用最新 Attention 配置判断为 `run` 或 `notify`。应进入 digest/ignore 的高分环境噪声不会触发抢占。
 
-抢占只发生在模型思考阶段。任何 Function Tool、MCP Tool、Connector action、Outbox delivery 或 SQLite 事务在途时都不会被中断；工具输出后若紧急事件仍在队列，下一次检查立即中止模型 Run。原 Event 原子恢复为 queued，本次 claim 不计失败 attempt，关联 Host Run 记为 interrupted。它之后使用相同 Event ID 和 execution ledger 续跑，因此已经成功记录的相同副作用不会重复执行。
+抢占只发生在模型思考阶段。任何 Function Tool、MCP Tool、Connector action、Outbox delivery 或 SQLite 事务在途时都不会被中断；工具输出后若紧急 Task 仍在队列，下一次检查立即中止模型 Run。原 Task 原子恢复为 queued，并补偿本次抢占消耗的 attempt 预算，关联 Run 记为 interrupted。它之后使用相同 Task ID 和 execution ledger 续跑，因此已经成功记录的相同副作用不会重复执行。
 
 系统仍只有一个 Dispatcher 和一个 MimiAgent。Event 第一次通过策略解析出实际 Session 后，会在持有事件租约时把该 Session 原子绑定到 Event；后续重试、配置热更新和进程重启都不能把同一 Event 切到另一 Session，从而保持 transcript、Goal 和 execution ledger 的幂等边界。同 Session 的排队项在 claim SQL 中直接避开活动 Session，不再靠反复 claim/requeue 制造 SQLite 状态抖动。抢占不会并发运行两个相同 Session，也没有第二条紧急队列；紧急 Event 只是由既有 `priority DESC, received_at ASC` 顺序先执行。相同或更低 priority 不互相抢占，避免同等级事件抖动。
 

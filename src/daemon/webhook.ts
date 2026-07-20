@@ -113,7 +113,7 @@ export class MimiWebhookServer {
       const occurredAt = body.occurredAt && Number.isFinite(Date.parse(body.occurredAt))
         ? new Date(body.occurredAt).toISOString()
         : now;
-      const result = this.store.enqueueEvent({
+      const result = this.store.ingestEvent({
         id: randomUUID(),
         externalId: body.externalId,
         source: `webhook:${body.channel}`,
@@ -130,7 +130,12 @@ export class MimiWebhookServer {
           ? { channel: `connector:${body.reply.connector}`, target: body.reply.target }
           : body.notify ? { channel: 'system' } : undefined,
       });
-      response(res, 202, { id: result.event.id, inserted: result.inserted, status: result.event.status });
+      response(res, 202, {
+        id: result.event.id,
+        taskId: result.task?.id,
+        inserted: result.inserted,
+        decision: result.task ? 'task_created' : 'digest',
+      });
     } catch (error) {
       response(res, 400, { error: error instanceof Error ? error.message : String(error) });
     }

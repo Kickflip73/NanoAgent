@@ -49,7 +49,7 @@ import {
   MimiLiveEvents,
   mimiRuntimeStreamEvent,
   mimiStreamEvent,
-  mimiStreamEventState,
+  mimiStreamTaskState,
 } from './live-events.js';
 import { ownerSessionId } from './policy.js';
 import {
@@ -343,7 +343,7 @@ export function daemonStartupMode(
 }
 
 export function daemonSupervisorAction(
-  status: Pick<DaemonStatus, 'activeEventId' | 'activeHostMutations' | 'events' | 'outbox'>,
+  status: Pick<DaemonStatus, 'activeEventId' | 'activeHostMutations' | 'activeTaskCount' | 'tasks' | 'outbox'>,
   startupMode: DaemonStartupMode,
   launchAgentInstalled: boolean,
 ): 'reuse' | 'migrate' {
@@ -435,7 +435,7 @@ export interface MimiDoctorReport {
     activity?: {
       needsAttention: boolean;
       workPending: number;
-      eventDeadLetters: number;
+      taskDeadLetters: number;
       outboxDeadLetters: number;
     };
   };
@@ -860,9 +860,9 @@ export async function doctorMimi(config: AppConfig): Promise<MimiDoctorReport> {
   if (unavailableConnectors.length) {
     issues.push(`${unavailableConnectors.length} 个 Connector 进程在线但渠道不可用：${unavailableConnectors.map((connector) => connector.id).join(', ')}`);
   }
-  const eventDeadLetters = activity?.events.dead_letter ?? 0;
+  const taskDeadLetters = activity?.tasks.dead_letter ?? 0;
   const outboxDeadLetters = activity?.outbox.dead_letter ?? 0;
-  if (eventDeadLetters) issues.push(`${eventDeadLetters} 个事件进入 dead letter`);
+  if (taskDeadLetters) issues.push(`${taskDeadLetters} 个任务进入 dead letter`);
   if (outboxDeadLetters) issues.push(`${outboxDeadLetters} 个消息投递进入 dead letter`);
   const nextActions: string[] = [];
   if (!connectorConfig) nextActions.push('运行 mimi 完成自动初始化');
@@ -875,7 +875,7 @@ export async function doctorMimi(config: AppConfig): Promise<MimiDoctorReport> {
   if (!daemonStatus && configured && connectorConfig) nextActions.push('运行 mimi，后台服务会自动启动');
   if (offlineConnectors.length) nextActions.push('mimi daemon connectors reload');
   if (unavailableConnectors.length) nextActions.push('mimi daemon connectors');
-  if (eventDeadLetters) nextActions.push('mimi daemon events');
+  if (taskDeadLetters) nextActions.push('mimi daemon tasks');
   if (outboxDeadLetters) nextActions.push('mimi daemon outbox');
   return {
     ready: issues.length === 0,
@@ -906,7 +906,7 @@ export async function doctorMimi(config: AppConfig): Promise<MimiDoctorReport> {
         activity: {
           needsAttention: activity.needsAttention,
           workPending: activity.workPending,
-          eventDeadLetters,
+          taskDeadLetters,
           outboxDeadLetters,
         },
       } : {}),
@@ -1057,6 +1057,7 @@ export async function runMimiDaemon(config: AppConfig): Promise<void> {
     const notifier = new NotifierRegistry();
     connectors = await ConnectorManager.load(paths.connectorsConfig, store, notifier);
     attention = await AttentionEngine.load(paths.assistantConfig, store);
+    store.setIngressRoutePolicy((event, at) => attention!.routeIngress(event, at));
     webhook = createWebhook(store);
     const liveEvents = new MimiLiveEvents();
     taskSupervisor = new TaskProcessSupervisor(store, config, {
@@ -1070,8 +1071,8 @@ export async function runMimiDaemon(config: AppConfig): Promise<void> {
     });
     const activeTaskSupervisor = taskSupervisor;
     dispatcher = new MimiDispatcher(store, host, attention, notifier, connectors, {
-      maxConcurrentEvents: config.sessionMaxConcurrency ?? 4,
-      claimExecutionLane: 'conversation',
+      maxConcurrentTasks: config.sessionMaxConcurrency ?? 4,
+      claimTaskTypes: ['conversation'],
       onStreamEvent: (eventId, event) => {
         const streamed = mimiStreamEvent(event);
         if (streamed) liveEvents.publish(eventId, streamed);
@@ -1081,14 +1082,14 @@ export async function runMimiDaemon(config: AppConfig): Promise<void> {
         if (streamed) liveEvents.publish(eventId, streamed);
       },
       cancelEvent: (eventId, reason) => {
-        const event = store.getEvent(eventId);
-        return event?.executionLane === 'task'
+        const task = store.getTask(eventId);
+        return task?.executor === 'isolated_worker' || task?.executor === 'codex'
           ? activeTaskSupervisor.cancel(eventId, reason)
           : dispatcher!.cancel(eventId, reason);
       },
       pauseEvent: (eventId, reason) => {
-        const event = store.getEvent(eventId);
-        return event?.executionLane === 'task'
+        const task = store.getTask(eventId);
+        return task?.executor === 'isolated_worker' || task?.executor === 'codex'
           ? activeTaskSupervisor.pause(eventId, reason)
           : { state: 'not_pauseable' };
       },
@@ -1106,7 +1107,7 @@ export async function runMimiDaemon(config: AppConfig): Promise<void> {
         activeHostMutations: mutationGate.active,
       };
     };
-    const taskSummaryWithRuntime = (task: ReturnType<MimiStore['getEvent']>) => {
+    const taskSummaryWithRuntime = (task: ReturnType<MimiStore['getTask']>) => {
       if (!task) throw new Error('后台任务不存在');
       const summary = backgroundTaskSummary(task);
       const worker = activeTaskSupervisor.status().find((candidate) => candidate.taskId === task.id);
@@ -1115,7 +1116,7 @@ export async function runMimiDaemon(config: AppConfig): Promise<void> {
         ...(worker ? { worker } : {}),
       };
     };
-    const taskDetailsWithRuntime = async (task: ReturnType<MimiStore['getEvent']>) => {
+    const taskDetailsWithRuntime = async (task: ReturnType<MimiStore['getTask']>) => {
       if (!task) throw new Error('后台任务不存在');
       const summary = taskSummaryWithRuntime(task);
       const recentEvents = liveEvents.recent(task.id, 8);
@@ -1157,6 +1158,26 @@ export async function runMimiDaemon(config: AppConfig): Promise<void> {
       };
       if (stopping.signal.aborted) throw new Error('MimiAgent 正在关闭，不再接受新事务');
       if (method === 'activity.get') return store.activitySnapshot(limit(object(rawParams).limit, 10));
+      if (method === 'chat.bootstrap') {
+        const params = object(rawParams);
+        const draftSessionId = assertSessionId(requiredString(params.draftSessionId, 'draftSessionId'));
+        const snapshot = await createMimiChatSnapshot(
+          host!, host!.currentSessionId, config.workspaceRoot, 1,
+        );
+        return {
+          ...snapshot,
+          sessionId: draftSessionId,
+          draft: true,
+          contextUsed: 0,
+          items: [],
+          plan: [],
+          recovery: undefined,
+        } satisfies MimiChatSnapshot;
+      }
+      if (method === 'chat.sessions') {
+        return (await host!.listSessionSummaries())
+          .filter((summary) => summary.turns > 0 || summary.recoverable);
+      }
       if (method === 'chat.snapshot') {
         const params = object(rawParams);
         const sessionId = chatSessionId(params);
@@ -1259,17 +1280,19 @@ export async function runMimiDaemon(config: AppConfig): Promise<void> {
             : assertSessionId(requiredString(params.sessionKey, 'sessionKey')),
           actor: params.actor, conversation: params.conversation, replyRoute: params.replyRoute,
         };
-        return store.enqueueEvent(event);
+        return store.ingestEvent(event);
       }
-      if (method === 'event.cancel') {
+      if (method === 'task.cancel') {
         const params = object(rawParams);
         const reason = typeof params.reason === 'string' ? params.reason : undefined;
         const id = requiredString(params.id, 'id');
-        return store.getEvent(id)?.executionLane === 'task'
+        const task = store.getTask(id);
+        return task?.executor === 'isolated_worker' || task?.executor === 'codex'
           ? activeTaskSupervisor.cancel(id, reason)
           : activeDispatcher.cancel(id, reason);
       }
-      if (method === 'event.get') return store.getEvent(requiredString(object(rawParams).id, 'id'));
+      if (method === 'event.get') return store.getImmutableEvent(requiredString(object(rawParams).id, 'id'));
+      if (method === 'event.route') return store.getEventRouteReceipt(requiredString(object(rawParams).id, 'id'));
       if (method === 'event.stream') {
         const params = object(rawParams);
         const id = requiredString(params.id, 'id');
@@ -1277,17 +1300,17 @@ export async function runMimiDaemon(config: AppConfig): Promise<void> {
         const page = liveEvents.page(id, Number.isSafeInteger(after) && after >= 0 ? after : 0);
         return {
           ...page,
-          event: mimiStreamEventState(store.getEvent(id)),
+          task: mimiStreamTaskState(store.getTask(id)),
         };
       }
       if (method === 'events.list') return store.listEventSummaries(limit(object(rawParams).limit));
       if (method === 'tasks.list') {
-        return store.listBackgroundTasks(limit(object(rawParams).limit))
+        return store.listTasks(limit(object(rawParams).limit))
           .map((task) => taskSummaryWithRuntime(task));
       }
       if (method === 'tasks.get') {
-        const task = store.getEvent(requiredString(object(rawParams).id, 'id'));
-        if (!task || task.executionLane !== 'task') throw new Error('后台任务不存在');
+        const task = store.getTask(requiredString(object(rawParams).id, 'id'));
+        if (!task) throw new Error('Task 不存在');
         return taskDetailsWithRuntime(task);
       }
       if (method === 'tasks.cancel') {
@@ -1306,16 +1329,15 @@ export async function runMimiDaemon(config: AppConfig): Promise<void> {
         const params = object(rawParams);
         const id = requiredString(params.id, 'id');
         const context = typeof params.context === 'string' ? params.context : undefined;
-        const event = store.getEvent(id);
-        if (!event || event.executionLane !== 'task') return { state: 'not_found' };
-        if (event.status !== 'paused' && event.status !== 'blocked') {
+        const task = store.getTask(id);
+        if (!task || task.type !== 'background') return { state: 'not_found' };
+        if (task.status !== 'paused' && task.status !== 'blocked') {
           return { state: 'not_resumable' };
         }
-        store.resumeBackgroundTask(id, context);
+        store.resumeTask(id, context);
         return { state: 'resumed' };
       }
-      if (method === 'event.retry') return store.retryDeadLetterEvent(requiredString(object(rawParams).id, 'id'));
-      if (method === 'event.archive') return store.archiveDeadLetterEvent(requiredString(object(rawParams).id, 'id'));
+      if (method === 'task.retry') return store.retryDeadLetterTask(requiredString(object(rawParams).id, 'id'));
       if (method === 'run.get') return store.getRun(requiredString(object(rawParams).id, 'id'));
       if (method === 'runs.list') return store.listRunSummaries(limit(object(rawParams).limit));
       if (method === 'outbox.get') return store.getOutbox(requiredString(object(rawParams).id, 'id'));
@@ -1550,23 +1572,23 @@ export async function stopMimiDaemon(config: AppConfig): Promise<void> {
   await mimiRpc(mimiPaths(config).socket, 'shutdown');
 }
 
-export async function waitForRemoteEvent(
+export async function waitForRemoteTask(
   config: AppConfig,
   id: string,
   timeoutMs = 24 * 60 * 60_000,
 ): Promise<unknown> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const event = await mimiRpc<{ status: string; result?: unknown; error?: string } | undefined>(
-      mimiPaths(config).socket, 'event.get', { id }, 2_000,
+    const task = await mimiRpc<{ status: string; result?: unknown; error?: string } | undefined>(
+      mimiPaths(config).socket, 'tasks.get', { id }, 2_000,
     );
-    if (!event) throw new Error(`事件不存在：${id}`);
-    if (['completed', 'ignored', 'digested', 'dead_letter', 'archived', 'paused', 'blocked'].includes(event.status)) {
-      return event;
+    if (!task) throw new Error(`Task 不存在：${id}`);
+    if (['completed', 'failed', 'cancelled', 'dead_letter', 'paused', 'blocked'].includes(task.status)) {
+      return task;
     }
     await new Promise((resolve) => setTimeout(resolve, 200));
   }
-  throw new Error(`等待事件超时：${id}`);
+  throw new Error(`等待 Task 超时：${id}`);
 }
 
 export type { ScheduleRecord };

@@ -128,14 +128,31 @@ export function daemonProtocolState(status: { protocolVersion?: unknown }): Daem
 }
 
 export function daemonHasActiveWork(
-  status: Pick<DaemonStatus,
-    'activeEventId' | 'activeHostMutations' | 'activeTaskCount' | 'events' | 'outbox'>,
+  status: {
+    activeEventId?: unknown;
+    activeEventIds?: unknown;
+    activeEventCount?: unknown;
+    activeHostMutations?: unknown;
+    activeTaskCount?: unknown;
+    tasks?: unknown;
+    events?: unknown;
+    outbox?: unknown;
+  },
 ): boolean {
+  const positiveCount = (value: unknown): boolean => typeof value === 'number' && value > 0;
+  const count = (value: unknown, key: string): unknown => value && typeof value === 'object'
+    ? (value as Record<string, unknown>)[key]
+    : undefined;
   return Boolean(status.activeEventId)
-    || (status.activeHostMutations ?? 0) > 0
-    || (status.activeTaskCount ?? 0) > 0
-    || status.events.running > 0
-    || status.outbox.sending > 0;
+    || (Array.isArray(status.activeEventIds) && status.activeEventIds.length > 0)
+    || positiveCount(status.activeEventCount)
+    || positiveCount(status.activeHostMutations)
+    || positiveCount(status.activeTaskCount)
+    || positiveCount(count(status.tasks, 'running'))
+    // Protocol <= 6 stored execution state on Events. Keep this read-only
+    // fallback so upgrade safety can detect an old daemon's in-flight work.
+    || positiveCount(count(status.events, 'running'))
+    || positiveCount(count(status.outbox, 'sending'));
 }
 
 export function assertDaemonWorkspace(

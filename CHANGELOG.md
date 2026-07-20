@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Changed
+
+- split immutable daemon Events from executable Tasks, with atomic schema v12 cutover and no dual-write compatibility path
+- move lease, retry, control, attempt, lifecycle, schedule occurrence, and Outbox ownership to Task IDs
+- separate Event timeline and Task management in daemon CLI/IPC, including Task-only dead-letter retry
+- open the CLI on an unpersisted draft, create its Session only on the first message, and derive evolving topic titles from conversation content
+
+### Fixed
+
+- validate the physical v12 Event/Task schema and atomically recover empty half-migrated databases instead of trusting `user_version` alone
+
 ## [0.11.7] - 2026-07-20 11:47
 
 ### Fixed

@@ -472,10 +472,23 @@ test('summarizes and sorts sessions from recent conversation content', async () 
 
   const [summary] = await FileSession.listSummaries(root);
   assert.equal(summary?.id, 'opaque-id');
-  assert.equal(summary?.title, '优化 MimiAgent 的终端交互体验');
+  assert.equal(summary?.title, 'MimiAgent 终端交互与任务队列');
   assert.equal(summary?.preview, '还要支持任务排队');
   assert.equal(summary?.turns, 3);
   assert.equal(summary?.recoverable, false);
+});
+
+test('generalizes Session titles from the conversation topic instead of copying the opening', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'nano-session-topic-title-'));
+  const session = new FileSession(root, 'topic-title');
+  await session.addItems([
+    { role: 'user', content: '进入 Mimi 后不要立刻创建一个 session' },
+    { role: 'user', content: 'session 名称要根据对话内容生成主题标题' },
+  ] as AgentInputItem[]);
+
+  const [summary] = await FileSession.listSummaries(root);
+  assert.equal(summary?.title, 'MimiAgent 会话与标题管理');
+  assert.notEqual(summary?.title, '进入 Mimi 后不要立刻创建一个 session');
 });
 
 test('orders session summaries by latest activity', async () => {

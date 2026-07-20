@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { tool, type Tool } from '@openai/agents';
 import { z } from 'zod';
 import type { EventCancelResult } from './dispatcher.js';
-import type { ReplyRoute, StoredEvent } from './types.js';
+import type { ImmutableEvent, ReplyRoute, TaskRecord } from './types.js';
 import { MimiStore } from './store.js';
 
 const MAX_BACKGROUND_TASK_CHILDREN = 8;
@@ -26,7 +26,8 @@ const delegationSchema = z.object({
 
 export interface BackgroundTaskToolContext {
   store: MimiStore;
-  event: StoredEvent;
+  task: TaskRecord;
+  event: ImmutableEvent;
   sessionId: string;
   replyRoute?: ReplyRoute;
   cancel?: (eventId: string, reason?: string) => MaybePromise<EventCancelResult>;
@@ -66,15 +67,15 @@ function taskPrompt(input: z.infer<typeof delegationSchema>): string {
 
 export interface BackgroundTaskSummary {
   taskId: string;
-  status: StoredEvent['status'];
+  status: TaskRecord['status'];
   objective?: string;
   strategy?: string;
   executor: 'mimi' | 'codex';
   workspaceAccess: 'read' | 'write';
   sessionId?: string;
   originSessionId?: string;
-  parentEventId?: string;
-  depth: number;
+  parentTaskId?: string;
+  authorityEventId: string;
   attempts: number;
   createdAt: string;
   updatedAt: string;
@@ -82,31 +83,31 @@ export interface BackgroundTaskSummary {
   error?: string;
 }
 
-export function backgroundTaskSummary(event: StoredEvent): BackgroundTaskSummary {
-  const payload = event.payload && typeof event.payload === 'object'
-    ? event.payload as Record<string, unknown>
+export function backgroundTaskSummary(task: TaskRecord): BackgroundTaskSummary {
+  const payload = task.objective && typeof task.objective === 'object'
+    ? task.objective as Record<string, unknown>
     : {};
   return {
-    taskId: event.id,
-    status: event.status,
+    taskId: task.id,
+    status: task.status,
     objective: typeof payload.objective === 'string' ? payload.objective.slice(0, 500) : undefined,
     strategy: typeof payload.strategy === 'string' ? payload.strategy : undefined,
-    executor: payload.executor === 'codex' ? 'codex' : 'mimi',
-    workspaceAccess: payload.workspaceAccess === 'read' ? 'read' : 'write',
-    sessionId: event.sessionKey,
-    originSessionId: event.originSessionKey,
-    parentEventId: event.parentEventId,
-    depth: event.taskDepth ?? 0,
-    attempts: event.attempts,
-    createdAt: event.createdAt,
-    updatedAt: event.updatedAt,
-    result: event.result,
-    error: event.error,
+    executor: task.executor === 'codex' ? 'codex' : 'mimi',
+    workspaceAccess: task.workspaceAccess === 'read' ? 'read' : 'write',
+    sessionId: task.sessionKey,
+    originSessionId: typeof payload.originSessionId === 'string' ? payload.originSessionId : undefined,
+    parentTaskId: task.parentTaskId,
+    authorityEventId: task.authorityEventId,
+    attempts: task.attemptCount,
+    createdAt: task.createdAt,
+    updatedAt: task.updatedAt,
+    result: task.result,
+    error: task.error,
   };
 }
 
 export function createBackgroundTaskTools(context: BackgroundTaskToolContext): Tool[] {
-  if (context.event.executionLane === 'task') {
+  if (context.task.type !== 'conversation') {
     if (!context.block) return [];
     return [tool({
       name: 'request_background_task_input',
@@ -132,16 +133,18 @@ export function createBackgroundTaskTools(context: BackgroundTaskToolContext): T
       name: 'list_background_tasks',
       description: '列出最近的 MimiAgent 后台任务及其 queued/running/completed/failed 状态。用于查看已委派工作；不要循环轮询，重要终态会主动通知。',
       parameters: z.object({ limit: z.number().int().min(1).max(50).default(20) }).strict(),
-      execute: async ({ limit }) => context.store.listBackgroundTasks(limit).map(backgroundTaskSummary),
+      execute: async ({ limit }) => context.store.listTasks(limit)
+        .filter((task) => task.type === 'background')
+        .map(backgroundTaskSummary),
     }),
     tool({
       name: 'inspect_background_task',
       description: '读取一个后台任务的目标、状态、结果和错误。仅在用户询问或需要继续处理阻塞任务时调用。',
       parameters: z.object({ taskId: z.string().uuid() }).strict(),
       execute: async ({ taskId }) => {
-        const event = context.store.getEvent(taskId);
-        if (!event || event.executionLane !== 'task') throw new Error(`后台任务不存在：${taskId}`);
-        return backgroundTaskSummary(event);
+        const task = context.store.getTask(taskId);
+        if (!task || task.type !== 'background') throw new Error(`后台任务不存在：${taskId}`);
+        return backgroundTaskSummary(task);
       },
     }),
     tool({
@@ -152,13 +155,13 @@ export function createBackgroundTaskTools(context: BackgroundTaskToolContext): T
         reason: z.string().trim().min(1).max(1_000).optional(),
       }).strict(),
       execute: async ({ taskId, reason }) => {
-        const event = context.store.getEvent(taskId);
-        if (!event || event.executionLane !== 'task') throw new Error(`后台任务不存在：${taskId}`);
+        const task = context.store.getTask(taskId);
+        if (!task || task.type !== 'background') throw new Error(`后台任务不存在：${taskId}`);
         const result = await context.cancel?.(taskId, reason ?? 'owner 取消了后台任务')
-          ?? (['queued', 'paused', 'blocked'].includes(event.status)
-            && context.store.cancelQueuedEvent(taskId, reason ?? 'owner 取消了后台任务')
-            ? { state: 'cancelled' as const }
-            : { state: 'not_found' as const });
+          ?? (() => {
+            context.store.cancelTask(taskId, reason ?? 'owner 取消了后台任务');
+            return { state: 'cancelled' as const };
+          })();
         return { taskId, ...result };
       },
     }),
@@ -170,19 +173,19 @@ export function createBackgroundTaskTools(context: BackgroundTaskToolContext): T
         reason: z.string().trim().min(1).max(1_000).optional(),
       }).strict(),
       execute: async ({ taskId, reason }) => {
-        const event = context.store.getEvent(taskId);
-        if (!event || event.executionLane !== 'task') throw new Error(`后台任务不存在：${taskId}`);
-        if (event.status === 'paused') return { taskId, state: 'already_paused' as const };
-        if (event.status === 'queued') {
-          context.store.pauseQueuedEvent(taskId, reason ?? 'owner 暂停了后台任务');
+        const task = context.store.getTask(taskId);
+        if (!task || task.type !== 'background') throw new Error(`后台任务不存在：${taskId}`);
+        if (task.status === 'paused') return { taskId, state: 'already_paused' as const };
+        if (task.status === 'queued') {
+          context.store.pauseTask(taskId, reason ?? 'owner 暂停了后台任务');
           return { taskId, state: 'paused' as const };
         }
-        if (event.status === 'running') {
+        if (task.status === 'running') {
           const result = await context.pause?.(taskId, reason ?? 'owner 暂停了后台任务')
             ?? { state: 'not_pauseable' as const };
           return { taskId, ...result };
         }
-        if (['completed', 'ignored', 'digested', 'dead_letter', 'archived'].includes(event.status)) {
+        if (['completed', 'failed', 'cancelled', 'dead_letter'].includes(task.status)) {
           return { taskId, state: 'already_terminal' as const };
         }
         return { taskId, state: 'not_pauseable' as const };
@@ -196,12 +199,12 @@ export function createBackgroundTaskTools(context: BackgroundTaskToolContext): T
         context: z.string().trim().min(1).max(4_000).optional(),
       }).strict(),
       execute: async ({ taskId, context: additionalContext }) => {
-        const event = context.store.getEvent(taskId);
-        if (!event || event.executionLane !== 'task') throw new Error(`后台任务不存在：${taskId}`);
-        if (event.status !== 'paused' && event.status !== 'blocked') {
+        const task = context.store.getTask(taskId);
+        if (!task || task.type !== 'background') throw new Error(`后台任务不存在：${taskId}`);
+        if (task.status !== 'paused' && task.status !== 'blocked') {
           return { taskId, state: 'not_resumable' as const };
         }
-        context.store.resumeBackgroundTask(taskId, additionalContext);
+        context.store.resumeTask(taskId, additionalContext);
         return { taskId, state: 'resumed' as const };
       },
     }),
@@ -219,17 +222,20 @@ export function createBackgroundTaskTools(context: BackgroundTaskToolContext): T
           .digest('hex')
           .slice(0, 24);
         const taskId = randomUUID();
-        const timestamp = new Date().toISOString();
         const taskSessionId = `mimi-task-${taskId}`;
-        const inserted = context.store.enqueueBackgroundTask({
+        if (context.store.taskChildCount(context.task.id) >= MAX_BACKGROUND_TASK_CHILDREN) {
+          throw new Error(`当前任务最多可直接委派 ${MAX_BACKGROUND_TASK_CHILDREN} 个后台子任务`);
+        }
+        const inserted = context.store.enqueueTask({
           id: taskId,
-          externalId: `background:${context.event.id}:${digest}`,
-          source: 'mimi:background-task',
-          kind: 'command',
-          trust: context.event.trust,
-          actor: context.event.actor,
-          conversation: context.event.conversation,
-          payload: {
+          type: 'background',
+          idempotencyKey: `delegate:${context.task.id}:${digest}`,
+          triggerEventId: context.task.triggerEventId,
+          authorityEventId: context.task.authorityEventId,
+          parentTaskId: context.task.id,
+          profileId: context.task.profileId,
+          sessionKey: taskSessionId,
+          objective: {
             prompt: taskPrompt(normalized),
             objective: normalized.objective,
             successCriteria: normalized.successCriteria,
@@ -237,26 +243,20 @@ export function createBackgroundTaskTools(context: BackgroundTaskToolContext): T
             strategy: normalized.strategy,
             executor: normalized.executor,
             workspaceAccess: normalized.workspaceAccess,
+            originSessionId: context.sessionId,
+            replyRoute: context.replyRoute ?? context.event.replyRoute ?? { channel: 'system' },
           },
-          occurredAt: timestamp,
-          receivedAt: timestamp,
+          executor: normalized.executor === 'codex' ? 'codex' : 'isolated_worker',
+          workspaceAccess: normalized.workspaceAccess,
           priority: normalized.priority,
-          profileId: context.event.profileId,
-          sessionKey: taskSessionId,
-          replyRoute: context.replyRoute ?? context.event.replyRoute ?? { channel: 'system' },
-          executionLane: 'task',
-          originSessionKey: context.sessionId,
-          parentEventId: context.event.id,
-          rootEventId: context.event.rootEventId ?? context.event.id,
-          taskDepth: 1,
-        }, MAX_BACKGROUND_TASK_CHILDREN);
+        });
         return {
-          taskId: inserted.event.id,
-          sessionId: inserted.event.sessionKey,
-          status: inserted.event.status,
+          taskId: inserted.id,
+          sessionId: inserted.sessionKey,
+          status: inserted.status,
           workspaceAccess: normalized.workspaceAccess,
           executor: normalized.executor,
-          accepted: inserted.inserted,
+          accepted: true,
           message: '后台任务已持久化并接手；完成、失败或需要输入时 MimiAgent 会主动通知。',
         };
       },

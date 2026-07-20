@@ -137,14 +137,47 @@ function compactText(text: string, limit: number): string {
   return clean.length <= limit ? clean : `${clean.slice(0, limit - 1)}…`;
 }
 
-function summarizeTitle(text: string): string {
-  const clean = text
+function cleanedTopicText(text: string): string {
+  return text
     .replace(/\s+/g, ' ')
     .replace(/^\/+\S+\s*/, '')
-    .replace(/^(?:请|帮我|麻烦|我想要?|我希望|需要|必须|能否|你能不能)\s*/u, '')
+    .replace(/^(?:请|帮我|麻烦|我想要?|我希望|需要|必须|能否|你能不能|请问)\s*/u, '')
     .split(/[，。！？；\n]/u)[0]
     ?.trim() ?? '';
-  return compactText(clean, 32);
+}
+
+function summarizeTopic(messages: string[]): string {
+  const corpus = messages.join(' ').replace(/\s+/g, ' ').trim();
+  if (/(?:session|会话)/iu.test(corpus) && /(?:标题|名称|命名|切换|新建)/u.test(corpus)) {
+    return 'MimiAgent 会话与标题管理';
+  }
+  if (/(?:终端|CLI)/iu.test(corpus) && /(?:排队|队列)/u.test(corpus)) {
+    return 'MimiAgent 终端交互与任务队列';
+  }
+  if (/(?:IPC|daemon|后台)/iu.test(corpus) && /(?:启动|进入|连接|超时|报错|无法)/u.test(corpus)) {
+    return 'MimiAgent 启动与后台通信';
+  }
+  if (/(?:Event|事件)/iu.test(corpus) && /(?:Task|任务)/iu.test(corpus)) {
+    return 'MimiAgent Event 与 Task 架构';
+  }
+  if (/(?:终端|CLI)/iu.test(corpus)) return 'MimiAgent 终端交互';
+  if (/(?:memory|记忆)/iu.test(corpus)) return 'MimiAgent 记忆管理';
+
+  const opening = cleanedTopicText(messages[0] ?? '')
+    .replace(/^(?:修复|解决|排查|分析|解释|说明|实现|新增|添加|支持|设计|改造|重构|优化|完善|调整|修改|编写|写|创建|生成|整理|总结|翻译)\s*/u, '')
+    .replace(/(?:的)?(?:功能|能力|体验|问题)\s*$/u, '')
+    .replace(/\s*的\s*/gu, ' ')
+    .trim();
+  const intent = /(?:报错|错误|失败|故障|异常|无法|不能|超时|崩溃|修复|排查)/u.test(corpus)
+    ? '故障排查'
+    : /(?:设计|实现|新增|添加|支持|改造|重构|优化|完善|调整|修改)/u.test(corpus)
+      ? '设计与改进'
+      : /(?:解释|说明|为什么|原理|区别)/u.test(corpus)
+        ? '原理说明'
+        : '主题讨论';
+  const subject = compactText(opening, 22);
+  if (subject === '新对话') return subject;
+  return compactText(`${subject} · ${intent}`, 32);
 }
 
 function isLowInformationOpening(text: string): boolean {
@@ -159,7 +192,7 @@ function summarizeSession(session: SessionFile): SessionSummary {
   const source = titled.length ? titled : meaningful.length ? meaningful : messages;
   return {
     id: session.id,
-    title: summarizeTitle(source[0] ?? session.checkpoint?.input ?? ''),
+    title: summarizeTopic(source.length ? source : [session.checkpoint?.input ?? '']),
     preview: compactText(source.at(-1) ?? session.checkpoint?.input ?? '', 52),
     updatedAt: session.updatedAt,
     turns: messages.length,

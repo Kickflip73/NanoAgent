@@ -387,7 +387,7 @@ class ConnectorProcess implements NotificationSink {
       const source = this.config.source ?? `connector:${this.id}`;
       const kind = isEventKind(event.kind) ? event.kind : 'webhook';
       const trust = this.config.trust as EventTrust;
-      const stored = this.store.enqueueEvent({
+      const stored = this.store.ingestEvent({
         id: randomUUID(),
         externalId: event.externalId,
         source,
@@ -534,7 +534,7 @@ class ConnectorProcess implements NotificationSink {
       ? `Connector “${this.id}” 已离线。${automaticRestart ? 'Daemon 正在自动重启；请核对实时状态并跟踪到恢复，只在无法自愈或影响事务时通知所有者。' : '该 Connector 未启用自动重启；请诊断并执行一次安全恢复，无法恢复时给出精确修复信息。'}`
       : `Connector “${this.id}” 已稳定恢复在线。请清理恢复跟踪并处理仍可安全继续的工作，不要重放中断期间结果不确定的外部动作。`;
     try {
-      this.store.enqueueEvent({
+      this.store.ingestEvent({
         id: randomUUID(),
         externalId: `${this.id}:${status}:${randomUUID()}`,
         source: 'system:connector-health',

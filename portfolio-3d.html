@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>刘煜燃 · 3D Portfolio</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#050510;overflow:hidden;cursor:crosshair}
+canvas{display:block}
+#loading{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
+  background:#050510;z-index:999;transition:opacity .6s}
+#loading.hidden{opacity:0;pointer-events:none}
+.loader-ring{width:48px;height:48px;border:2px solid rgba(110,150,255,.2);
+  border-top-color:#7eb4ff;border-radius:50%;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<div id="loading"><div class="loader-ring"></div></div>
+
+<script type="importmap">
+{"imports":{
+  "three":"https://unpkg.com/three@0.160.0/build/three.module.js",
+  "three/addons/":"https://unpkg.com/three@0.160.0/examples/jsm/"
+}}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+
+// ═══════════════════ RENDERER SETUP ═══════════════════
+const w=()=>window.innerWidth, h=()=>window.innerHeight;
+const renderer=new THREE.WebGLRenderer({antialias:true,alpha:true});
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+renderer.setSize(w(),h());
+renderer.toneMapping=THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure=1.2;
+document.body.appendChild(renderer.domElement);
+
+const scene=new THREE.Scene();
+scene.fog=new THREE.FogExp2('#050510',0.0002);
+
+const camera=new THREE.PerspectiveCamera(60,w()/h(),0.1,120);
+camera.position.set(0,0.4,12);
+
+// ═══════════════ BLUR RENDER TARGET (half res) ═══════════════
+const blurScale=0.45;
+let blurRT=new THREE.WebGLRenderTarget(
+  Math.floor(w()*blurScale),Math.floor(h()*blurScale),
+  {minFilter:THREE.LinearFilter,magFilter:THREE.LinearFilter,format:THREE.RGBAFormat}
+);
+
+// ═══════════════ LIGHTING ═══════════════
+scene.add(new THREE.AmbientLight('#334466',0.8));
+const pLight=new THREE.PointLight('#7ea8ff',80,30);
+pLight.position.set(0,3,5); scene.add(pLight);
+const pLight2=new THREE.PointLight('#b98aff',50,25);
+pLight2.position.set(-3,-1,3); scene.add(pLight2);
+
+// ═══════════════ GLOW TEXTURE ═══════════════
+function glowTex(c1,c2){const c=document.createElement('canvas');
+c.width=c.height=64;const x=c.getContext('2d'),
+g=x.createRadialGradient(32,32,0,32,32,32);
+g.addColorStop(0,c1);g.addColorStop(0.12,c2);g.addColorStop(0.5,'rgba(0,0,0,0)');
+x.fillStyle=g;x.fillRect(0,0,64,64);return new THREE.CanvasTexture(c);}
+const gt=glowTex('rgba(160,210,255,1)','rgba(100,150,255,0.5)');
+
+// ═══════════════ STARS ═══════════════
+const starsGeo=new THREE.BufferGeometry();
+const N=2400,pos=new Float32Array(N*3),col=new Float32Array(N*3);
+for(let i=0;i<N;i++){const th=Math.random()*Math.PI*2,ph=Math.acos(2*Math.random()-1),
+r=22+Math.pow(Math.random(),0.5)*45;
+pos[i*3]=r*Math.sin(ph)*Math.cos(th);pos[i*3+1]=r*Math.sin(ph)*Math.sin(th);pos[i*3+2]=r*Math.cos(ph);
+const c=0.3+Math.random()*0.5;col[i*3]=0.5+c*0.5;col[i*3+1]=0.3+c*0.3;col[i*3+2]=0.6+c*0.4;}
+starsGeo.setAttribute('position',new THREE.BufferAttribute(pos,3));
+starsGeo.setAttribute('color',new THREE.BufferAttribute(col,3));
+const stars=new THREE.Points(starsGeo,new THREE.PointsMaterial({size:0.09,map:gt,
+  blending:THREE.AdditiveBlending,depthWrite:false,vertexColors:true,opacity:0.8}));
+stars.renderOrder=0; scene.add(stars);
+
+// ═══════════════ CENTRAL TORUS KNOT ═══════════════
+const torus=new THREE.Mesh(
+  new THREE.TorusKnotGeometry(1.5,0.16,200,28),
+  new THREE.MeshStandardMaterial({color:'#2a4488',emissive:'#0d1a3a',metalness:0.35,roughness:0.35})
+); torus.renderOrder=1; scene.add(torus);
+
+const torusWF=new THREE.Mesh(
+  new THREE.TorusKnotGeometry(1.52,0.19,100,14),
+  new THREE.MeshBasicMaterial({color:'#6ea8ff',wireframe:true,opacity:0.3,transparent:true})
+); torusWF.renderOrder=1; scene.add(torusWF);
+
+const ring=new THREE.Mesh(
+  new THREE.TorusGeometry(2.3,0.06,64,180),
+  new THREE.MeshBasicMaterial({color:'#5588dd',transparent:true,opacity:0.2,blending:THREE.AdditiveBlending,depthWrite:false})
+); ring.rotation.x=Math.PI/2; ring.renderOrder=0; scene.add(ring);
+
+// ═══════════════ ORBITING PARTICLES ═══════════════
+const orbs=[];
+for(let i=0;i<12;i++){const s=new THREE.Mesh(
+  new THREE.SphereGeometry(0.06,12,12),
+  new THREE.MeshBasicMaterial({color:i<6?'#6ea8ff':'#b98aff',blending:THREE.AdditiveBlending,depthWrite:false})
+); const a=(i/12)*Math.PI*2,d=2.5+Math.random()*3.5;
+s.userData={a,d,sp:0.3+Math.random()*0.7,yo:(Math.random()-0.5)*4};
+s.position.set(Math.cos(a)*d,s.userData.yo,Math.sin(a)*d);
+s.renderOrder=0; scene.add(s); orbs.push(s);}
+
+// Floating diamond shape
+const diamondGeo=new THREE.OctahedronGeometry(0.35,0);
+const diamond=new THREE.Mesh(diamondGeo,new THREE.MeshStandardMaterial({
+  color:'#8899dd',emissive:'#334466',metalness:0.6,roughness:0.2,wireframe:false}));
+diamond.renderOrder=1; scene.add(diamond);
+
+// ═══════════════ GROUND GRID ═══════════════
+const gridHelper=new THREE.PolarGridHelper(18,48,24,64,'#1a2255','#0d1133');
+gridHelper.position.y=-5; scene.add(gridHelper);
+
+// ═══════════════ PANEL CONTENT CANVAS ═══════════════
+function textTex(wid,hei,draw){const c=document.createElement('canvas');
+c.width=wid;c.height=hei;draw(c.getContext('2d'),wid,hei);
+const t=new THREE.CanvasTexture(c);t.minFilter=THREE.LinearFilter;t.magFilter=THREE.LinearFilter;
+t.colorSpace=THREE.SRGBColorSpace;return t;}
+
+function gradientText(ctx,text,x,y,size,colors){
+  const g=ctx.createLinearGradient(x,y-size,x+ctx.measureText(text).width,y);
+  colors.forEach((c,i)=>g.addColorStop(i/(colors.length-1),c));
+  ctx.fillStyle=g;ctx.font=`bold ${size}px "SF Pro Display","PingFang SC","Microsoft YaHei",sans-serif`;
+  ctx.fillText(text,x,y);
+}
+
+function drawPanelHero(ctx,w,h){
+  ctx.textAlign='center';
+  gradientText(ctx,'刘煜燃',w/2,110,64,['#80b8ff','#c090ff','#f472b6']);
+  ctx.fillStyle='rgba(160,190,230,0.65)';ctx.font='500 18px "SF Pro Display","PingFang SC",sans-serif';
+  ctx.fillText('FULL-STACK DEVELOPER',w/2,156);
+  // decorative line
+  ctx.strokeStyle='rgba(130,170,255,0.3)';ctx.lineWidth=1;
+  ctx.beginPath();ctx.moveTo(w*0.25,174);ctx.lineTo(w*0.75,174);ctx.stroke();
+  ctx.fillStyle='rgba(180,200,240,0.4)';ctx.font='400 14px "PingFang SC","Microsoft YaHei",sans-serif';
+  ctx.fillText('构建极致体验 · 用代码创造未来',w/2,206);
+}
+
+function drawPanelAbout(ctx,w,h){
+  ctx.fillStyle='#a0c8ff';ctx.font='bold 22px "SF Pro Display","PingFang SC",sans-serif';
+  ctx.fillText('About',24,50);
+  ctx.fillStyle='rgba(180,200,235,0.85)';ctx.font='400 15px/1.8 "PingFang SC","Microsoft YaHei",sans-serif';
+  const lines=['24岁 · 全栈开发者','互联网公司任职','独立自主 · 自驱力强','热爱技术与开源'];
+  lines.forEach((l,i)=>ctx.fillText(l,24,84+i*26));
+}
+
+function drawPanelSkills(ctx,w,h){
+  ctx.fillStyle='#a0c8ff';ctx.font='bold 22px "SF Pro Display","PingFang SC",sans-serif';
+  ctx.fillText('Skills',24,50);
+  const tags=['TypeScript','React','Node.js','Python','Three.js','Chrome Ext','AI Agent','Vite'];
+  let x=24,y=78;
+  tags.forEach(t=>{
+    const tw=ctx.measureText(t).width+28;
+    if(x+tw>w-16){x=24;y+=36;}
+    ctx.fillStyle='rgba(90,140,240,0.15)';ctx.strokeStyle='rgba(110,160,255,0.25)';ctx.lineWidth=1;
+    roundRect(ctx,x,y,tw-2,28,14);
+    ctx.fillStyle='rgba(180,210,255,0.9)';ctx.font='400 13px "SF Pro Display","PingFang SC",sans-serif';
+    ctx.fillText(t,x+14,y+19);
+    x+=tw+8;
+  });
+}
+
+function roundRect(ctx,x,y,w,h,r){ctx.beginPath();ctx.moveTo(x+r,y);
+ctx.lineTo(x+w-r,y);ctx.quadraticCurveTo(x+w,y,x+w,y+r);
+ctx.lineTo(x+w,y+h-r);ctx.quadraticCurveTo(x+w,y+h,x+w-r,y+h);
+ctx.lineTo(x+r,y+h);ctx.quadraticCurveTo(x,y+h,x,y+h-r);
+ctx.lineTo(x,y+r);ctx.quadraticCurveTo(x,y,x+r,y);ctx.closePath();ctx.fill();ctx.stroke();}
+
+function drawPanelProjects(ctx,w,h){
+  ctx.fillStyle='#a0c8ff';ctx.font='bold 22px "SF Pro Display","PingFang SC",sans-serif';
+  ctx.fillText('Projects',24,50);
+  const items=[
+    ['MimiAgent','全能个人 AI Agent'],
+    ['DevContext','AI 代码上下文工具'],
+    ['Jarvis IM','智能消息接管系统']
+  ];
+  items.forEach(([n,d],i)=>{const y=82+i*42;
+    ctx.fillStyle='rgba(200,220,255,0.95)';ctx.font='600 15px "SF Pro Display","PingFang SC",sans-serif';
+    ctx.fillText(n,24,y);
+    ctx.fillStyle='rgba(150,180,220,0.7)';ctx.font='400 13px "PingFang SC","Microsoft YaHei",sans-serif';
+    ctx.fillText(d,24,y+22);
+  });
+}
+
+function drawPanelContact(ctx,w,h){
+  ctx.fillStyle='#a0c8ff';ctx.font='bold 22px "SF Pro Display","PingFang SC",sans-serif';
+  ctx.fillText('Contact',24,50);
+  ctx.fillStyle='rgba(180,200,235,0.8)';ctx.font='400 15px/1.8 "PingFang SC","Microsoft YaHei",sans-serif';
+  ctx.fillText('GitHub · Email · Blog',24,84);
+  ctx.fillText('欢迎技术交流与合作',24,114);
+  ctx.fillStyle='rgba(160,190,230,0.6)';ctx.font='italic 500 15px "SF Pro Display",sans-serif';
+  ctx.fillText("Let's build the future.",24,150);
+}
+
+// ═══════════════ GLASS PANEL SHADER ═══════════════
+const glassVert=/*glsl*/`
+varying vec2 vUv; varying vec4 vScreenPos;
+void main(){
+  vUv=uv;
+  vec4 mv=modelViewMatrix*vec4(position,1.);
+  vScreenPos=projectionMatrix*mv;
+  gl_Position=vScreenPos;
+}`;
+
+const glassFrag=/*glsl*/`
+uniform sampler2D uBg; uniform sampler2D uContent;
+uniform vec3 uTint; uniform float uOpacity; uniform float uHover;
+varying vec2 vUv; varying vec4 vScreenPos;
+void main(){
+  vec2 suv=vScreenPos.xy/vScreenPos.w*.5+.5;
+  suv.y=1.-suv.y;
+  vec4 bg=texture2D(uBg,suv);
+  vec3 glass=mix(bg.rgb,uTint,.22);
+  float e=min(min(vUv.x,1.-vUv.x),min(vUv.y,1.-vUv.y));
+  float edge=smoothstep(0.,.04,e)-smoothstep(.04,.16,e);
+  float edgeGlow=smoothstep(0.,.06,e);
+  glass=mix(glass,uTint*1.6,edge*.35+edgeGlow*.08);
+  float borderBright=1.-smoothstep(.015,.04,e);
+  glass+=borderBright*uTint*.22;
+  vec4 c=texture2D(uContent,vUv);
+  vec3 f=mix(glass,c.rgb,c.a);
+  float a=uOpacity*(.78+edge*.15+edgeGlow*.04+borderBright*.25);
+  a+=uHover*.12;
+  gl_FragColor=vec4(f,a);
+}`;
+
+function createPanel(worldW,worldH,contentTex,tint){
+  const mat=new THREE.ShaderMaterial({
+    uniforms:{
+      uBg:{value:blurRT.texture},
+      uContent:{value:contentTex},
+      uTint:{value:new THREE.Color(tint)},
+      uOpacity:{value:0.88},
+      uHover:{value:0}
+    },
+    vertexShader:glassVert,fragmentShader:glassFrag,
+    transparent:true,depthWrite:false,
+  });
+  const mesh=new THREE.Mesh(new THREE.PlaneGeometry(worldW,worldH),mat);
+  mesh.renderOrder=2;
+  mesh.userData={hoverTarget:0};
+  return mesh;
+}
+
+// ═══════════════ CREATE PANELS ═══════════════
+const panels=[];
+function addPanel(wW,wH,cW,cH,drawFn,tint,x,y,z){
+  const tex=textTex(cW,cH,drawFn);
+  const panel=createPanel(wW,wH,tex,tint);
+  panel.position.set(x,y,z);
+  scene.add(panel);
+  panels.push(panel);
+  return panel;
+}
+
+addPanel(5.2,2.3,1144,506,drawPanelHero,'#5577bb',0,2.6,0);
+addPanel(3.5,3.0,840,720,drawPanelAbout,'#4466aa',-4.5,0,-1.2);
+addPanel(4.0,3.0,960,720,drawPanelSkills,'#554488',4.5,0,-1.2);
+addPanel(4.2,2.6,1008,624,drawPanelProjects,'#335588',-5.8,-2.8,-3.5);
+addPanel(3.5,2.6,840,624,drawPanelContact,'#445577',5.8,-2.8,-3.5);
+
+// ═══════════════ MOUSE & CAMERA ═══════════════
+const mouse=new THREE.Vector2(),target=new THREE.Vector2();
+const raycaster=new THREE.Raycaster();
+document.addEventListener('mousemove',e=>{
+  mouse.x=(e.clientX/w())*2-1; mouse.y=-(e.clientY/h())*2+1;
+});
+document.addEventListener('touchmove',e=>{
+  mouse.x=(e.touches[0].clientX/w())*2-1; mouse.y=-(e.touches[0].clientY/h())*2+1;
+},{passive:true});
+
+// ═══════════════ ANIMATION ═══════════════
+const clock=new THREE.Clock();
+function animate(){
+  requestAnimationFrame(animate);
+  const t=clock.getElapsedTime();
+
+  // Smooth mouse follow
+  target.x+=(mouse.x-target.x)*0.05;
+  target.y+=(mouse.y-target.y)*0.05;
+
+  // Camera parallax
+  const camX=target.x*3.5,camY=0.4+target.y*2.2;
+  camera.position.x+=(camX-camera.position.x)*0.03;
+  camera.position.y+=(camY-camera.position.y)*0.03;
+  camera.lookAt(target.x*2,target.y*1.5,0);
+
+  // Rotate objects
+  torus.rotation.x+=0.004; torus.rotation.y+=0.006;
+  torusWF.rotation.copy(torus.rotation);
+  diamond.rotation.x+=0.005; diamond.rotation.y+=0.008;
+  diamond.position.set(Math.sin(t*0.4)*1.8,Math.cos(t*0.5)*1.2-1,Math.cos(t*0.35)*1.5);
+
+  ring.scale.setScalar(1+Math.sin(t*0.7)*0.06);
+  ring.material.opacity=0.18+Math.sin(t*1.1)*0.06;
+
+  orbs.forEach(s=>{
+    s.userData.a+=s.userData.sp*0.01;
+    const a=s.userData.a;
+    s.position.x=Math.cos(a)*s.userData.d;
+    s.position.z=Math.sin(a)*s.userData.d;
+    s.position.y=s.userData.yo+Math.sin(t*0.6+a)*0.6;
+  });
+
+  stars.rotation.y+=0.00025; stars.rotation.x+=0.00008;
+
+  // Hover detection
+  raycaster.setFromCamera(new THREE.Vector2(target.x,target.y),camera);
+  const hits=raycaster.intersectObjects(panels);
+  panels.forEach(p=>p.userData.hoverTarget=0);
+  if(hits.length){const p=hits[0].object;p.userData.hoverTarget=1;}
+  panels.forEach(p=>{
+    p.material.uniforms.uHover.value+=(p.userData.hoverTarget-p.material.uniforms.uHover.value)*0.12;
+  });
+
+  // ═══════ TWO-PASS RENDER ═══════
+  // Pass 1: render non-glass to blur RT
+  panels.forEach(p=>p.visible=false);
+  renderer.setRenderTarget(blurRT);
+  renderer.render(scene,camera);
+
+  // Pass 2: full scene with glass
+  panels.forEach(p=>p.visible=true);
+  renderer.setRenderTarget(null);
+  renderer.render(scene,camera);
+}
+
+// ═══════════════ RESIZE ═══════════════
+window.addEventListener('resize',()=>{
+  camera.aspect=w()/h(); camera.updateProjectionMatrix();
+  renderer.setSize(w(),h());
+  blurRT.dispose();
+  blurRT=new THREE.WebGLRenderTarget(
+    Math.floor(w()*blurScale),Math.floor(h()*blurScale),
+    {minFilter:THREE.LinearFilter,magFilter:THREE.LinearFilter,format:THREE.RGBAFormat}
+  );
+  panels.forEach(p=>p.material.uniforms.uBg.value=blurRT.texture);
+});
+
+// ═══════════════ START ═══════════════
+animate();
+requestAnimationFrame(()=>requestAnimationFrame(()=>{
+  document.getElementById('loading').classList.add('hidden');
+  setTimeout(()=>document.getElementById('loading').remove(),600);
+}));
+</script>
+</body>
+</html>
