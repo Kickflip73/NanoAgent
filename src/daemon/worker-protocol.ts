@@ -67,7 +67,7 @@ const appConfigSchema = z.object({
   historyLimit: z.number().int().positive(),
   contextWindow: z.number().int().positive().optional(),
   outputReserve: z.number().int().positive().optional(),
-  maxTurns: z.number().int().positive(),
+  maxTurns: z.number().int().positive().nullable(),
   teamMaxConcurrency: z.number().int().positive().optional(),
   sessionMaxConcurrency: z.number().int().positive().optional(),
   permissionMode: z.enum(['workspace', 'read-only', 'trusted']).optional(),

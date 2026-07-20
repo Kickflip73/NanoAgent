@@ -931,7 +931,6 @@ export function daemonLaunchEnvironment(config: AppConfig): Record<string, strin
     MIMI_SKILLS_DIR: config.skillsRoot,
     MIMI_MCP_CONFIG: config.mcpConfig,
     MIMI_HISTORY_LIMIT: String(config.historyLimit),
-    MIMI_MAX_TURNS: String(config.maxTurns),
     MIMI_TEAM_MAX_CONCURRENCY: String(config.teamMaxConcurrency ?? 4),
     MIMI_PERMISSION_MODE: config.permissionMode ?? 'trusted',
     MIMI_SESSION: session,
@@ -939,6 +938,7 @@ export function daemonLaunchEnvironment(config: AppConfig): Record<string, strin
     MIMI_CONNECTORS_CONFIG: paths.connectorsConfig,
     MIMI_ASSISTANT_CONFIG: paths.assistantConfig,
   };
+  if (config.maxTurns !== null) environment.MIMI_MAX_TURNS = String(config.maxTurns);
   if (config.contextWindow !== undefined) environment.MIMI_CONTEXT_WINDOW = String(config.contextWindow);
   if (config.outputReserve !== undefined) environment.MIMI_OUTPUT_TOKEN_RESERVE = String(config.outputReserve);
   if (config.trustedWorkspaceMcp !== undefined) {

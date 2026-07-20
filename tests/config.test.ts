@@ -221,19 +221,22 @@ test('migrates old template workspace defaults without overriding versioned rest
   }
 });
 
-test('migrates the version-2 generated max-turn default without overriding explicit modern values', () => {
+test('leaves Agent runs unlimited by default while preserving explicit operator limits', () => {
   const previousTurns = process.env.MIMI_MAX_TURNS;
   const previousVersion = process.env.MIMI_CONFIG_VERSION;
   try {
+    delete process.env.MIMI_MAX_TURNS;
+    assert.equal(loadConfig(ISOLATED_HOME).maxTurns, null);
+
     process.env.MIMI_CONFIG_VERSION = '2';
-    process.env.MIMI_MAX_TURNS = '200';
-    assert.equal(loadConfig(ISOLATED_HOME).maxTurns, 32);
+    process.env.MIMI_MAX_TURNS = '32';
+    assert.equal(loadConfig(ISOLATED_HOME).maxTurns, null);
 
     process.env.MIMI_MAX_TURNS = '120';
     assert.equal(loadConfig(ISOLATED_HOME).maxTurns, 120);
-    process.env.MIMI_CONFIG_VERSION = '3';
-    process.env.MIMI_MAX_TURNS = '200';
-    assert.equal(loadConfig(ISOLATED_HOME).maxTurns, 200);
+    process.env.MIMI_CONFIG_VERSION = '4';
+    process.env.MIMI_MAX_TURNS = '32';
+    assert.equal(loadConfig(ISOLATED_HOME).maxTurns, 32);
   } finally {
     if (previousTurns === undefined) delete process.env.MIMI_MAX_TURNS;
     else process.env.MIMI_MAX_TURNS = previousTurns;

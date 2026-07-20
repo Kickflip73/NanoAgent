@@ -2061,7 +2061,7 @@ test('an uncertain Completion Gate result is terminal and never automatically re
   }
 });
 
-test('three identical tool calls and results terminate one run as a no-progress loop', async () => {
+test('repeated tool results do not terminate a progressing run by call count', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-dispatcher-tool-loop-'));
   const store = new MimiStore(path.join(root, 'mimi.db'));
   const attention = await AttentionEngine.load(path.join(root, 'assistant.json'), store);
@@ -2090,16 +2090,15 @@ test('three identical tool calls and results terminate one run as a no-progress 
   try {
     store.enqueueEvent(event('tool-loop', '发送消息', 100));
     await dispatcher.processOnce();
-    assert.equal(store.getEvent('tool-loop')?.status, 'dead_letter');
+    assert.equal(store.getEvent('tool-loop')?.status, 'completed');
     assert.equal(store.getEvent('tool-loop')?.attempts, 1);
-    assert.match(store.getEvent('tool-loop')?.error ?? '', /无进展循环/);
   } finally {
     await host.close();
     store.close();
   }
 });
 
-test('three repeated five-tool cycles terminate one run as a no-progress loop', async () => {
+test('repeated multi-tool cycles do not terminate a long run by cycle count', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-dispatcher-long-tool-loop-'));
   const store = new MimiStore(path.join(root, 'mimi.db'));
   const attention = await AttentionEngine.load(path.join(root, 'assistant.json'), store);
@@ -2130,8 +2129,7 @@ test('three repeated five-tool cycles terminate one run as a no-progress loop', 
   try {
     store.enqueueEvent(event('long-tool-loop', '重复五工具链', 100));
     await dispatcher.processOnce();
-    assert.equal(store.getEvent('long-tool-loop')?.status, 'dead_letter');
-    assert.match(store.getEvent('long-tool-loop')?.error ?? '', /无进展循环/);
+    assert.equal(store.getEvent('long-tool-loop')?.status, 'completed');
   } finally {
     await host.close();
     store.close();

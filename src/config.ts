@@ -27,7 +27,7 @@ export interface AppConfig {
   historyLimit: number;
   contextWindow?: number;
   outputReserve?: number;
-  maxTurns: number;
+  maxTurns: number | null;
   teamMaxConcurrency?: number;
   sessionMaxConcurrency?: number;
   permissionMode?: AgentPermissionMode;
@@ -288,12 +288,14 @@ export function loadConfig(homeDirectory = os.homedir()): AppConfig {
   const skillsRoot = preferredEnvironmentValue('MIMI_SKILLS_DIR', 'AGENT_SKILLS_DIR');
   const mcpConfig = preferredEnvironmentValue('MIMI_MCP_CONFIG', 'MCP_CONFIG');
   const selectedMaxTurns = environmentEntry('MIMI_MAX_TURNS', 'MAX_TURNS');
-  const configuredMaxTurns = positiveSafeInteger(['MIMI_MAX_TURNS', 'MAX_TURNS'], 32)!;
-  const maxTurns = configurationVersion() === 2
-    && selectedMaxTurns?.name === 'MIMI_MAX_TURNS'
-    && selectedMaxTurns.value === '200'
-    ? 32
-    : configuredMaxTurns;
+  const configVersion = configurationVersion();
+  const generatedTurnLimit = selectedMaxTurns?.name === 'MIMI_MAX_TURNS' && (
+    (selectedMaxTurns.value === '200' && configVersion === 2)
+    || (selectedMaxTurns.value === '32' && (configVersion ?? 0) <= 3)
+  );
+  const maxTurns = !selectedMaxTurns || generatedTurnLimit
+    ? null
+    : positiveSafeInteger(['MIMI_MAX_TURNS', 'MAX_TURNS'])!;
   return {
     provider: modelProvider(),
     workspaceRoot,

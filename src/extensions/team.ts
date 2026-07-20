@@ -103,7 +103,7 @@ async function defaultWorker(
   const agent = new Agent({ name: `Mimi ${task.role} · ${task.id}`, model: options.model, instructions: prompt, tools: workerTools });
   const runner = new Runner({ workflowName: `MimiAgent Ultra · ${task.role}`, tracingDisabled: true, traceIncludeSensitiveData: false });
   const result = await runner.run(agent, task.description, {
-    maxTurns: task.role === 'builder' ? 24 : task.role === 'tester' ? 20 : 16,
+    maxTurns: null,
     signal,
     toolExecution: { maxFunctionToolConcurrency: task.role === 'builder' ? 1 : 2 },
   });

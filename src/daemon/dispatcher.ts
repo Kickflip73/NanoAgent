@@ -1,4 +1,4 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import type { RunStreamEvent } from '@openai/agents';
 import type { MimiAgent } from '../runtime/mimi-agent.js';
 import { MimiHost } from '../runtime/mimi-host.js';
@@ -52,7 +52,6 @@ interface ActiveExecution {
   runController?: AbortController;
   promise?: Promise<void>;
   pendingToolCalls: Map<string, { name: string; argumentsJson: string }>;
-  toolResultHistory: string[];
 }
 
 export type EventCancelResult =
@@ -101,17 +100,6 @@ function delay(ms: number, signal: AbortSignal): Promise<void> {
     }
     signal.addEventListener('abort', done, { once: true });
   });
-}
-
-function repeatedToolCycle(history: readonly string[]): boolean {
-  for (let period = 1; period <= Math.min(8, Math.floor(history.length / 3)); period += 1) {
-    if (history.length < period * 3) continue;
-    const tail = history.slice(-period);
-    const previous = history.slice(-period * 2, -period);
-    const earlier = history.slice(-period * 3, -period * 2);
-    if (tail.every((value, index) => value === previous[index] && value === earlier[index])) return true;
-  }
-  return false;
 }
 
 export class MimiDispatcher {
@@ -384,7 +372,6 @@ export class MimiDispatcher {
       event,
       tools: 0,
       pendingToolCalls: new Map(),
-      toolResultHistory: [],
     };
     this.active.set(event.id, active);
     const promise = this.processEvent(active);
@@ -611,26 +598,7 @@ export class MimiDispatcher {
             const fallback = callId ? undefined : [...active.pendingToolCalls.entries()]
               .find(([, pending]) => pending.name === raw.name);
             const resolvedCallId = callId ?? fallback?.[0];
-            const call = resolvedCallId ? active.pendingToolCalls.get(resolvedCallId) : undefined;
             if (resolvedCallId) active.pendingToolCalls.delete(resolvedCallId);
-            if (call) {
-              let outputJson: string;
-              try {
-                outputJson = JSON.stringify(item.output ?? null);
-              } catch {
-                outputJson = String(item.output);
-              }
-              const fingerprint = createHash('sha256')
-                .update(`${call.name}\0${call.argumentsJson}\0${outputJson}`)
-                .digest('hex');
-              active.toolResultHistory.push(fingerprint);
-              if (active.toolResultHistory.length > 24) active.toolResultHistory.shift();
-              if (repeatedToolCycle(active.toolResultHistory) && !runSignal.aborted) {
-                runController.abort(new TerminalRunInterruptedError(
-                  `工具调用序列重复获得相同结果，判定为无进展循环并停止自动重试（最近工具：${call.name}）`,
-                ));
-              }
-            }
             this.synchronizeDurableTaskControl(active);
             if (active.cancelRequested && active.tools === 0) {
               pauseRunIdleWatchdog();

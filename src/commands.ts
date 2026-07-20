@@ -289,7 +289,7 @@ export class CommandHandler {
         `输出      ${this.ui.getOutputLevel?.() ?? 'tools'}`,
         `会话      ${info.sessionId}`,
         `工作区    ${info.workspaceRoot}`,
-        `最大轮数  ${info.maxTurns}`,
+        `最大轮数  ${info.maxTurns ?? '不限（由状态、取消与超时控制）'}`,
         `Skills    ${info.skillCount}`,
         `Memories  ${info.memoryCount}`,
         `MCP       ${info.mcpServers.join(', ') || '未连接'}`,
