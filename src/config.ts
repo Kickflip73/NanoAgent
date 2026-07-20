@@ -145,17 +145,21 @@ function modelProvider(): AppConfig['provider'] {
   return value;
 }
 
-function permissionMode(): AgentPermissionMode {
-  const modern = environmentEntry('MIMI_PERMISSION_MODE');
-  const legacy = environmentEntry('AGENT_PERMISSION_MODE');
+function configurationVersion(): number | undefined {
   const configVersion = environmentEntry('MIMI_CONFIG_VERSION');
-  const selected = modern ?? legacy;
   if (configVersion && (!/^\d+$/.test(configVersion.value)
     || !Number.isSafeInteger(Number(configVersion.value))
     || Number(configVersion.value) <= 0)) {
     throw new Error('MIMI_CONFIG_VERSION 必须是正安全整数');
   }
-  const version = configVersion ? Number(configVersion.value) : undefined;
+  return configVersion ? Number(configVersion.value) : undefined;
+}
+
+function permissionMode(): AgentPermissionMode {
+  const modern = environmentEntry('MIMI_PERMISSION_MODE');
+  const legacy = environmentEntry('AGENT_PERMISSION_MODE');
+  const selected = modern ?? legacy;
+  const version = configurationVersion();
   // Older templates wrote workspace even when the owner made no choice. That
   // default appeared under both the legacy and modern names, so only a current
   // template marker can distinguish a deliberate workspace restriction.
@@ -283,6 +287,13 @@ export function loadConfig(homeDirectory = os.homedir()): AppConfig {
   }
   const skillsRoot = preferredEnvironmentValue('MIMI_SKILLS_DIR', 'AGENT_SKILLS_DIR');
   const mcpConfig = preferredEnvironmentValue('MIMI_MCP_CONFIG', 'MCP_CONFIG');
+  const selectedMaxTurns = environmentEntry('MIMI_MAX_TURNS', 'MAX_TURNS');
+  const configuredMaxTurns = positiveSafeInteger(['MIMI_MAX_TURNS', 'MAX_TURNS'], 32)!;
+  const maxTurns = configurationVersion() === 2
+    && selectedMaxTurns?.name === 'MIMI_MAX_TURNS'
+    && selectedMaxTurns.value === '200'
+    ? 32
+    : configuredMaxTurns;
   return {
     provider: modelProvider(),
     workspaceRoot,
@@ -293,7 +304,7 @@ export function loadConfig(homeDirectory = os.homedir()): AppConfig {
     historyLimit: positiveSafeInteger(['MIMI_HISTORY_LIMIT', 'HISTORY_LIMIT'], 40)!,
     contextWindow,
     outputReserve,
-    maxTurns: positiveSafeInteger(['MIMI_MAX_TURNS', 'MAX_TURNS'], 200)!,
+    maxTurns,
     teamMaxConcurrency,
     sessionMaxConcurrency,
     permissionMode: permissionMode(),

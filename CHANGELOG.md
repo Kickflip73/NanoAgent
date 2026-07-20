@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.11.3] - 2026-07-20 09:57
+
+### Fixed
+
+- bound duplicate execution and delivery (@Kickflip73)
+
 ## [0.11.2] - 2026-07-20 00:59
 
 ### Fixed
@@ -23,6 +29,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- bound Completion Gate deferrals and model turns, keep pure answers out of execution gating, isolate stale Goal/Plan/recovery context, preserve delivery suppression across crash recovery, batch briefing/context protocol units, and prevent one blocked IM channel from holding up another
+- disable the generic NapCat OneBot client after a remembered QQ account has an account-specific client, preventing a permanent duplicate reverse-WebSocket reconnect loop
 - keep CLI submission and event streaming alive across transient IPC timeouts, reconcile ambiguous submissions by stable Event ID, and forbid detached Shell work that escapes task ownership
 - require Completion Contracts for execution tasks, keep failed checks inside the current task, and reject terminal success unless real ledger receipts, artifacts, tests and Plan state satisfy every criterion; external actions require confirmed rather than accepted delivery
 - unify active source, tools, scripts, configuration examples, launchd identifiers and OpenClaw bridge names under MimiAgent, with old data handled only by the one-way migration boundary

@@ -111,6 +111,12 @@ export interface CompletedExecutionReceipt {
   usage?: ContextUsageSnapshot;
   actions?: RuntimeAction[];
   effects?: RuntimeEffect[];
+  delivery?: CompletionDeliveryDisposition;
+}
+
+export interface CompletionDeliveryDisposition {
+  suppressed: true;
+  reason?: string;
 }
 
 const contextUsageSchema = z.object({
@@ -126,6 +132,10 @@ const completedExecutionReceiptSchema = z.object({
   answer: z.string(),
   usage: contextUsageSchema.optional(),
   actions: z.array(runtimeActionSchema).max(20).default([]),
+  delivery: z.object({
+    suppressed: z.literal(true),
+    reason: z.string().trim().min(1).max(500).optional(),
+  }).strict().optional(),
 }).strict();
 
 const RUNTIME_ACTION_TOOLS = new Set([
@@ -221,6 +231,7 @@ export interface MimiRunOptions {
   authorizeSideEffect?: (toolName: string, argumentsJson: string) => Promise<void>;
   requireCompletionGate?: boolean;
   completionContract?: CompletionContract;
+  completionDelivery?: () => CompletionDeliveryDisposition | undefined;
 }
 
 export interface AgentSessionSnapshot {
@@ -391,6 +402,11 @@ export class MimiAgent {
 
   async stream(input: string, signal?: AbortSignal, options?: MimiRunOptions) {
     if (this.activeRun) throw new Error('当前 Session 仍有任务运行中，请等待完成或先中止');
+    const policyTools = options?.policy?.allowedTools;
+    const completionToolsAllowed = (!options?.policy
+      || options.policy.allowedCapabilities.includes('state-read'))
+      && (!policyTools
+        || (policyTools.includes('prepare_task') && policyTools.includes('finish_task')));
     const run: ActiveRun = {
       runId: randomUUID(),
       ownerId: randomUUID(),
@@ -404,8 +420,8 @@ export class MimiAgent {
       options,
       pendingActions: [],
       requireDurableBlocker: Boolean(options?.hostTools?.some((tool) => tool.name === 'request_background_task_input')),
-      completionRequired: options?.requireCompletionGate
-        ?? Boolean(options?.completionContract || requiresCompletionContract(input)),
+      completionRequired: completionToolsAllowed && (options?.requireCompletionGate
+        ?? Boolean(options?.completionContract || requiresCompletionContract(input))),
       completionContract: options?.completionContract,
     };
     run.releaseOwner = registerSessionRunOwner(run.ownerId);
@@ -431,6 +447,8 @@ export class MimiAgent {
       [...this.tools, ...(options?.hostTools ?? [])],
     ), runPolicy);
     const currentMode = AGENT_MODES.find((item) => item.id === mode)!;
+    await run.session.cleanupGeneratedSummaries();
+    await run.session.repairToolPairs();
     const recovery = canReadSessionContext ? await run.session.getCheckpoint() : undefined;
     run.recoveryRunId = recovery?.runId;
     await run.session.beginRun(
@@ -454,8 +472,6 @@ export class MimiAgent {
       await run.session.updateRunCompletion({ completionContract: run.completionContract }, run.runId);
     }
     await this.hooks.emit({ type: 'run_start', sessionId: run.sessionId, input });
-    await run.session.cleanupGeneratedSummaries();
-    await run.session.repairToolPairs();
     const [memories, plan, storedGoal, teamSummary, history, guidance, storedArchive] = await Promise.all([
       canReadMemory ? this.memory.search(this.memoryQuery(input, options?.cause)) : Promise.resolve([]),
       canReadState ? runPlans.get() : Promise.resolve([]),
@@ -471,11 +487,14 @@ export class MimiAgent {
     const resumesGoal = activeStoredGoal !== undefined && (resumesCheckpoint
       || input.includes('继续长期目标：')
       || input.trim() === activeStoredGoal.objective.trim());
+    const createsGoal = run.completionRequired && canReadState && requiresPersistentGoal(input);
     const goal = resumesGoal
       ? activeStoredGoal
-      : run.completionRequired && canReadState && requiresPersistentGoal(input)
+      : createsGoal
         ? await runPlans.setGoal(input, run.completionContract?.criteria)
         : undefined;
+    const activePlan = createsGoal && !resumesGoal ? [] : resumesGoal || resumesCheckpoint ? plan : [];
+    const activeTeamSummary = resumesGoal || resumesCheckpoint ? teamSummary : '';
     run.goalCreatedAt = goal?.createdAt;
     const archive = canReadSessionContext
       ? context.compactArchive(history, storedArchive, 'collapse')
@@ -613,10 +632,9 @@ export class MimiAgent {
           : '',
       ].join('\n'),
       sessionState: canReadSessionContext ? sessionStateSummary({
-        input,
-        plan,
+        plan: activePlan,
         goal,
-        hasTeam: Boolean(teamSummary),
+        hasTeam: Boolean(activeTeamSummary),
         run: { sessionId: run.sessionId, mode, modeLabel: currentMode.label, modelName },
         outputLevel: this.outputLevel,
       }) : '',
@@ -625,10 +643,10 @@ export class MimiAgent {
       skillCatalog: canReadLocal ? this.skills.catalog() : '',
       memories,
       documents: [],
-      plan,
+      plan: activePlan,
       goal,
-      teamSummary,
-      recoverySummary: recoverySummary(recovery),
+      teamSummary: activeTeamSummary,
+      recoverySummary: resumesCheckpoint ? recoverySummary(recovery) : '',
     }, instructionBudget);
     const historyBudget = Math.max(0, budget.inputBudget - estimateTokens(instructions));
     const effectiveHistory = context.effectiveHistory(history, [
@@ -1095,7 +1113,13 @@ export class MimiAgent {
     try {
       actions = await this.actionsForCompletedRun(run, executionKey);
       if (run.options?.retainExecutionLedger && executionKey) {
-        const receipt = { runId: run.runId, answer, usage: validUsage, actions };
+        const receipt = {
+          runId: run.runId,
+          answer,
+          usage: validUsage,
+          actions,
+          delivery: run.options.completionDelivery?.(),
+        };
         const persisted = completedExecutionReceiptSchema.parse(
           await this.ledger.commitReceipt<unknown>(run.sessionId, executionKey, receipt),
         );

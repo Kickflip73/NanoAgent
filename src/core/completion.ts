@@ -149,7 +149,8 @@ function criterionSatisfied(
   }
   if (criterion.requiredEvidence === 'artifact') {
     return {
-      satisfied: succeeded.some((item) => ['write_file', 'edit_file', 'move_file'].includes(item.toolName)),
+      satisfied: succeeded.some((item) => ['write_file', 'edit_file', 'move_file'].includes(item.toolName)
+        || (item.toolName === 'run_shell' && objectValue(item.output)?.exitCode === 0)),
       uncertain: false,
     };
   }
@@ -228,14 +229,14 @@ export class CompletionGateError extends Error {
 export function requiresCompletionContract(input: string): boolean {
   const normalized = input.trim().toLowerCase();
   if (!normalized) return false;
-  return /(?:^\/goal\b|修复|升级|实现|创建|生成|编写|修改|发送|发给|告诉|说我|通知|删除|部署|安装|运行|执行|测试|验证|整理|导出|预订|购买|提交|完成|分析|检查|调查|研究|审查|规划|翻译|打开|关闭|关掉|把.+(?:放|移|改|写|存|关|开)|帮我|麻烦|请你?)/u.test(normalized)
-    || /\b(?:fix|build|create|write|edit|send|delete|deploy|install|run|test|verify|export|submit|implement|analyze|inspect|research|review|translate|open|close|turn|notify|purchase|book|pay|publish|develop|migrate|refactor)\b/u.test(normalized);
+  return /(?:^\/goal\b|修复|升级|实现|创建|生成|编写|修改|发送|发给|通知|删除|清空|移动|改名|部署|安装|运行|执行|测试|验证|导出|预订|购买|提交|发布|迁移|重构|打开|关闭|关掉|把.+(?:放|移|改|写|存|关|开))/u.test(normalized)
+    || /\b(?:fix|build|create|write|edit|send|delete|deploy|install|run|test|verify|export|submit|implement|open|close|turn|notify|purchase|book|pay|publish|develop|migrate|refactor)\b/u.test(normalized);
 }
 
 export function requiresPersistentGoal(input: string): boolean {
   const normalized = input.trim().toLowerCase();
   return /^\/goal\b/u.test(normalized)
-    || /(?:长期|持续|跨轮|多阶段|完整项目|修复|升级|重构|实现|开发|构建|迁移|改造|long[- ]?running|multi[- ]?step|refactor|migrate|implement)/u.test(normalized);
+    || /(?:长期|持续(?:任务|研究|跟进|监控|执行|处理)|跨轮|多阶段|完整项目|long[- ]?running|multi[- ]?step)/u.test(normalized);
 }
 
 export function expectedCompletionKind(input: string): CompletionKind {

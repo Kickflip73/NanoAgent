@@ -1,7 +1,12 @@
 import type { RunStreamEvent } from '@openai/agents';
 import type { RuntimeEffect } from './control.js';
 import type { RuntimeEvent } from './hooks.js';
-import type { ContextUsageSnapshot, MimiAgent, MimiRunOptions } from './mimi-agent.js';
+import type {
+  CompletionDeliveryDisposition,
+  ContextUsageSnapshot,
+  MimiAgent,
+  MimiRunOptions,
+} from './mimi-agent.js';
 import { CompletionGateError } from '../core/completion.js';
 import { assertRunCanComplete, isRunInterrupted, isTerminalRunInterruption } from './run-outcome.js';
 
@@ -15,6 +20,7 @@ export interface AgentRunResult {
   answer: string;
   effects: RuntimeEffect[];
   usage?: ContextUsageSnapshot;
+  delivery?: CompletionDeliveryDisposition;
 }
 
 export interface AgentRunObserver {
@@ -111,7 +117,12 @@ export class AgentRunService {
         : finalOutput === undefined ? streamedAnswer : JSON.stringify(finalOutput)).slice(0, 20_000);
       const usage = usageFrom(stream);
       const effects = await this.agent.completeRun(answer, usage);
-      const result = { answer, effects, usage } satisfies AgentRunResult;
+      const result = {
+        answer,
+        effects,
+        usage,
+        delivery: request.options?.completionDelivery?.(),
+      } satisfies AgentRunResult;
       await observe(observer.onComplete, result);
       return result;
     } catch (error) {

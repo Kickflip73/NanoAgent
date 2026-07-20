@@ -279,7 +279,7 @@ function ensureConnectorSecrets() {
   return { httpPort, reverseWsPort, sharedToken, wsToken };
 }
 
-function mergeOneBotConfig(file, secrets) {
+function mergeOneBotConfig(file, secrets, enabled = true) {
   const config = existsSync(file) ? readJson(file, `NapCat 配置 ${file}`) : {};
   const network = config.network && typeof config.network === 'object' && !Array.isArray(config.network)
     ? config.network
@@ -290,7 +290,7 @@ function mergeOneBotConfig(file, secrets) {
   const managedWsNames = new Set(['mimiagent-reverse-ws', 'mimi-reverse-ws']);
   const managedHttp = {
     name: 'mimiagent-http',
-    enable: true,
+    enable: enabled,
     port: secrets.httpPort,
     host: '127.0.0.1',
     enableCors: false,
@@ -301,7 +301,7 @@ function mergeOneBotConfig(file, secrets) {
   };
   const managedWs = {
     name: 'mimiagent-reverse-ws',
-    enable: true,
+    enable: enabled,
     url: `ws://127.0.0.1:${secrets.reverseWsPort}/`,
     messagePostFormat: 'array',
     reportSelfMessage: false,
@@ -326,7 +326,9 @@ function configureOneBot(secrets) {
   const files = new Set([join(configDir, 'onebot11.json')]);
   const rememberedAccount = readQuickLoginAccount();
   if (rememberedAccount) {
-    files.add(join(configDir, `onebot11_${rememberedAccount}.json`));
+    mergeOneBotConfig(join(configDir, 'onebot11.json'), secrets, false);
+    mergeOneBotConfig(join(configDir, `onebot11_${rememberedAccount}.json`), secrets, true);
+    return;
   } else {
     for (const name of readdirSync(configDir)) {
       if (/^onebot11_[0-9]+\.json$/.test(name)) files.add(join(configDir, name));
@@ -382,6 +384,10 @@ function configureInstalledOneBot() {
   if (!state.managed || !existsSync(join(shellDir, 'napcat.mjs'))) {
     fail('NapCat 尚未完整安装，不能配置 OneBot');
   }
+  // Discover the account before choosing the active OneBot file. NapCat may
+  // load both the base and account-specific files; enabling both creates a
+  // permanent duplicate reverse-WebSocket reconnect loop.
+  configureNapCatPrivacyAndQuickLogin(state);
   configureOneBot(ensureConnectorSecrets());
   configureNapCatPrivacyAndQuickLogin(state);
   createRunner();

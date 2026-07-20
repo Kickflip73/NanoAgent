@@ -184,6 +184,45 @@ test('releases the active run when asynchronous Runner setup rejects', async () 
   }
 });
 
+test('failed durable attempts roll back after legacy history cleanup changes item offsets', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-cleanup-rollback-'));
+  const dataRoot = path.join(root, '.mimi-agent');
+  const previous = process.env.MIMI_SESSION;
+  process.env.MIMI_SESSION = 'cleanup-rollback';
+  const session = new FileSession(path.join(dataRoot, 'sessions'), 'cleanup-rollback');
+  await session.addItems([
+    { role: 'user', content: 'STABLE_HISTORY' },
+    { role: 'user', content: '[更早的会话历史已压缩为摘要，共 1 条]\nLEGACY_SUMMARY' },
+    { type: 'function_call', name: 'read_file', callId: 'dangling', arguments: '{}' },
+  ] as unknown as AgentInputItem[]);
+  const agent = await MimiAgent.create({
+    provider: 'openai', workspaceRoot: root, dataRoot,
+    skillsRoot: path.join(root, 'skills'), mcpConfig: path.join(root, 'mcp.json'),
+    historyLimit: 40, maxTurns: 20,
+  });
+  const runner = (agent as unknown as { runner: { run: (...args: unknown[]) => Promise<never> } }).runner;
+  runner.run = async () => {
+    await session.addItems([
+      { role: 'user', content: 'FAILED_ATTEMPT_INPUT' },
+      { role: 'assistant', content: 'FAILED_ATTEMPT_OUTPUT' },
+    ] as AgentInputItem[]);
+    throw new Error('simulated durable attempt failure');
+  };
+  try {
+    await assert.rejects(agent.stream('retry task', undefined, {
+      executionKey: 'event:cleanup-rollback', retainExecutionLedger: true,
+      requireCompletionGate: false,
+    }), /simulated durable attempt failure/);
+    const serialized = JSON.stringify(await session.getItems());
+    assert.match(serialized, /STABLE_HISTORY/);
+    assert.doesNotMatch(serialized, /LEGACY_SUMMARY|FAILED_ATTEMPT_INPUT|FAILED_ATTEMPT_OUTPUT/);
+  } finally {
+    await agent.close();
+    if (previous === undefined) delete process.env.MIMI_SESSION;
+    else process.env.MIMI_SESSION = previous;
+  }
+});
+
 test('does not clear durable Session state while its Run is active', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'nano-active-clear-'));
   const dataRoot = path.join(root, '.mimi-agent');
@@ -851,6 +890,20 @@ test('context trimming keeps tool calls paired and never persists generated summ
   assert.match(serialized, /"type":"function_call"/);
   assert.match(serialized, /"type":"function_call_result"/);
   assert.ok(serialized.indexOf('function_call') < serialized.indexOf('function_call_result'));
+});
+
+test('oversized current input never leaves an orphaned function result', () => {
+  const manager = new ContextManager(100, 4_000, 0.5);
+  const input = [
+    { role: 'user', content: 'inspect the result' },
+    { type: 'function_call', name: 'read_file', callId: 'call-large', arguments: '{"path":"large.txt"}' },
+    { type: 'function_call_result', name: 'read_file', callId: 'call-large', output: 'x'.repeat(20_000) },
+  ] as unknown as AgentInputItem[];
+  const effective = manager.effectiveHistory([], input, undefined, 500);
+  const serialized = JSON.stringify(effective);
+
+  if (serialized.includes('function_call_result')) assert.match(serialized, /"type":"function_call"/);
+  assert.ok(estimateTokens(effective) <= 500);
 });
 
 test('limits recent history by token budget even below the item limit', async () => {

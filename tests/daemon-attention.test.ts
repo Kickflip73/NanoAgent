@@ -964,6 +964,31 @@ test('briefing payload bounds oversized untrusted digest content', async () => {
   }
 });
 
+test('briefings leave excess digest rows for later bounded batches', async () => {
+  const { store, attention } = await setup(config({
+    briefings: { enabled: true, times: ['08:30'], maxItems: 100 },
+  }));
+  try {
+    for (let index = 0; index < 25; index += 1) {
+      const id = `batched-${index}`;
+      store.enqueueEvent(envelope(id, { payload: { text: 'x'.repeat(2_500) } }));
+      const claimed = store.claimEventById(id, 'worker')!;
+      store.digestEvent(claimed.id, 'worker', 'later');
+    }
+    const briefing = attention.forceBriefing(new Date('2026-07-15T08:30:00Z'))!;
+    const payload = briefing.payload as { prompt: string; digestItemIds: string[] };
+    assert.equal(payload.digestItemIds.length, 20);
+    assert.ok(payload.prompt.length < 45_000);
+    assert.equal(store.pendingDigestCount(), 25);
+
+    const claimed = store.claimEventById(briefing.id, 'briefing-worker')!;
+    store.completeEvent(claimed.id, 'briefing-worker', { answer: 'done' });
+    assert.equal(store.pendingDigestCount(), 5);
+  } finally {
+    store.close();
+  }
+});
+
 test('dead-letter or archived briefings release their digest items for a later briefing', async () => {
   const { store, attention } = await setup();
   try {

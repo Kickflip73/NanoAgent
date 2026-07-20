@@ -153,6 +153,15 @@ test('completion deferrals use durable exponential backoff without consuming fai
     assert.equal(first.attempts, 0);
     assert.equal((first.payload as { completionGate: { deferrals: number } }).completionGate.deferrals, 1);
     assert.ok(Date.parse(first.notBefore) >= Date.parse(first.updatedAt) + 900);
+
+    assert.ok(store.claimEventById('gate-task', 'worker', 60_000, new Date(first.notBefore)));
+    const second = store.deferEventForCompletion('gate-task', 'worker', 'still missing', new Date(first.notBefore));
+    assert.equal(second.status, 'queued');
+    assert.ok(store.claimEventById('gate-task', 'worker', 60_000, new Date(second.notBefore)));
+    const terminal = store.deferEventForCompletion('gate-task', 'worker', 'still missing', new Date(second.notBefore));
+    assert.equal(terminal.status, 'dead_letter');
+    assert.equal((terminal.payload as { completionGate: { deferrals: number } }).completionGate.deferrals, 3);
+    assert.equal(store.listOutbox(10)[0]?.eventId, 'gate-task');
   } finally {
     store.close();
   }
@@ -229,6 +238,23 @@ test('expired event leases recover and failed work uses bounded retry', async ()
     const retried = store.failEvent(recovered.id, 'new-worker', new Error('temporary'), 5, new Date('2026-07-14T00:00:05.000Z'));
     assert.equal(retried.status, 'queued');
     assert.match(retried.error!, /temporary/);
+  } finally {
+    store.close();
+  }
+});
+
+test('lease recovery honors the caller configured attempt limit', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-retry-limit-'));
+  const store = new MimiStore(path.join(root, 'mimi.db'));
+  try {
+    store.enqueueEvent(envelope('single-attempt'));
+    assert.ok(store.claimEventById(
+      'single-attempt', 'dead-worker', 1_000, new Date('2026-07-14T00:00:01.000Z'), 1,
+    ));
+    assert.equal(store.claimEvent(
+      'recovery-worker', 60_000, new Date('2026-07-14T00:00:03.000Z'), undefined, 1,
+    ), undefined);
+    assert.equal(store.getEvent('single-attempt')?.status, 'dead_letter');
   } finally {
     store.close();
   }

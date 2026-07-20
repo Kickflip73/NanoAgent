@@ -195,6 +195,13 @@ test('macOS NapCat installer patches and restores QQ with a background-only Laun
     const idempotent = JSON.parse(readFileSync(oneBot, 'utf8')) as typeof config;
     assert.equal(idempotent.network.httpServers.length, 1);
     assert.equal(idempotent.network.websocketClients.length, 1);
+    assert.equal(idempotent.network.httpServers[0]?.enable, false);
+    assert.equal(idempotent.network.websocketClients[0]?.enable, false);
+    const accountOneBot = JSON.parse(readFileSync(
+      path.join(fixture.workDir, 'config', 'onebot11_12345678.json'), 'utf8',
+    )) as typeof config;
+    assert.equal(accountOneBot.network.httpServers[0]?.enable, true);
+    assert.equal(accountOneBot.network.websocketClients[0]?.enable, true);
     assert.equal(statSync(oneBot).mode & 0o777, 0o600);
     const napCat = JSON.parse(readFileSync(
       path.join(fixture.workDir, 'config', 'napcat_12345678.json'), 'utf8',

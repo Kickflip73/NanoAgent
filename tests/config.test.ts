@@ -221,6 +221,27 @@ test('migrates old template workspace defaults without overriding versioned rest
   }
 });
 
+test('migrates the version-2 generated max-turn default without overriding explicit modern values', () => {
+  const previousTurns = process.env.MIMI_MAX_TURNS;
+  const previousVersion = process.env.MIMI_CONFIG_VERSION;
+  try {
+    process.env.MIMI_CONFIG_VERSION = '2';
+    process.env.MIMI_MAX_TURNS = '200';
+    assert.equal(loadConfig(ISOLATED_HOME).maxTurns, 32);
+
+    process.env.MIMI_MAX_TURNS = '120';
+    assert.equal(loadConfig(ISOLATED_HOME).maxTurns, 120);
+    process.env.MIMI_CONFIG_VERSION = '3';
+    process.env.MIMI_MAX_TURNS = '200';
+    assert.equal(loadConfig(ISOLATED_HOME).maxTurns, 200);
+  } finally {
+    if (previousTurns === undefined) delete process.env.MIMI_MAX_TURNS;
+    else process.env.MIMI_MAX_TURNS = previousTurns;
+    if (previousVersion === undefined) delete process.env.MIMI_CONFIG_VERSION;
+    else process.env.MIMI_CONFIG_VERSION = previousVersion;
+  }
+});
+
 test('rebuilds workspace-derived paths when the CLI adopts an existing Host workspace', async () => {
   const home = await mkdtemp(path.join(os.tmpdir(), 'mimi-adopt-config-'));
   const localWorkspace = path.join(home, 'local');

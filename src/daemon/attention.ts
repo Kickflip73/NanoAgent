@@ -814,7 +814,10 @@ export class AttentionEngine {
           this.config.briefings.replyTarget,
         ),
       };
-    }, this.config.briefings.maxItems);
+    // Each prompt item already caps its payload at 2,000 characters. Keep the
+    // complete briefing request under a predictable context budget and leave
+    // remaining digest rows unassigned for a later briefing.
+    }, Math.min(this.config.briefings.maxItems, 20));
   }
 
   private isQuiet(now: Date): boolean {

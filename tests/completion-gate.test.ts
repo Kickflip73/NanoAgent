@@ -5,6 +5,8 @@ import {
   assertCompletionContractForTask,
   evaluateCompletion,
   expectedCompletionKind,
+  requiresCompletionContract,
+  requiresPersistentGoal,
   type CompletionContract,
   type CompletionEvidence,
   type CompletionReport,
@@ -51,6 +53,18 @@ test('completion gate requires a contract and an explicit completion report', ()
   assert.match(evaluateCompletion(contract, undefined, []).reason, /finish_task/);
 });
 
+test('completion gate stays off for pure answers and goals stay explicit', () => {
+  for (const input of ['请问今天天气怎么样', '帮我解释闭包', '翻译 hello', '分析这段错误日志', '检查这份方案']) {
+    assert.equal(requiresCompletionContract(input), false, input);
+  }
+  for (const input of ['发送微信消息', '修复登录页', '运行测试', '导出报告']) {
+    assert.equal(requiresCompletionContract(input), true, input);
+  }
+  assert.equal(requiresPersistentGoal('修复登录页'), false);
+  assert.equal(requiresPersistentGoal('/goal 持续完善项目'), true);
+  assert.equal(requiresPersistentGoal('这是一个多阶段任务'), true);
+});
+
 test('completion gate accepts verified external action receipts', () => {
   assert.deepEqual(evaluateCompletion(contract, report, actionEvidence('confirmed')), {
     decision: 'pass',
@@ -58,6 +72,24 @@ test('completion gate accepts verified external action receipts', () => {
     unmetCriteria: [],
   });
   assert.equal(evaluateCompletion(contract, report, actionEvidence('accepted')).decision, 'uncertain');
+});
+
+test('artifact evidence accepts a successful shell-generated artifact', () => {
+  const artifact: CompletionContract = {
+    objective: 'generate report',
+    kind: 'artifact',
+    criteria: [{
+      id: 'report', description: 'report exists', requiredEvidence: 'artifact',
+      expectedTool: 'run_shell', expectedArgumentsContain: ['report.md'],
+    }],
+  };
+  assert.equal(evaluateCompletion(artifact, {
+    status: 'completed',
+    proofs: [{ criterionId: 'report', evidence: 'generated', toolCallIds: ['shell-1'] }],
+  }, [{
+    toolName: 'run_shell', callId: 'shell-1', argumentsJson: 'touch report.md',
+    status: 'succeeded', output: { exitCode: 0 },
+  }]).decision, 'pass');
 });
 
 test('completion contract requires objective evidence for side effects and artifacts', () => {

@@ -166,6 +166,7 @@ export class MimiHost {
             answer: receipt.answer,
             effects: receipt.effects ?? [],
             usage: receipt.usage,
+            delivery: receipt.delivery,
           } satisfies AgentRunResult;
           await this.observe(observer.onStart, request.input);
           signal.throwIfAborted();

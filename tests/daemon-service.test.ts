@@ -402,7 +402,7 @@ test('launchd service keeps secrets out of plist and escapes local paths', () =>
 
     assert.deepEqual(daemonLaunchEnvironment(config), {
       MIMI_MODEL_PROVIDER: 'deepseek',
-      MIMI_CONFIG_VERSION: '2',
+      MIMI_CONFIG_VERSION: '3',
       MIMI_WORKSPACE: '/tmp/work & life',
       AGENT_WORKSPACE: '/tmp/work & life',
       MIMI_DATA_DIR: '/tmp/data',

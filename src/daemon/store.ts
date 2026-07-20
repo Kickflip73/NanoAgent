@@ -31,6 +31,7 @@ const TERMINAL_EVENT_STATUSES = new Set<EventStatus>([
 ]);
 const DEFAULT_OUTBOX_LEASE_MS = 180_000;
 const DEFAULT_EVENT_MAX_ATTEMPTS = 5;
+const MAX_COMPLETION_DEFERRALS = 3;
 const DEFAULT_PREEMPTION_RESERVATION_MS = 60_000;
 const MAX_TASK_RESUME_CONTEXT_LENGTH = 4_000;
 const MAX_TASK_PROMPT_LENGTH = 64_000;
@@ -650,20 +651,26 @@ export class MimiStore {
     leaseMs = 60_000,
     at = new Date(),
     executionLane?: EventExecutionLane,
+    maxAttempts = DEFAULT_EVENT_MAX_ATTEMPTS,
+    excludedIds: readonly string[] = [],
   ): StoredEvent | undefined {
     return this.transaction(() => {
       const timestamp = at.toISOString();
-      this.recoverExpiredEventLeases(timestamp);
+      this.recoverExpiredEventLeases(timestamp, maxAttempts);
       this.settleQueuedTaskControls(timestamp);
+      const exclusions = excludedIds.slice(0, 100);
+      const exclusionSql = exclusions.length
+        ? ` AND id NOT IN (${exclusions.map(() => '?').join(', ')})`
+        : '';
       const row = executionLane ? this.database.prepare(`
         SELECT id FROM events
-        WHERE status = 'queued' AND not_before <= ? AND execution_lane = ?
+        WHERE status = 'queued' AND not_before <= ? AND execution_lane = ?${exclusionSql}
         ORDER BY priority DESC, received_at ASC LIMIT 1
-      `).get(timestamp, executionLane) as Row | undefined : this.database.prepare(`
+      `).get(timestamp, executionLane, ...exclusions) as Row | undefined : this.database.prepare(`
         SELECT id FROM events
-        WHERE status = 'queued' AND not_before <= ?
+        WHERE status = 'queued' AND not_before <= ?${exclusionSql}
         ORDER BY priority DESC, received_at ASC LIMIT 1
-      `).get(timestamp) as Row | undefined;
+      `).get(timestamp, ...exclusions) as Row | undefined;
       if (!row) return undefined;
       const leaseUntil = new Date(at.getTime() + leaseMs).toISOString();
       const claimed = this.database.prepare(`
@@ -677,10 +684,16 @@ export class MimiStore {
     });
   }
 
-  claimEventById(id: string, owner: string, leaseMs = 60_000, at = new Date()): StoredEvent | undefined {
+  claimEventById(
+    id: string,
+    owner: string,
+    leaseMs = 60_000,
+    at = new Date(),
+    maxAttempts = DEFAULT_EVENT_MAX_ATTEMPTS,
+  ): StoredEvent | undefined {
     return this.transaction(() => {
       const timestamp = at.toISOString();
-      this.recoverExpiredEventLeases(timestamp);
+      this.recoverExpiredEventLeases(timestamp, maxAttempts);
       this.settleQueuedTaskControls(timestamp);
       const leaseUntil = new Date(at.getTime() + leaseMs).toISOString();
       const claimed = this.database.prepare(`
@@ -694,10 +707,10 @@ export class MimiStore {
     });
   }
 
-  readyBackgroundTasks(limit = 10, at = new Date()): StoredEvent[] {
+  readyBackgroundTasks(limit = 10, at = new Date(), maxAttempts = DEFAULT_EVENT_MAX_ATTEMPTS): StoredEvent[] {
     return this.transaction(() => {
       const timestamp = at.toISOString();
-      this.recoverExpiredEventLeases(timestamp);
+      this.recoverExpiredEventLeases(timestamp, maxAttempts);
       this.settleQueuedTaskControls(timestamp);
       return (this.database.prepare(`
         SELECT * FROM events
@@ -920,6 +933,27 @@ export class MimiStore {
         ...payload,
         completionGate: { deferrals, reason: reason.slice(0, 2_000), checkedAt: timestamp },
       };
+      if (deferrals >= MAX_COMPLETION_DEFERRALS) {
+        const terminalReason = `Completion Gate 连续 ${deferrals} 次未通过，已停止自动重试：${reason}`;
+        const updated = this.database.prepare(`
+          UPDATE events SET status = 'dead_letter', payload_json = ?, error = ?,
+            not_before = ?, lease_owner = NULL, lease_until = NULL, updated_at = ?
+          WHERE id = ? AND status = 'running' AND lease_owner = ? AND task_control IS NULL
+        `).run(
+          json(updatedPayload),
+          terminalReason.slice(0, 4_000),
+          timestamp,
+          timestamp,
+          id,
+          owner,
+        );
+        if (Number(updated.changes) !== 1) throw new Error(`事件 ${id} 租约已失效`);
+        if (runId) this.finishRun(runId, 'failed', undefined, terminalReason, timestamp);
+        const delivery = eventFailureDelivery(event, terminalReason);
+        this.insertOutbox(event.id, delivery.route, delivery.payload, timestamp);
+        this.insertAudit('event.dead_letter', id, { completionDeferrals: deferrals }, timestamp);
+        return this.getEvent(id)!;
+      }
       const updated = this.database.prepare(`
         UPDATE events SET status = 'queued', attempts = MAX(0, attempts - 1),
           payload_json = ?, error = ?, not_before = ?, lease_owner = NULL,
@@ -1229,7 +1263,12 @@ export class MimiStore {
     });
   }
 
-  claimOutbox(owner: string, leaseMs = DEFAULT_OUTBOX_LEASE_MS, at = new Date()): OutboxMessage | undefined {
+  claimOutbox(
+    owner: string,
+    leaseMs = DEFAULT_OUTBOX_LEASE_MS,
+    at = new Date(),
+    excludedChannels: readonly string[] = [],
+  ): OutboxMessage | undefined {
     return this.transaction(() => {
       const timestamp = at.toISOString();
       const expired = this.database.prepare(`
@@ -1259,10 +1298,14 @@ export class MimiStore {
           reason: 'lease_expired',
         }, timestamp);
       }
+      const exclusions = excludedChannels.slice(0, 16);
+      const exclusionSql = exclusions.length
+        ? ` AND channel NOT IN (${exclusions.map(() => '?').join(', ')})`
+        : '';
       const row = this.database.prepare(`
-        SELECT id FROM outbox WHERE status = 'pending' AND not_before <= ?
+        SELECT id FROM outbox WHERE status = 'pending' AND not_before <= ?${exclusionSql}
         ORDER BY created_at ASC LIMIT 1
-      `).get(timestamp) as Row | undefined;
+      `).get(timestamp, ...exclusions) as Row | undefined;
       if (!row) return undefined;
       const leaseUntil = new Date(at.getTime() + leaseMs).toISOString();
       const claimed = this.database.prepare(`

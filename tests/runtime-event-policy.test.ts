@@ -163,6 +163,33 @@ test('default owner General runs expose Shell while Plan remains read-only', asy
   }
 });
 
+test('restricted reply-only runs do not enable an impossible completion gate', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-reply-only-completion-'));
+  const agent = await MimiAgent.create({
+    provider: 'openai', workspaceRoot: root, dataRoot: path.join(root, '.mimi-agent'),
+    skillsRoot: path.join(root, 'skills'), mcpConfig: path.join(root, 'mcp.json'),
+    historyLimit: 40, contextWindow: 128_000, maxTurns: 20,
+  });
+  const runner = (agent as unknown as { runner: { run: (...args: unknown[]) => Promise<unknown> } }).runner;
+  runner.run = async () => ({});
+  try {
+    await agent.stream('生成今日主动简报', undefined, {
+      policy: {
+        allowedCapabilities: ['delivery-control'],
+        allowSideEffects: false,
+        allowUnknownTools: false,
+        allowMcp: false,
+        allowSessionContext: false,
+      },
+      hostTools: [hostTool('finish_mimi_silently')],
+    });
+    assert.equal(agent.completionGateRequired, false);
+    await agent.completeRun('briefed');
+  } finally {
+    await agent.close();
+  }
+});
+
 test('terminal cancellation removes the exact recoverable checkpoint instead of resuming it later', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-terminal-cancel-'));
   const previousSession = process.env.AGENT_SESSION;

@@ -69,6 +69,9 @@ export function eventFailureAttemptLimit(
   const status = typeof value.status === 'number'
     ? value.status
     : messageStatus ? Number(messageStatus) : undefined;
+  if (value.name === 'MaxTurnsExceededError' || /^Max turns \(\d+\) exceeded$/i.test(message)) {
+    return Math.max(1, claimedAttempts);
+  }
   // Background conversation retries happen within seconds. Retrying a rejected
   // request, exhausted quota, or rate limit only burns attempts/credits and can
   // produce a stale IM reply later; dead-letter once and require an explicit retry.
@@ -103,10 +106,11 @@ export class MimiDispatcher {
   private loopPromise?: Promise<void>;
   private readonly active = new Map<string, ActiveExecution>();
   private readonly activeSessions = new Set<string>();
+  private readonly deferredForActiveSession = new Map<string, string>();
   private stopRequested = false;
   private forceStopReason?: Error;
   private preferOutbox = true;
-  private deliveryPromise?: Promise<void>;
+  private readonly deliveryPromises = new Map<string, Promise<void>>();
   private nextMaintenanceAt = 0;
 
   constructor(
@@ -131,7 +135,7 @@ export class MimiDispatcher {
     for (const execution of this.active.values()) this.abortForStopWhenSafe(execution);
     await this.loopPromise;
     await Promise.all([...this.active.values()].map((execution) => execution.promise).filter(Boolean));
-    await this.deliveryPromise;
+    await Promise.all(this.deliveryPromises.values());
   }
 
   forceStop(reason = 'MimiAgent Dispatcher 被强制停止'): void {
@@ -221,6 +225,7 @@ export class MimiDispatcher {
       this.options.leaseMs ?? 60_000,
       new Date(),
       this.options.claimExecutionLane,
+      this.options.maxAttempts ?? 5,
     );
     if (event) {
       await this.runEvent(event);
@@ -235,27 +240,38 @@ export class MimiDispatcher {
   }
 
   async processEventById(eventId: string): Promise<boolean> {
-    const event = this.store.claimEventById(eventId, this.workerId, this.options.leaseMs ?? 60_000);
+    const event = this.store.claimEventById(
+      eventId,
+      this.workerId,
+      this.options.leaseMs ?? 60_000,
+      new Date(),
+      this.options.maxAttempts ?? 5,
+    );
     if (!event) return false;
     await this.runEvent(event);
     return true;
   }
 
   private async deliverOne(): Promise<boolean> {
-    const inFlight = this.deliveryPromise;
-    if (inFlight) {
-      await inFlight;
+    const delivery = this.startDelivery();
+    if (delivery) {
+      await delivery;
       return true;
     }
-    const delivery = this.startDelivery();
-    if (!delivery) return false;
-    await delivery;
+    const inFlight = this.deliveryPromises.values().next().value as Promise<void> | undefined;
+    if (!inFlight) return false;
+    await inFlight;
     return true;
   }
 
   private startDelivery(): Promise<void> | undefined {
-    if (this.deliveryPromise) return undefined;
-    const outgoing = this.store.claimOutbox(this.workerId);
+    if (this.deliveryPromises.size >= 4) return undefined;
+    const outgoing = this.store.claimOutbox(
+      this.workerId,
+      undefined,
+      undefined,
+      [...this.deliveryPromises.keys()],
+    );
     if (!outgoing) return undefined;
     let tracked!: Promise<void>;
     tracked = this.deliverClaimed(outgoing)
@@ -265,9 +281,11 @@ export class MimiDispatcher {
         );
       })
       .finally(() => {
-        if (this.deliveryPromise === tracked) this.deliveryPromise = undefined;
+        if (this.deliveryPromises.get(outgoing.channel) === tracked) {
+          this.deliveryPromises.delete(outgoing.channel);
+        }
       });
-    this.deliveryPromise = tracked;
+    this.deliveryPromises.set(outgoing.channel, tracked);
     return tracked;
   }
 
@@ -324,6 +342,8 @@ export class MimiDispatcher {
         this.options.leaseMs ?? 60_000,
         new Date(),
         this.options.claimExecutionLane,
+        this.options.maxAttempts ?? 5,
+        [...this.deferredForActiveSession.keys()],
       );
       if (!event) break;
       worked = true;
@@ -416,6 +436,7 @@ export class MimiDispatcher {
           undefined,
           new Date(now.getTime() + Math.max(25, this.options.pollMs ?? 250)),
         );
+        this.deferredForActiveSession.set(event.id, sessionId);
         return;
       }
       active.sessionId = sessionId;
@@ -493,6 +514,9 @@ export class MimiDispatcher {
           ...decision.options,
           executionKey,
           retainExecutionLedger: true,
+          completionDelivery: () => deliveryControl.suppressed
+            ? { suppressed: true, reason: deliveryControl.reason }
+            : undefined,
           hostTools: createMimiHostTools({
             store: this.store,
             attention: this.attention,
@@ -554,6 +578,10 @@ export class MimiDispatcher {
       this.abortForBlockWhenSafe(active);
       this.abortForPauseWhenSafe(active);
       const result = await hostedRun;
+      if (result.delivery?.suppressed) {
+        deliveryControl.suppressed = true;
+        deliveryControl.reason = result.delivery.reason;
+      }
       if (leaseFailure) throw leaseFailure;
       this.synchronizeDurableTaskControl(active);
       const pendingCancellation = active.cancelRequested;
@@ -719,7 +747,12 @@ export class MimiDispatcher {
       clearInterval(renew);
       active.tools = 0;
       this.active.delete(event.id);
-      if (active.sessionId) this.activeSessions.delete(active.sessionId);
+      if (active.sessionId) {
+        this.activeSessions.delete(active.sessionId);
+        for (const [eventId, sessionId] of this.deferredForActiveSession) {
+          if (sessionId === active.sessionId) this.deferredForActiveSession.delete(eventId);
+        }
+      }
     }
   }
 

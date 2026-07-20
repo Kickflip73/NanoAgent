@@ -59,12 +59,13 @@ test('summarizes recovery and active session state without runtime dependencies'
   };
   assert.match(recoverySummary(checkpoint), /停止原因：boom/);
   assert.equal(recoverySummary({ ...checkpoint, status: 'completed' }), '');
-  assert.match(sessionStateSummary({
-    input: '实现功能',
+  const summary = sessionStateSummary({
     plan: [{ id: 'build', description: '编码', status: 'running' }],
     goal: undefined,
     hasTeam: false,
     run: { sessionId: 'demo', mode: 'general', modeLabel: '通用', modelName: 'model' },
     outputLevel: 'tools',
-  }), /当前阶段：build 编码/);
+  });
+  assert.match(summary, /当前阶段：build 编码/);
+  assert.doesNotMatch(summary, /实现功能|当前任务/);
 });

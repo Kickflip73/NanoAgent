@@ -58,6 +58,7 @@ test('background provider request rejections do not consume five automatic attem
   assert.equal(eventFailureAttemptLimit(Object.assign(new Error('rate limited'), { status: 429 }), 1, 5), 1);
   assert.equal(eventFailureAttemptLimit(Object.assign(new Error('timeout'), { status: 408 }), 1, 5), 5);
   assert.equal(eventFailureAttemptLimit(Object.assign(new Error('server unavailable'), { status: 503 }), 1, 5), 5);
+  assert.equal(eventFailureAttemptLimit(new Error('Max turns (32) exceeded'), 1, 5), 1);
 });
 
 test('daemon loop executes different Session actors concurrently', async () => {
@@ -189,6 +190,11 @@ test('daemon loop keeps one writer per Session without starving another Session'
     await waitUntil(() => order.includes('session-b:1:start'));
     assert.deepEqual(order, ['session-a:1:start', 'session-b:1:start']);
     assert.equal(store.getEvent('fair-a-2')?.status, 'queued');
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const fifoDeferrals = store.activitySnapshot(100).recentTransitions.filter((transition) => (
+      transition.type === 'event.preempted' && transition.entityId === 'fair-a-2'
+    ));
+    assert.equal(fifoDeferrals.length, 1);
 
     releaseB();
     releaseFirstA();
@@ -648,6 +654,40 @@ test('the daemon loop runs at most one Outbox delivery concurrently', async () =
     await waitUntil(() => outboxIds.every((id) => store.getOutbox(id)?.status === 'sent'));
   } finally {
     for (const release of releases.splice(0)) release();
+    await dispatcher.stop();
+    store.close();
+  }
+});
+
+test('a blocked connector channel does not hold up another Outbox channel', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-dispatcher-delivery-lanes-'));
+  const store = new MimiStore(path.join(root, 'mimi.db'));
+  const attention = await AttentionEngine.load(path.join(root, 'assistant.json'), store);
+  const notifier = new NotifierRegistry();
+  const slowGate = deferred();
+  let slowStarted = false;
+  let fastDelivered = false;
+  notifier.register('connector:qq', {
+    deliver: async () => {
+      slowStarted = true;
+      await slowGate.promise;
+    },
+  });
+  notifier.register('connector:wechat', {
+    deliver: async () => { fastDelivered = true; },
+  });
+  const slowId = enqueueOutbox(store, 'delivery-lane-qq', 'connector:qq');
+  const fastId = enqueueOutbox(store, 'delivery-lane-wechat', 'connector:wechat');
+  const dispatcher = new MimiDispatcher(store, {} as MimiAgent, attention, notifier, undefined, { pollMs: 1 });
+  try {
+    dispatcher.start();
+    await waitUntil(() => slowStarted && fastDelivered);
+    assert.equal(store.getOutbox(slowId)?.status, 'sending');
+    assert.equal(store.getOutbox(fastId)?.status, 'sent');
+    slowGate.resolve();
+    await waitUntil(() => store.getOutbox(slowId)?.status === 'sent');
+  } finally {
+    slowGate.resolve();
     await dispatcher.stop();
     store.close();
   }

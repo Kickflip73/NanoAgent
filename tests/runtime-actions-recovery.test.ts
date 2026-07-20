@@ -3,7 +3,8 @@ import { mkdtemp } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { RunContext, type AgentInputItem } from '@openai/agents';
+import { RunContext, tool, type AgentInputItem } from '@openai/agents';
+import { z } from 'zod';
 import { ExecutionLedger, type ExecutionCall } from '../src/core/execution-ledger.js';
 import { FileSession } from '../src/core/session.js';
 import { MimiHost, type HostedRunExecutor } from '../src/runtime/mimi-host.js';
@@ -118,6 +119,41 @@ test('defers model and mode changes and restores them from a completion receipt 
     ]);
     assert.equal((await reopened.runtimeInfo()).model, 'runtime-action-test-model');
     assert.equal((await reopened.runtimeInfo()).mode.id, targetMode);
+  } finally {
+    await reopened.close();
+  }
+});
+
+test('completion receipt preserves final-delivery suppression across process recovery', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-runtime-delivery-recovery-'));
+  const first = await createAgent(root, 'owner');
+  const control: { suppressed: boolean; reason?: string } = { suppressed: false };
+  runControlCalls(first, [{ name: 'finish_mimi_silently', input: { reason: 'nothing changed' } }], []);
+  await first.stream('检查状态', undefined, {
+    executionKey: 'event:silent',
+    retainExecutionLedger: true,
+    requireCompletionGate: false,
+    completionDelivery: () => control.suppressed
+      ? { suppressed: true, reason: control.reason }
+      : undefined,
+    hostTools: [tool({
+      name: 'finish_mimi_silently',
+      description: 'finish silently',
+      parameters: z.object({ reason: z.string() }),
+      execute: async ({ reason }) => {
+        control.suppressed = true;
+        control.reason = reason;
+        return { suppressed: true };
+      },
+    })],
+  });
+  await first.completeRun('done');
+  await first.close();
+
+  const reopened = await createAgent(root, 'owner');
+  try {
+    const receipt = await reopened.completedExecution('owner', 'event:silent');
+    assert.deepEqual(receipt?.delivery, { suppressed: true, reason: 'nothing changed' });
   } finally {
     await reopened.close();
   }

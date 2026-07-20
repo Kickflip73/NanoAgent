@@ -44,7 +44,6 @@ export function buildResumePrompt(state: {
 }
 
 export function sessionStateSummary(state: {
-  input: string;
   plan: PlanStep[];
   goal?: Goal;
   hasTeam: boolean;
@@ -57,7 +56,7 @@ export function sessionStateSummary(state: {
   return [
     `Session：${state.run.sessionId}`,
     `Mode：${state.run.modeLabel} (${state.run.mode}) · Model：${state.run.modelName} · Output：${state.outputLevel}`,
-    `Run：running · 当前任务：${state.input.trim().replace(/\s+/g, ' ').slice(0, 500)}`,
+    'Run：running',
     state.plan.length
       ? `Plan：${completed}/${state.plan.length} completed${current ? ` · 当前阶段：${current.id} ${current.description}` : ''}`
       : 'Plan：未建立',

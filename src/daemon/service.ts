@@ -920,7 +920,7 @@ export function daemonLaunchEnvironment(config: AppConfig): Record<string, strin
   const session = preferredEnvironmentValue('MIMI_SESSION', 'AGENT_SESSION') ?? 'mimi-system';
   const environment: Record<string, string> = {
     MIMI_MODEL_PROVIDER: config.provider,
-    MIMI_CONFIG_VERSION: '2',
+    MIMI_CONFIG_VERSION: '3',
     MIMI_WORKSPACE: config.workspaceRoot,
     AGENT_WORKSPACE: config.workspaceRoot,
     MIMI_DATA_DIR: config.dataRoot,
