@@ -169,7 +169,7 @@ test('Daxiang connector verifies official API credentials before reporting outbo
   }
 });
 
-test('QQ connector health check distinguishes HTTP API readiness from inbound WebSocket readiness', async () => {
+test('QQ connector accepts desktop OneBot settings and distinguishes HTTP from WebSocket readiness', async () => {
   const requests: Array<{ url: string; body: Record<string, unknown>; authorization?: string }> = [];
   const server = createServer(async (request, response) => {
     requests.push({
@@ -184,7 +184,9 @@ test('QQ connector health check distinguishes HTTP API readiness from inbound We
   const script = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../examples/connectors/qq-napcat-connector.mjs');
   const child = spawn(process.execPath, [script], {
     env: {
-      NC_HTTP_URL: `http://127.0.0.1:${address.port}`, NC_WS_PORT: '0', NC_ACCESS_TOKEN: 'fixture-token',
+      QQ_ONEBOT_HTTP_URL: `http://127.0.0.1:${address.port}`,
+      QQ_ONEBOT_WS_PORT: '0',
+      QQ_ONEBOT_ACCESS_TOKEN: 'fixture-token',
     },
     stdio: ['pipe', 'pipe', 'pipe'],
   });
@@ -347,7 +349,7 @@ test('QQ connector requires an authenticated reverse WebSocket', async () => {
     child.once('exit', resolve);
   });
   assert.notEqual(code, 0);
-  assert.match(stderr, /missing NC_WS_ACCESS_TOKEN/);
+  assert.match(stderr, /missing QQ_ONEBOT_WS_ACCESS_TOKEN/);
 });
 
 test('QQ connector authenticates one upstream, keeps HTTP credentials separate, and survives oversized input', async () => {

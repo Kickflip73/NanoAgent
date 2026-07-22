@@ -232,6 +232,7 @@ export class MimiStore {
     this.eventStore = new EventStore(this.database);
     this.taskStore = new TaskStore(this.database);
     this.backupBeforeMemoryHubCutover();
+    this.backupBeforeTaskRouteRepairV14();
     this.migrate();
     this.eventRouter = new EventRouter(this, 'ingress-v1');
     chmodSync(this.file, 0o600);
@@ -1830,6 +1831,23 @@ export class MimiStore {
   activitySnapshot(requestedLimit = 10): MimiActivitySnapshot {
     const limit = Number.isSafeInteger(requestedLimit) ? Math.max(1, Math.min(20, requestedLimit)) : 10;
     const counts = this.counts();
+    const taskTypes: TaskRecord['type'][] = [
+      'conversation', 'background', 'scheduled', 'briefing', 'memory_maintenance',
+    ];
+    const taskStatuses: TaskRecord['status'][] = [
+      'queued', 'running', 'paused', 'blocked', 'completed', 'failed', 'cancelled', 'dead_letter',
+    ];
+    const tasksByType = Object.fromEntries(taskTypes.map((type) => [
+      type,
+      Object.fromEntries(taskStatuses.map((status) => [status, 0])),
+    ])) as MimiActivitySnapshot['tasksByType'];
+    for (const row of this.database.prepare(`
+      SELECT type, status, COUNT(*) AS count FROM tasks GROUP BY type, status
+    `).all() as Row[]) {
+      const type = String(row.type) as TaskRecord['type'];
+      const status = String(row.status) as TaskRecord['status'];
+      if (tasksByType[type]) tasksByType[type][status] = Number(row.count);
+    }
     const pendingDigest = this.pendingDigestCount();
     const recentEvents = (this.database.prepare(`
       SELECT id, source, type, subject_type, subject_id, occurred_at, received_at
@@ -1844,12 +1862,19 @@ export class MimiStore {
       receivedAt: String(row.received_at),
     }));
     const recentTasks = (this.database.prepare(`
-      SELECT id, type, status, priority, attempt_count, updated_at, error
-      FROM tasks ORDER BY updated_at DESC, rowid DESC LIMIT ?
+      SELECT task.id, task.type, task.status, task.trigger_event_id,
+        event.source, event.type AS event_type,
+        task.priority, task.attempt_count, task.updated_at, task.error
+      FROM tasks task
+      LEFT JOIN events event ON event.id = task.trigger_event_id
+      ORDER BY task.updated_at DESC, task.rowid DESC LIMIT ?
     `).all(limit) as Row[]).map((row) => ({
       id: String(row.id),
       type: String(row.type) as TaskRecord['type'],
       status: String(row.status) as TaskRecord['status'],
+      triggerEventId: optional(row.trigger_event_id),
+      source: optional(row.source),
+      eventType: optional(row.event_type),
       priority: Number(row.priority),
       attemptCount: Number(row.attempt_count),
       updatedAt: String(row.updated_at),
@@ -1896,6 +1921,7 @@ export class MimiStore {
       enabledSchedules: counts.enabledSchedules,
       events: counts.events,
       tasks: counts.tasks,
+      tasksByType,
       outbox: counts.outbox,
       recentEvents,
       recentTasks,
@@ -2315,17 +2341,26 @@ export class MimiStore {
 
   private migrate(): void {
     const version = Number((this.database.prepare('PRAGMA user_version').get() as Row).user_version);
-    if (version > 13) throw new Error(`不支持的 MimiAgent 数据库版本：${version}`);
+    if (version > 14) throw new Error(`不支持的 MimiAgent 数据库版本：${version}`);
+    if (version === 14) {
+      if (!this.hasFinalV12Schema() || !this.tableColumns('memory_observations').has('source_key')) {
+        throw new Error('MimiAgent 数据库标记为 v14，但缺少最终 Event/Task 或 Memory observation schema');
+      }
+      this.ensureMemoryLintSchemaV13();
+      return;
+    }
     if (version === 13) {
       if (!this.hasFinalV12Schema() || !this.tableColumns('memory_observations').has('source_key')) {
         throw new Error('MimiAgent 数据库标记为 v13，但缺少最终 Event/Task 或 Memory observation schema');
       }
       this.ensureMemoryLintSchemaV13();
+      this.repairDigestedTaskRoutesV14();
       return;
     }
     if (version === 12) {
       if (this.hasFinalV12Schema()) {
         this.upgradeMemoryObservationsV13();
+        this.repairDigestedTaskRoutesV14();
         return;
       }
       if (!this.hasLegacyEventSchema()) {
@@ -2334,11 +2369,13 @@ export class MimiStore {
       this.assertEmptyPartialV12Tables();
       this.cutoverEventTaskV12(true);
       this.upgradeMemoryObservationsV13();
+      this.repairDigestedTaskRoutesV14();
       return;
     }
     if (version === 0) {
       this.createFreshV12Schema();
       this.upgradeMemoryObservationsV13();
+      this.repairDigestedTaskRoutesV14();
       return;
     }
     if (version <= 2) {
@@ -2374,6 +2411,56 @@ export class MimiStore {
     this.createEventTaskIndexes();
     this.cutoverEventTaskV12();
     this.upgradeMemoryObservationsV13();
+    this.repairDigestedTaskRoutesV14();
+  }
+
+  private backupBeforeTaskRouteRepairV14(): void {
+    const version = Number((this.database.prepare('PRAGMA user_version').get() as Row).user_version);
+    if (version !== 13 || !this.hasFinalV12Schema()) return;
+    this.database.exec('PRAGMA wal_checkpoint(FULL);');
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const backupRoot = path.join(path.dirname(this.file), 'backups', `task-route-v14-${stamp}-${randomUUID().slice(0, 8)}`);
+    mkdirSync(backupRoot, { recursive: true, mode: 0o700 });
+    chmodSync(backupRoot, 0o700);
+    for (const suffix of ['', '-wal', '-shm']) {
+      const source = `${this.file}${suffix}`;
+      if (!existsSync(source)) continue;
+      const target = path.join(backupRoot, `${path.basename(this.file)}${suffix}`);
+      copyFileSync(source, target);
+      chmodSync(target, 0o600);
+    }
+  }
+
+  private repairDigestedTaskRoutesV14(): void {
+    this.database.exec(`
+      BEGIN IMMEDIATE;
+      UPDATE event_route_receipts
+      SET decision = 'digest', task_ids_json = '[]', reason_code = 'legacy_digest_conversion'
+      WHERE router_version = 'migration-v12'
+        AND EXISTS (
+          SELECT 1 FROM events lifecycle
+          WHERE lifecycle.id = 'migration-task-' || event_route_receipts.event_id
+            AND lifecycle.source = 'mimi:migration'
+            AND lifecycle.type = 'task.digested'
+            AND lifecycle.causation_event_id = event_route_receipts.event_id
+        )
+        AND NOT EXISTS (SELECT 1 FROM runs WHERE task_id = event_route_receipts.event_id)
+        AND NOT EXISTS (SELECT 1 FROM outbox WHERE task_id = event_route_receipts.event_id);
+      DELETE FROM tasks
+      WHERE idempotency_key = 'migration:event:' || id
+        AND EXISTS (
+          SELECT 1 FROM events lifecycle
+          WHERE lifecycle.id = 'migration-task-' || tasks.id
+            AND lifecycle.source = 'mimi:migration'
+            AND lifecycle.type = 'task.digested'
+            AND lifecycle.causation_event_id = tasks.id
+        )
+        AND NOT EXISTS (SELECT 1 FROM runs WHERE task_id = tasks.id)
+        AND NOT EXISTS (SELECT 1 FROM outbox WHERE task_id = tasks.id)
+        AND NOT EXISTS (SELECT 1 FROM tasks child WHERE child.parent_task_id = tasks.id);
+      PRAGMA user_version = 14;
+      COMMIT;
+    `);
   }
 
   private backupBeforeMemoryHubCutover(): void {
@@ -2594,6 +2681,9 @@ export class MimiStore {
   private cutoverEventTaskV12(removePartialV12 = false): void {
     const legacyCounts = {
       events: Number((this.database.prepare('SELECT COUNT(*) AS count FROM events').get() as Row).count),
+      executableEvents: Number((this.database.prepare(`
+        SELECT COUNT(*) AS count FROM events WHERE status NOT IN ('digested', 'ignored')
+      `).get() as Row).count),
       runs: Number((this.database.prepare('SELECT COUNT(*) AS count FROM runs').get() as Row).count),
       outbox: Number((this.database.prepare('SELECT COUNT(*) AS count FROM outbox').get() as Row).count),
     };
@@ -2726,7 +2816,8 @@ export class MimiStore {
             WHEN 'digested' THEN 'completed' ELSE e.status END,
           e.not_before, e.attempts, COALESCE(e.max_attempts, 5), e.lease_owner, e.lease_until,
           e.task_control, e.task_control_reason, e.result_json, e.error, e.created_at, e.updated_at
-        FROM events e LEFT JOIN events parent ON parent.id = e.parent_event_id;
+        FROM events e LEFT JOIN events parent ON parent.id = e.parent_event_id
+        WHERE e.status NOT IN ('digested', 'ignored');
 
         INSERT INTO events_v12 (
           id, external_id, source, type, trust, actor_json, conversation_json, payload_json,
@@ -2740,14 +2831,20 @@ export class MimiStore {
           'system', 'null', 'null', json_object('provenance', 'migration-v12'),
           'task', id, COALESCE(root_event_id, parent_event_id, id), id, profile_id,
           'null', updated_at, updated_at, updated_at
-        FROM events;
+        FROM events
+        WHERE status NOT IN ('digested', 'ignored');
 
         INSERT INTO event_route_receipts_v12 (
           event_id, router_version, decision, task_ids_json, reason_code, routed_at
         )
         SELECT id, 'migration-v12',
-          'task_created', json_array(id),
-          'legacy_event_conversion', updated_at
+          CASE status WHEN 'digested' THEN 'digest' WHEN 'ignored' THEN 'rejected'
+            ELSE 'task_created' END,
+          CASE WHEN status IN ('digested', 'ignored') THEN '[]' ELSE json_array(id) END,
+          CASE status WHEN 'digested' THEN 'legacy_digest_conversion'
+            WHEN 'ignored' THEN 'legacy_ignored_conversion'
+            ELSE 'legacy_event_conversion' END,
+          updated_at
         FROM events;
 
         INSERT INTO event_route_receipts_v12 (
@@ -2755,7 +2852,8 @@ export class MimiStore {
         )
         SELECT 'migration-task-' || id, 'migration-v12', 'observe_only', '[]',
           'task_lifecycle', updated_at
-        FROM events;
+        FROM events
+        WHERE status NOT IN ('digested', 'ignored');
 
         INSERT INTO runs_v12 (
           id, task_id, attempt_no, session_key, worker_id, status,
@@ -2807,8 +2905,8 @@ export class MimiStore {
         runs: Number((this.database.prepare('SELECT COUNT(*) AS count FROM runs').get() as Row).count),
         outbox: Number((this.database.prepare('SELECT COUNT(*) AS count FROM outbox').get() as Row).count),
       };
-      if (convertedCounts.tasks !== legacyCounts.events
-        || convertedCounts.routes !== legacyCounts.events * 2
+      if (convertedCounts.tasks !== legacyCounts.executableEvents
+        || convertedCounts.routes !== legacyCounts.events + legacyCounts.executableEvents
         || convertedCounts.runs !== legacyCounts.runs
         || convertedCounts.outbox !== legacyCounts.outbox) {
         throw new Error(`Event/Task v12 转换计数校验失败：${JSON.stringify({ legacyCounts, convertedCounts })}`);

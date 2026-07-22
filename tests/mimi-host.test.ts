@@ -14,6 +14,28 @@ function deferred(): { promise: Promise<void>; resolve: () => void } {
   return { promise, resolve };
 }
 
+test('forwards a trusted Host answer through the keyed Session runner', async () => {
+  let forwarded: AgentRunRequest | undefined;
+  const agent = {
+    currentSessionId: 'session-a',
+    sessionSnapshot: async () => { throw new Error('unused'); },
+    listSessionSummaries: async () => [],
+    close: async () => undefined,
+  } as unknown as MimiAgent;
+  const host = new MimiHost(agent, {
+    execute: async (request: AgentRunRequest): Promise<AgentRunResult> => {
+      forwarded = request;
+      return { answer: request.trustedHostAnswer ?? 'model', effects: [] };
+    },
+  });
+
+  const result = await host.execute({
+    sessionId: 'session-a', input: '咋样了？', trustedHostAnswer: '当前空闲。',
+  });
+  assert.equal(forwarded?.trustedHostAnswer, '当前空闲。');
+  assert.equal(result.answer, '当前空闲。');
+});
+
 test('serializes Session mutations behind the active Agent run', async () => {
   const release = deferred();
   const started = deferred();

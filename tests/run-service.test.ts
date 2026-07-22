@@ -38,6 +38,36 @@ test('shared run service owns completion, usage and observer isolation', async (
   assert.equal(stopped, true);
 });
 
+test('trusted host answers complete without invoking the model stream', async () => {
+  let hostInput = '';
+  let hostAnswer = '';
+  let streamed = false;
+  const observed: string[] = [];
+  const agent = {
+    onRuntimeEvent: () => () => undefined,
+    stream: async () => { streamed = true; throw new Error('model must not run'); },
+    completeHostRun: async (input: string, answer: string) => {
+      hostInput = input;
+      hostAnswer = answer;
+      return [];
+    },
+    failRun: async () => assert.fail('successful host answer must not fail'),
+  } as unknown as MimiAgent;
+
+  const result = await new AgentRunService(agent).execute({
+    input: '咋样了？', trustedHostAnswer: '当前没有任务在运行。',
+  }, {
+    onStart: () => { observed.push('start'); },
+    onComplete: () => { observed.push('complete'); },
+  });
+
+  assert.equal(streamed, false);
+  assert.equal(hostInput, '咋样了？');
+  assert.equal(hostAnswer, '当前没有任务在运行。');
+  assert.equal(result.answer, '当前没有任务在运行。');
+  assert.deepEqual(observed, ['start', 'complete']);
+});
+
 test('shared run service records one failed terminal outcome', async () => {
   const failure = new Error('provider unavailable');
   let failed: unknown;

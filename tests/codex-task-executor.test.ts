@@ -3,7 +3,44 @@ import { chmod, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
-import { CodexCliTaskExecutor } from '../src/daemon/codex-task-executor.js';
+import {
+  codexExecutionEnvironment,
+  CodexCliTaskExecutor,
+  resolveCodexExecutable,
+} from '../src/daemon/codex-task-executor.js';
+
+test('Codex executor resolves the CLI from PATH before spawning', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-codex-path-'));
+  const executable = path.join(root, 'codex');
+  await writeFile(executable, '#!/bin/sh\nexit 0\n');
+  await chmod(executable, 0o755);
+
+  assert.equal(resolveCodexExecutable({ PATH: root }, 'linux'), executable);
+  assert.equal(resolveCodexExecutable({ MIMI_CODEX_PATH: '/custom/codex', PATH: '' }, 'linux'), '/custom/codex');
+});
+
+test('Codex executor adds the current Node directory to a minimal daemon PATH', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-codex-node-path-'));
+  const executable = path.join(root, 'codex');
+  await writeFile(executable, `#!/usr/bin/env node
+process.stdout.write(JSON.stringify({type:'turn.completed'})+'\\n');
+`);
+  await chmod(executable, 0o755);
+  const minimalEnvironment = { PATH: '/usr/bin:/bin' };
+  const environment = codexExecutionEnvironment(executable, minimalEnvironment, process.execPath);
+  assert.equal(environment.PATH?.split(path.delimiter)[0], path.dirname(process.execPath));
+
+  const result = await new CodexCliTaskExecutor(
+    executable,
+    minimalEnvironment,
+    process.execPath,
+  ).execute({
+    objective: 'work',
+    workspaceRoot: root,
+    workspaceAccess: 'read',
+  });
+  assert.equal(result.exitCode, 0);
+});
 
 test('Codex executor parses JSONL progress and returns the resumable thread', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-codex-executor-'));

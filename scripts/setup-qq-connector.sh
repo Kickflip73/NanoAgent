@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
-# Configure MimiAgent's background-only NapCat/OneBot QQ connector.
+# Configure MimiAgent's OneBot 11 QQ connector.
+# QQ_ONEBOT_MODE=desktop connects to OneBot hosted by the visible QQ process;
+# the legacy/default napcat mode keeps the separately managed NapCat workflow.
 set -euo pipefail
+
+QQ_ONEBOT_MODE="${QQ_ONEBOT_MODE:-napcat}"
+if [[ "$QQ_ONEBOT_MODE" != "desktop" && "$QQ_ONEBOT_MODE" != "napcat" ]]; then
+  echo "QQ_ONEBOT_MODE must be desktop or napcat" >&2
+  exit 2
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -43,7 +51,7 @@ fi
 mkdir -p "$(dirname "$CONNECTORS_FILE")" "$(dirname "$ENV_FILE")"
 chmod 700 "$(dirname "$CONNECTORS_FILE")" "$(dirname "$ENV_FILE")" 2>/dev/null || true
 
-export CONNECTORS_FILE ENV_FILE NODE_BIN PROJECT_ROOT
+export CONNECTORS_FILE ENV_FILE NODE_BIN PROJECT_ROOT QQ_ONEBOT_MODE
 "$NODE_BIN" <<'NODE'
 const fs = require('node:fs');
 const path = require('node:path');
@@ -78,10 +86,10 @@ const previous = config.connectors.qq && typeof config.connectors.qq === 'object
   : {};
 const actions = {
   send_message: { description: '向 QQ 私聊或群聊主动发送文本消息' },
-  health_check: { description: '调用 NapCat get_status 并确认反向 WebSocket 入站连接是否在线' },
-  recent_conversations: { description: '通过 NapCat 后台 API 读取近期 QQ 会话；target 为 all' },
-  list_friends: { description: '通过 NapCat 后台 API 列出有界好友目录；target 为 all' },
-  list_groups: { description: '通过 NapCat 后台 API 列出有界群目录；target 为 all' },
+  health_check: { description: '调用 OneBot get_status 并确认反向 WebSocket 入站连接是否在线' },
+  recent_conversations: { description: '通过 OneBot API 读取近期 QQ 会话；target 为 all（实现扩展能力）' },
+  list_friends: { description: '通过 OneBot API 列出有界好友目录；target 为 all' },
+  list_groups: { description: '通过 OneBot API 列出有界群目录；target 为 all' },
   friend_history: { description: '读取指定 QQ 好友的有界历史；target 为 private:<QQ号>' },
   group_history: { description: '读取指定 QQ 群的有界历史；target 为 group:<群号>' },
 };
@@ -92,6 +100,8 @@ config.connectors.qq = {
   args: [path.join(process.env.PROJECT_ROOT, 'examples/connectors/qq-napcat-connector.mjs')],
   envAllowlist: [...new Set([
     ...(Array.isArray(previous.envAllowlist) ? previous.envAllowlist : []),
+    'QQ_ONEBOT_HTTP_URL', 'QQ_ONEBOT_WS_PORT', 'QQ_ONEBOT_ACCESS_TOKEN',
+    'QQ_ONEBOT_WS_ACCESS_TOKEN', 'QQ_ONEBOT_STATUS_POLL_MS',
     'NC_HTTP_URL', 'NC_WS_PORT', 'NC_ACCESS_TOKEN', 'NC_WS_ACCESS_TOKEN', 'NC_STATUS_POLL_MS',
   ])],
   source: 'qq',
@@ -112,15 +122,20 @@ const existing = Object.fromEntries(env.split(/\r?\n/).flatMap((line) => {
   const match = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(line);
   return match ? [[match[1], match[2]]] : [];
 }));
-const sharedToken = existing.NC_ACCESS_TOKEN || randomBytes(32).toString('base64url');
-env = upsertEnv(env, 'NC_HTTP_URL', existing.NC_HTTP_URL || 'http://127.0.0.1:3000');
-env = upsertEnv(env, 'NC_WS_PORT', existing.NC_WS_PORT || '3080');
-env = upsertEnv(env, 'NC_ACCESS_TOKEN', sharedToken);
-env = upsertEnv(env, 'NC_WS_ACCESS_TOKEN', existing.NC_WS_ACCESS_TOKEN || sharedToken);
+const desktop = process.env.QQ_ONEBOT_MODE === 'desktop';
+const httpKey = desktop ? 'QQ_ONEBOT_HTTP_URL' : 'NC_HTTP_URL';
+const portKey = desktop ? 'QQ_ONEBOT_WS_PORT' : 'NC_WS_PORT';
+const accessKey = desktop ? 'QQ_ONEBOT_ACCESS_TOKEN' : 'NC_ACCESS_TOKEN';
+const wsAccessKey = desktop ? 'QQ_ONEBOT_WS_ACCESS_TOKEN' : 'NC_WS_ACCESS_TOKEN';
+const sharedToken = process.env[accessKey] || existing[accessKey] || randomBytes(32).toString('base64url');
+env = upsertEnv(env, httpKey, process.env[httpKey] || existing[httpKey] || 'http://127.0.0.1:3000');
+env = upsertEnv(env, portKey, process.env[portKey] || existing[portKey] || '3080');
+env = upsertEnv(env, accessKey, sharedToken);
+env = upsertEnv(env, wsAccessKey, process.env[wsAccessKey] || existing[wsAccessKey] || sharedToken);
 writeAtomic(process.env.ENV_FILE, env);
 NODE
 
-echo "MimiAgent QQ 后台 Connector 配置已增量写入：${CONNECTORS_FILE}"
+echo "MimiAgent QQ OneBot Connector 配置已增量写入：${CONNECTORS_FILE}"
 echo "凭证已写入 owner-only 环境文件：${ENV_FILE}（不会输出 token）"
 echo "QQ/微信 UI 自动化 Connector 已关闭。"
 
@@ -135,9 +150,11 @@ const values = Object.fromEntries(readFileSync(process.env.ENV_FILE, 'utf8').spl
   const match = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(line);
   return match ? [[match[1], match[2]]] : [];
 }));
-const base = values.NC_HTTP_URL || 'http://127.0.0.1:3000';
+const desktop = process.env.QQ_ONEBOT_MODE === 'desktop';
+const base = (desktop ? values.QQ_ONEBOT_HTTP_URL : values.NC_HTTP_URL) || 'http://127.0.0.1:3000';
+const token = desktop ? values.QQ_ONEBOT_ACCESS_TOKEN : values.NC_ACCESS_TOKEN;
 const headers = { 'content-type': 'application/json' };
-if (values.NC_ACCESS_TOKEN) headers.authorization = `Bearer ${values.NC_ACCESS_TOKEN}`;
+if (token) headers.authorization = `Bearer ${token}`;
 try {
   const response = await fetch(`${base.replace(/\/$/, '')}/get_status`, {
     method: 'POST', headers, body: '{}', signal: AbortSignal.timeout(5_000),
@@ -159,13 +176,18 @@ const temporary = `${file}.tmp-${process.pid}`;
 fs.writeFileSync(temporary, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
 fs.renameSync(temporary, file);
 NODE
-  echo "NapCat HTTP 已响应，QQ Connector 已启用。"
+  echo "OneBot HTTP 已响应，QQ Connector 已启用。"
   if [[ -n "$MIMI_BIN" ]]; then
     "$MIMI_BIN" daemon connectors reload >/dev/null
     echo "MimiAgent Connector 已热重载。"
   fi
 else
-  echo "NapCat HTTP 尚未响应；QQ Connector 保持禁用，避免误报在线。"
-  echo "安装/状态入口：$PROJECT_ROOT/scripts/install-napcat-macos.mjs（推荐把已验证的官方 QQ 副本通过 NAPCAT_QQ_APP 安装到 MimiAgent 私有目录）。"
-  echo "NapCat 配置：HTTP 127.0.0.1:3000；反向 WS ws://127.0.0.1:3080/；两端 token 使用 $ENV_FILE 中的值。"
+  echo "OneBot HTTP 尚未响应；QQ Connector 保持禁用，避免误报在线。"
+  if [[ "$QQ_ONEBOT_MODE" == "desktop" ]]; then
+    echo "请在当前桌面 QQ 内的 LLOneBot/LLBot 启用 HTTP 127.0.0.1:3000 和反向 WS ws://127.0.0.1:3080/。"
+    echo "HTTP/WS token 使用 $ENV_FILE 中 QQ_ONEBOT_* 的值；完成后再运行本脚本。"
+  else
+    echo "安装/状态入口：$PROJECT_ROOT/scripts/install-napcat-macos.mjs（推荐把已验证的官方 QQ 副本通过 NAPCAT_QQ_APP 安装到 MimiAgent 私有目录）。"
+    echo "NapCat 配置：HTTP 127.0.0.1:3000；反向 WS ws://127.0.0.1:3080/；两端 token 使用 $ENV_FILE 中的值。"
+  fi
 fi

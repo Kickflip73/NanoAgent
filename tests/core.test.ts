@@ -19,6 +19,7 @@ import { FileSession, registerSessionRunOwner } from '../src/core/session.js';
 import { TeamTaskStore } from '../src/core/team.js';
 import { TraceStore } from '../src/core/trace.js';
 import { HookBus } from '../src/runtime/hooks.js';
+import { decideEvent } from '../src/daemon/policy.js';
 import {
   collectTrustedMcpEnvironment,
   expandMcpEnvironment,
@@ -180,6 +181,57 @@ test('releases the active run when asynchronous Runner setup rejects', async () 
   try {
     await assert.rejects(agent.stream('start'), /async runner setup failed/);
     await assert.doesNotReject(agent.switchSession('after-failure'));
+  } finally {
+    await agent.close();
+  }
+});
+
+test('focused owner runs omit undisclosed Skill catalog and cap output reservation', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-focused-context-'));
+  const dataRoot = path.join(root, '.mimi-agent');
+  const skillsRoot = path.join(root, 'skills');
+  await mkdir(path.join(skillsRoot, 'hidden-skill'), { recursive: true });
+  await writeFile(path.join(skillsRoot, 'hidden-skill', 'SKILL.md'), [
+    '---',
+    'name: hidden-skill',
+    'description: UNIQUE_SKILL_DESCRIPTION_MUST_NOT_LEAK',
+    '---',
+    'Hidden instructions.',
+  ].join('\n'));
+  const agent = await MimiAgent.create({
+    provider: 'openai', workspaceRoot: root, dataRoot, skillsRoot,
+    mcpConfig: path.join(root, 'mcp.json'), historyLimit: 40, contextWindow: 128_000, maxTurns: 20,
+  });
+  const captured: { tools?: string[]; instructions?: string; maxTokens?: number } = {};
+  const runner = (agent as unknown as { runner: { run: (runtimeAgent: unknown) => Promise<unknown> } }).runner;
+  runner.run = async (runtimeAgent) => {
+    const value = runtimeAgent as {
+      tools: Array<{ name: string }>;
+      instructions: string;
+      modelSettings: { maxTokens?: number };
+    };
+    captured.tools = value.tools.map((item) => item.name);
+    captured.instructions = value.instructions;
+    captured.maxTokens = value.modelSettings.maxTokens;
+    return {};
+  };
+  const now = new Date().toISOString();
+  const decision = decideEvent({
+    id: 'focused-event', externalId: 'focused-event', source: 'local-cli', kind: 'command', trust: 'owner',
+    payload: '咋样了？', profileId: 'owner', occurredAt: now, receivedAt: now, priority: 100,
+  });
+  try {
+    const session = (agent as unknown as { session: FileSession }).session;
+    await session.addItems(Array.from({ length: 20 }, (_, index) => [
+      { role: 'user', content: `OLD_USER_${index}_${'x'.repeat(2_000)}` },
+      { role: 'assistant', content: `OLD_ASSISTANT_${index}_${'y'.repeat(2_000)}` },
+    ]).flat() as AgentInputItem[]);
+    await agent.stream('咋样了？', undefined, decision.options);
+    assert.deepEqual(captured.tools, []);
+    assert.doesNotMatch(captured.instructions ?? '', /UNIQUE_SKILL_DESCRIPTION_MUST_NOT_LEAK/);
+    assert.equal(captured.maxTokens, 4_096);
+    assert.ok((await agent.contextInfo()).estimatedTokens < 20_000);
+    await agent.failRun(new Error('test cleanup'), true);
   } finally {
     await agent.close();
   }

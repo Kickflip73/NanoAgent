@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { RunContext } from '@openai/agents';
+import type OpenAI from 'openai';
 import { createMemoryHub } from '../src/extensions/memory/hub.js';
 import { SqliteMemoryCatalog } from '../src/extensions/memory/sqlite-catalog.js';
 import { createMemoryTools } from '../src/extensions/memory/tools.js';
@@ -45,6 +46,28 @@ test('MemoryHub isolates private profiles and forget suppresses automatic resurr
     scope: 'private',
     autonomous: true,
   }, ownerContext), /已被 owner 遗忘/);
+});
+
+test('automatic semantic recall fails fast instead of retrying a slow embedding request', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-memory-embedding-budget-'));
+  let requestOptions: unknown;
+  const embeddingClient = {
+    embeddings: {
+      create: async (_input: unknown, options: unknown) => {
+        requestOptions = options;
+        throw Object.assign(new Error('rate limited'), { status: 429 });
+      },
+    },
+  } as unknown as OpenAI;
+  const hub = await createMemoryHub({
+    workspaceRoot: root,
+    dataRoot: path.join(root, 'data'),
+    profileId: 'owner',
+    embeddingClient,
+  });
+
+  assert.deepEqual(await hub.search('quick recall', context(root)), []);
+  assert.deepEqual(requestOptions, { maxRetries: 0, timeout: 1_500 });
 });
 
 test('SubAgent and Team memory tools cannot read private Wiki or episodes', async () => {

@@ -1,5 +1,7 @@
 import { spawn } from 'node:child_process';
-import { createWriteStream } from 'node:fs';
+import { accessSync, constants, createWriteStream } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import readline from 'node:readline';
 
 export interface CodexTaskRequest {
@@ -22,6 +24,55 @@ export interface CodexTaskResult {
   exitCode: number;
 }
 
+export function resolveCodexExecutable(
+  environment: NodeJS.ProcessEnv = process.env,
+  platform = process.platform,
+): string {
+  const configured = environment.MIMI_CODEX_PATH?.trim();
+  if (configured) return configured;
+  const pathCandidates = (environment.PATH ?? '')
+    .split(path.delimiter)
+    .filter(Boolean)
+    .map((directory) => path.join(directory, platform === 'win32' ? 'codex.exe' : 'codex'));
+  const commonCandidates = platform === 'darwin'
+    ? [
+        '/opt/homebrew/bin/codex',
+        '/usr/local/bin/codex',
+        path.join(os.homedir(), '.local/bin/codex'),
+        '/Applications/ChatGPT.app/Contents/Resources/codex',
+      ]
+    : platform === 'win32'
+      ? []
+      : ['/usr/local/bin/codex', path.join(os.homedir(), '.local/bin/codex')];
+  for (const candidate of [...pathCandidates, ...commonCandidates]) {
+    try {
+      accessSync(candidate, constants.X_OK);
+      return candidate;
+    } catch {
+      // Continue through known installation locations before preserving the
+      // original PATH-based behavior and its useful ENOENT diagnostic.
+    }
+  }
+  return 'codex';
+}
+
+export function codexExecutionEnvironment(
+  executable: string,
+  source: NodeJS.ProcessEnv = process.env,
+  nodeExecutable = process.execPath,
+): NodeJS.ProcessEnv {
+  const inheritedPath = source.PATH ?? '';
+  const entries = [
+    path.dirname(nodeExecutable),
+    ...(path.isAbsolute(executable) ? [path.dirname(executable)] : []),
+    ...inheritedPath.split(path.delimiter).filter(Boolean),
+  ];
+  return {
+    ...source,
+    PATH: [...new Set(entries)].join(path.delimiter),
+  };
+}
+
 function prompt(request: CodexTaskRequest): string {
   return [
     '你是 MimiAgent 的可选后台执行器。请在指定工作区自主完成任务。',
@@ -33,7 +84,17 @@ function prompt(request: CodexTaskRequest): string {
 }
 
 export class CodexCliTaskExecutor {
-  constructor(private readonly executable = process.env.MIMI_CODEX_PATH?.trim() || 'codex') {}
+  private readonly executable: string;
+  private readonly environment: NodeJS.ProcessEnv;
+
+  constructor(
+    executable?: string,
+    environment: NodeJS.ProcessEnv = process.env,
+    nodeExecutable = process.execPath,
+  ) {
+    this.executable = executable ?? resolveCodexExecutable(environment);
+    this.environment = codexExecutionEnvironment(this.executable, environment, nodeExecutable);
+  }
 
   execute(request: CodexTaskRequest): Promise<CodexTaskResult> {
     request.signal?.throwIfAborted();
@@ -47,7 +108,7 @@ export class CodexCliTaskExecutor {
     return new Promise<CodexTaskResult>((resolve, reject) => {
       const child = spawn(this.executable, args, {
         cwd: request.workspaceRoot,
-        env: process.env,
+        env: this.environment,
         stdio: ['ignore', 'pipe', 'pipe'],
         detached: process.platform !== 'win32',
       });

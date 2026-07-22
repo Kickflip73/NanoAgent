@@ -1,11 +1,13 @@
 import { createHash } from 'node:crypto';
 import {
   READ_ONLY_EVENT_CAPABILITIES,
+  type RunPolicy,
   type MimiRunOptions,
 } from '../runtime/mimi-agent.js';
 import type { ToolCapability } from '../runtime/tool-policy.js';
 import type { ComputerAccess } from '../extensions/computer/types.js';
 import { assertSessionId, sessionIdSchema } from '../core/session-id.js';
+import { capabilityDisclosureForInput } from '../core/user-intent.js';
 import type { EventEnvelope, TaskRecord } from './types.js';
 
 export interface EventDecision {
@@ -112,6 +114,64 @@ const NON_OWNER_WORK_TASK_TOOLS = WORK_TASK_TOOLS
   .filter((name) => name !== 'connector_action');
 const NON_OWNER_WORK_TASK_SIDE_EFFECT_TOOLS = WORK_TASK_SIDE_EFFECT_TOOLS
   .filter((name) => name !== 'connector_action');
+
+const OWNER_STATUS_TOOLS = [] as const;
+
+const OWNER_SESSION_TOOLS = [
+  'runtime_status', 'list_models', 'list_modes', 'switch_model', 'switch_mode',
+  'set_output_level', 'list_sessions', 'get_session_history', 'switch_session',
+  'new_session', 'clear_session',
+] as const;
+
+const OWNER_WEB_TOOLS = [
+  'current_time', 'calculate', 'http_get', 'web_search',
+] as const;
+
+function ownerConversationPolicy(input: string): RunPolicy | undefined {
+  const disclosure = capabilityDisclosureForInput(input);
+  if (disclosure === 'full') return undefined;
+  if (disclosure === 'status') {
+    return {
+      allowedCapabilities: ['read', 'state-read'],
+      allowedTools: OWNER_STATUS_TOOLS,
+      allowSideEffects: false,
+      allowUnknownTools: false,
+      allowMcp: false,
+      allowSessionContext: true,
+    };
+  }
+  if (disclosure === 'session') {
+    return {
+      allowedCapabilities: ['read', 'state-read', 'control'],
+      allowedTools: OWNER_SESSION_TOOLS,
+      allowSideEffects: true,
+      allowedSideEffectTools: [
+        'switch_model', 'switch_mode', 'set_output_level', 'switch_session', 'new_session', 'clear_session',
+      ],
+      allowUnknownTools: false,
+      allowMcp: false,
+      allowSessionContext: true,
+    };
+  }
+  if (disclosure === 'web') {
+    return {
+      allowedCapabilities: ['read', 'network-read'],
+      allowedTools: OWNER_WEB_TOOLS,
+      allowSideEffects: false,
+      allowUnknownTools: false,
+      allowMcp: false,
+      allowSessionContext: true,
+    };
+  }
+  return {
+    allowedCapabilities: ['read'],
+    allowedTools: ['current_time', 'calculate'],
+    allowSideEffects: false,
+    allowUnknownTools: false,
+    allowMcp: false,
+    allowSessionContext: true,
+  };
+}
 
 function textPayload(payload: unknown): string {
   if (typeof payload === 'string') return payload.trim() ? payload : '';
@@ -299,12 +359,12 @@ export function decideEvent(
   const ownerDelegated = !forceRestricted && restrictedProvenance && ownerSourcePolicyAccess !== undefined;
   const mayAct = !restrictedProvenance || ownerDelegated;
   const backgroundTask = task !== undefined && task.type !== 'conversation';
-  const memoryMaintenance = task?.type === 'memory_maintenance';
   const computerAccess = backgroundTask
     ? 'none'
     : ownerComputerAccess ?? (!restrictedProvenance ? 'background' : 'none');
   const computerEnabled = computerAccess !== 'none';
   const computerWriteEnabled = computerAccess !== 'observe' && computerAccess !== 'none';
+  const memoryMaintenance = task?.type === 'memory_maintenance';
   const semanticMemoryLint = memoryMaintenance
     && task.objective !== null && typeof task.objective === 'object'
     && (task.objective as Record<string, unknown>).semanticLint === true;
@@ -448,7 +508,9 @@ export function decideEvent(
               allowMcp: false,
               allowSessionContext: true,
             }
-          : undefined;
+          : event.trust === 'owner' && !backgroundTask
+            ? ownerConversationPolicy(content)
+            : undefined;
   return {
     action: 'run',
     reason: '事件需要 Agent 判断或处理',
@@ -469,11 +531,11 @@ export function decideEvent(
           personName: person.displayName,
         } : {}),
       },
-      ...(policy ? { policy } : {}),
-    },
       ...(computerEnabled ? {
         computerAccess,
         ...(ownerComputerApps ? { computerApps: ownerComputerApps } : {}),
       } : {}),
+      ...(policy ? { policy } : {}),
+    },
   };
 }

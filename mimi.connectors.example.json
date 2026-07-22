@@ -75,7 +75,7 @@
       "enabled": false,
       "command": "node",
       "args": ["/absolute/path/to/MimiAgent/examples/connectors/qq-napcat-connector.mjs"],
-      "envAllowlist": ["NC_HTTP_URL", "NC_WS_PORT", "NC_ACCESS_TOKEN", "NC_WS_ACCESS_TOKEN", "NC_STATUS_POLL_MS"],
+      "envAllowlist": ["QQ_ONEBOT_HTTP_URL", "QQ_ONEBOT_WS_PORT", "QQ_ONEBOT_ACCESS_TOKEN", "QQ_ONEBOT_WS_ACCESS_TOKEN", "QQ_ONEBOT_STATUS_POLL_MS", "NC_HTTP_URL", "NC_WS_PORT", "NC_ACCESS_TOKEN", "NC_WS_ACCESS_TOKEN", "NC_STATUS_POLL_MS"],
       "source": "qq",
       "trust": "external",
       "profileId": "owner",
@@ -84,10 +84,10 @@
       "actionTimeoutMs": 30000,
       "actions": {
         "send_message": { "description": "向 QQ 私聊或群聊主动发送文本消息" },
-        "health_check": { "description": "调用 NapCat get_status 并确认反向 WebSocket 入站连接是否在线" },
-        "recent_conversations": { "description": "通过 NapCat 后台 API 读取近期 QQ 会话；target 为 all" },
-        "list_friends": { "description": "通过 NapCat 后台 API 列出有界好友目录；target 为 all" },
-        "list_groups": { "description": "通过 NapCat 后台 API 列出有界群目录；target 为 all" },
+        "health_check": { "description": "调用 OneBot get_status 并确认反向 WebSocket 入站连接是否在线" },
+        "recent_conversations": { "description": "通过 OneBot 扩展 API 读取近期 QQ 会话；target 为 all" },
+        "list_friends": { "description": "通过 OneBot API 列出有界好友目录；target 为 all" },
+        "list_groups": { "description": "通过 OneBot API 列出有界群目录；target 为 all" },
         "friend_history": { "description": "读取指定 QQ 好友的有界历史；target 为 private:<QQ号>" },
         "group_history": { "description": "读取指定 QQ 群的有界历史；target 为 group:<群号>" }
       }

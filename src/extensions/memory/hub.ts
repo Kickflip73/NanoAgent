@@ -34,6 +34,8 @@ import { SqliteMemoryCatalog } from './sqlite-catalog.js';
 import { WikiVault } from './wiki-vault.js';
 import { cutoverLegacyMemory } from './cutover.js';
 
+const AUTOMATIC_EMBEDDING_TIMEOUT_MS = 1_500;
+
 export interface MemoryHubOptions {
   workspaceRoot: string;
   dataRoot: string;
@@ -159,7 +161,7 @@ class DefaultMemoryHub implements MemoryHub {
     const limit = Math.min(20, Math.max(1, options.limit ?? 5));
     const automatic = Object.keys(options).length === 0;
     const finish = (hits: MemoryHit[]) => automatic ? boundCards(hits, 1_200, 5) : hits;
-    const queryVector = await this.embed(normalized);
+    const queryVector = await this.embed(normalized, automatic);
     const channels: Array<Array<{ item: MemoryHit; key: string }>> = [];
     if (!options.scope || options.scope === 'all' || options.scope === 'private') {
       const hits = this.privateCatalog.search(normalized, { ...options, limit }, queryVector);
@@ -494,10 +496,13 @@ class DefaultMemoryHub implements MemoryHub {
     validateRunMemoryContext(context, this.workspaceRoot, this.profileId);
   }
 
-  private async embed(query: string): Promise<number[] | undefined> {
+  private async embed(query: string, automatic = false): Promise<number[] | undefined> {
     if (this.options.retrievalMode === 'lexical' || !this.options.embeddingClient) return undefined;
     try {
-      const response = await this.options.embeddingClient.embeddings.create({ model: this.embeddingModel, input: query });
+      const response = await this.options.embeddingClient.embeddings.create(
+        { model: this.embeddingModel, input: query },
+        automatic ? { maxRetries: 0, timeout: AUTOMATIC_EMBEDDING_TIMEOUT_MS } : undefined,
+      );
       return response.data[0]?.embedding;
     } catch {
       return undefined;

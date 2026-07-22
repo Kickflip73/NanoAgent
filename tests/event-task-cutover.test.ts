@@ -68,6 +68,14 @@ function createLegacyV11(file: string): void {
       '2026-07-20T00:00:00.000Z', NULL, NULL, '{"answer":"done"}', NULL,
       '2026-07-20T00:00:00.000Z', '2026-07-20T00:01:00.000Z'
     );
+    INSERT INTO events VALUES (
+      'legacy-digest', 'legacy:digest', 'qq', 'command', 'trusted', 'null', 'null',
+      '{"text":"ordinary group chatter"}', '2026-07-20T00:00:00.000Z', '2026-07-20T00:00:00.000Z',
+      10, 'owner', 'qq-group', 'null', 'conversation', NULL,
+      NULL, NULL, 0, NULL, NULL, 'digested', 0, 5, 0, 0, NULL,
+      '2026-07-20T00:00:00.000Z', NULL, NULL, NULL, NULL,
+      '2026-07-20T00:00:00.000Z', '2026-07-20T00:00:30.000Z'
+    );
     INSERT INTO runs VALUES (
       'legacy-run', 'legacy-task', 'mimi-task-legacy', 'completed',
       '2026-07-20T00:00:10.000Z', '2026-07-20T00:01:00.000Z', '{"answer":"done"}', NULL
@@ -100,6 +108,89 @@ function markAsEmptyPartialV12(file: string): void {
       event_id TEXT PRIMARY KEY REFERENCES events_v2(id)
     ) STRICT;
     PRAGMA user_version = 12;
+  `);
+  database.close();
+}
+
+function addV13PhantomDigestedTask(file: string): void {
+  const database = new DatabaseSync(file);
+  database.exec(`
+    INSERT INTO events (
+      id, external_id, source, type, trust, actor_json, conversation_json, payload_json,
+      correlation_id, profile_id, reply_route_json, occurred_at, received_at, created_at
+    ) VALUES (
+      'phantom-digest', 'phantom-digest', 'qq', 'command.received', 'trusted', 'null', 'null',
+      '{"text":"ordinary group chatter"}', 'phantom-digest', 'owner', 'null',
+      '2026-07-20T00:00:00.000Z', '2026-07-20T00:00:00.000Z', '2026-07-20T00:00:00.000Z'
+    );
+    INSERT INTO tasks (
+      id, type, idempotency_key, trigger_event_id, authority_event_id, profile_id, session_key,
+      objective_json, executor, workspace_access, priority, status, not_before, attempt_count,
+      max_attempts, created_at, updated_at
+    ) VALUES (
+      'phantom-digest', 'conversation', 'migration:event:phantom-digest', 'phantom-digest',
+      'phantom-digest', 'owner', 'qq-group', '{"text":"ordinary group chatter"}',
+      'session_actor', 'write', 10, 'completed', '2026-07-20T00:00:00.000Z', 0, 5,
+      '2026-07-20T00:00:00.000Z', '2026-07-20T00:00:30.000Z'
+    );
+    INSERT INTO events (
+      id, external_id, source, type, trust, actor_json, conversation_json, payload_json,
+      subject_type, subject_id, correlation_id, causation_event_id, profile_id,
+      reply_route_json, occurred_at, received_at, created_at
+    ) VALUES (
+      'migration-task-phantom-digest', 'task:phantom-digest:migration-v12', 'mimi:migration',
+      'task.digested', 'system', 'null', 'null', '{"provenance":"migration-v12"}',
+      'task', 'phantom-digest', 'phantom-digest', 'phantom-digest', 'owner', 'null',
+      '2026-07-20T00:00:30.000Z', '2026-07-20T00:00:30.000Z', '2026-07-20T00:00:30.000Z'
+    );
+    INSERT INTO event_route_receipts VALUES (
+      'phantom-digest', 'migration-v12', 'task_created', '["phantom-digest"]',
+      'legacy_event_conversion', '2026-07-20T00:00:30.000Z'
+    );
+    INSERT INTO event_route_receipts VALUES (
+      'migration-task-phantom-digest', 'migration-v12', 'observe_only', '[]',
+      'task_lifecycle', '2026-07-20T00:00:30.000Z'
+    );
+    PRAGMA user_version = 13;
+  `);
+  database.close();
+}
+
+function addV13ProtectedDigestedTask(file: string): void {
+  const database = new DatabaseSync(file);
+  database.exec(`
+    INSERT INTO events
+    SELECT 'protected-digest', 'protected-digest', source, type, trust, actor_json,
+      conversation_json, payload_json, subject_type, subject_id, 'protected-digest',
+      causation_event_id, profile_id, reply_route_json, occurred_at, received_at, created_at
+    FROM events WHERE id = 'phantom-digest';
+    INSERT INTO tasks
+    SELECT 'protected-digest', type, 'migration:event:protected-digest', 'protected-digest',
+      'protected-digest', parent_task_id, profile_id, session_key, objective_json, executor,
+      workspace_access, priority, status, not_before, attempt_count, max_attempts, lease_owner,
+      lease_until, control_intent, control_reason, result_json, error, created_at, updated_at
+    FROM tasks WHERE id = 'phantom-digest';
+    INSERT INTO events
+    SELECT 'migration-task-protected-digest', 'task:protected-digest:migration-v12', source,
+      type, trust, actor_json, conversation_json, payload_json, subject_type, 'protected-digest',
+      'protected-digest', 'protected-digest', profile_id, reply_route_json, occurred_at,
+      received_at, created_at
+    FROM events WHERE id = 'migration-task-phantom-digest';
+    INSERT INTO event_route_receipts VALUES (
+      'protected-digest', 'migration-v12', 'task_created', '["protected-digest"]',
+      'legacy_event_conversion', '2026-07-20T00:00:30.000Z'
+    );
+    INSERT INTO event_route_receipts VALUES (
+      'migration-task-protected-digest', 'migration-v12', 'observe_only', '[]',
+      'task_lifecycle', '2026-07-20T00:00:30.000Z'
+    );
+    INSERT INTO outbox (
+      id, task_id, channel, payload_json, status, attempts, not_before, created_at, updated_at
+    ) VALUES (
+      'protected-delivery', 'protected-digest', 'system', '{"text":"already delivered"}',
+      'sent', 1, '2026-07-20T00:00:30.000Z', '2026-07-20T00:00:30.000Z',
+      '2026-07-20T00:00:30.000Z'
+    );
   `);
   database.close();
 }
@@ -225,6 +316,10 @@ test('v11 cutover atomically preserves Task, Run and Outbox ownership without pa
     assert.equal(store.getOutbox('legacy-outbox')?.taskId, 'legacy-task');
     assert.equal(store.getEventRouteReceipt('legacy-task')?.decision, 'task_created');
     assert.equal(store.getEventRouteReceipt('migration-task-legacy-task')?.decision, 'observe_only');
+    assert.equal(store.getTask('legacy-digest'), undefined);
+    assert.equal(store.getEventRouteReceipt('legacy-digest')?.decision, 'digest');
+    assert.equal(store.getEventRouteReceipt('legacy-digest')?.taskIds.length, 0);
+    assert.equal(store.getImmutableEvent('migration-task-legacy-digest'), undefined);
     const backups = await readdir(path.join(root, 'backups'), { recursive: true });
     assert.equal(backups.some((entry) => entry.endsWith('mimi.db')), true);
   } finally {
@@ -232,13 +327,51 @@ test('v11 cutover atomically preserves Task, Run and Outbox ownership without pa
   }
   const database = new DatabaseSync(file, { readOnly: true });
   try {
-    assert.equal((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 13);
+    assert.equal((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 14);
     assert.equal(database.prepare("SELECT name FROM sqlite_master WHERE name = 'events_v2'").get(), undefined);
     assert.equal(database.prepare("SELECT name FROM sqlite_master WHERE name = 'task_attempts'").get(), undefined);
     assert.equal((database.prepare('PRAGMA foreign_key_check').all() as unknown[]).length, 0);
   } finally {
     database.close();
   }
+});
+
+test('v14 removes only artifact-free digested Tasks and repairs their route receipts', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-event-task-v14-repair-'));
+  const file = path.join(root, 'mimi.db');
+  new MimiStore(file).close();
+  addV13PhantomDigestedTask(file);
+  addV13ProtectedDigestedTask(file);
+
+  const store = new MimiStore(file);
+  try {
+    assert.equal(store.getTask('phantom-digest'), undefined);
+    assert.deepEqual(store.getEventRouteReceipt('phantom-digest'), {
+      eventId: 'phantom-digest',
+      routerVersion: 'migration-v12',
+      decision: 'digest',
+      taskIds: [],
+      reasonCode: 'legacy_digest_conversion',
+      routedAt: '2026-07-20T00:00:30.000Z',
+    });
+    assert.equal(store.getImmutableEvent('phantom-digest')?.type, 'command.received');
+    assert.equal(store.getImmutableEvent('migration-task-phantom-digest')?.type, 'task.digested');
+    assert.equal(store.getTask('protected-digest')?.status, 'completed');
+    assert.equal(store.getEventRouteReceipt('protected-digest')?.decision, 'task_created');
+    assert.equal(store.getOutbox('protected-delivery')?.status, 'sent');
+  } finally {
+    store.close();
+  }
+
+  const database = new DatabaseSync(file, { readOnly: true });
+  try {
+    assert.equal((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 14);
+    assert.equal((database.prepare('PRAGMA foreign_key_check').all() as unknown[]).length, 0);
+  } finally {
+    database.close();
+  }
+  const backups = await readdir(path.join(root, 'backups'), { recursive: true });
+  assert.equal(backups.some((entry) => entry.endsWith('mimi.db')), true);
 });
 
 test('repairs an empty half-migrated v12 database before accepting new Events', async () => {

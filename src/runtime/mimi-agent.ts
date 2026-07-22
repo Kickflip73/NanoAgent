@@ -472,6 +472,9 @@ export class MimiAgent {
     const modelProfile = this.modelProfile;
     const context = this.context;
     const runPolicy = options?.policy;
+    const focusedOwnerRun = options?.cause?.trust === 'owner'
+      && options.cause.source === 'local-cli'
+      && runPolicy?.allowedTools !== undefined;
     const allowedCapabilities = new Set(runPolicy?.allowedCapabilities ?? []);
     const canReadLocal = !runPolicy || allowedCapabilities.has('read');
     const canReadMemory = !runPolicy || allowedCapabilities.has('memory-read');
@@ -698,6 +701,9 @@ export class MimiAgent {
       const value = tool as unknown as Record<string, unknown>;
       return { name: value.name, description: value.description, parameters: value.parameters };
     });
+    const skillsDisclosed = allTools.some((tool) => (
+      tool.name === 'list_skills' || tool.name === 'use_skill' || tool.name === 'read_skill_resource'
+    ));
     const budget = context.requestBudget(toolSchemas);
     const instructionBudget = Math.floor(budget.inputBudget * 0.35);
     const instructions = context.buildInstructions({
@@ -725,14 +731,17 @@ export class MimiAgent {
       identity: canReadLocal ? soul.instructions : '',
       projectGuidance: canReadLocal ? projectGuidance.instructions : '',
       historySummary: '',
-      skillCatalog: canReadLocal ? this.skills.catalog() : '',
+      skillCatalog: canReadLocal && skillsDisclosed ? this.skills.catalog() : '',
       memories,
       plan: activePlan,
       goal,
       teamSummary: activeTeamSummary,
       recoverySummary: resumesCheckpoint ? recoverySummary(recovery) : '',
     }, instructionBudget);
-    const historyBudget = Math.max(0, budget.inputBudget - estimateTokens(instructions));
+    const historyBudget = Math.min(
+      Math.max(0, budget.inputBudget - estimateTokens(instructions)),
+      focusedOwnerRun ? 8_000 : Number.POSITIVE_INFINITY,
+    );
     const archiveContext = archive?.summary ? [{
       role: 'user',
       content: [
@@ -756,7 +765,11 @@ export class MimiAgent {
     const agent = new Agent({
       name: 'MimiAgent',
       model,
-      modelSettings: { maxTokens: modelProfile.outputReserve },
+      modelSettings: {
+        maxTokens: focusedOwnerRun
+          ? Math.min(modelProfile.outputReserve, 4_096)
+          : modelProfile.outputReserve,
+      },
       instructions,
       tools: allTools,
       // Plan mode keeps only the explicit read-only MCP resource wrappers above.
@@ -1279,6 +1292,42 @@ export class MimiAgent {
     return this.hooks.on(hook);
   }
 
+  async completeHostRun(input: string, answer: string, options?: MimiRunOptions): Promise<RuntimeEffect[]> {
+    if (this.activeRun) throw new Error('当前 Session 仍有任务运行中，请等待完成或先中止');
+    this.lastCommittedAnswer = undefined;
+    const run: ActiveRun = {
+      runId: randomUUID(),
+      ownerId: randomUUID(),
+      releaseOwner: () => undefined,
+      sessionId: this.sessionId,
+      session: options?.policy?.allowSessionContext === false
+        ? this.createIsolatedSession(this.sessionId)
+        : this.session,
+      input,
+      options,
+      pendingActions: [],
+      completionRequired: false,
+      requireDurableBlocker: false,
+    };
+    run.releaseOwner = registerSessionRunOwner(run.ownerId);
+    this.activeRun = run;
+    try {
+      await run.session.cleanupGeneratedSummaries();
+      await run.session.repairToolPairs();
+      run.recoveryRunId = (await run.session.getCheckpoint())?.runId;
+      await run.session.beginRun(input, run.runId, run.ownerId, options?.retainExecutionLedger === true);
+      await this.hooks.emit({ type: 'run_start', sessionId: run.sessionId, input });
+      await run.session.addItems([
+        { role: 'user', content: input },
+        { role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: answer }] },
+      ]);
+      return await this.completeRun(answer);
+    } catch (error) {
+      await this.failRun(error, false);
+      throw error;
+    }
+  }
+
   async completeRun(answer: string, usage?: ContextUsageSnapshot): Promise<RuntimeEffect[]> {
     const run = this.activeRun;
     if (!run) throw new Error('没有正在运行的任务可完成');
@@ -1332,7 +1381,10 @@ export class MimiAgent {
         await this.plans.completeGoalFromGate(gate.reason, run.goalCreatedAt);
       }
       const cause = run.options?.cause;
-      if (cause?.source !== 'mimi:memory-maintenance' && cause?.source !== 'attention:briefing') {
+      const focusedOwnerRun = cause?.trust === 'owner' && cause.source === 'local-cli'
+        && run.options?.policy?.allowedTools !== undefined;
+      if (!focusedOwnerRun
+        && cause?.source !== 'mimi:memory-maintenance' && cause?.source !== 'attention:briefing') {
         await this.memory.recordEpisode({
           sessionId: run.sessionId,
           runId: run.runId,

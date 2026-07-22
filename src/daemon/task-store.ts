@@ -204,7 +204,7 @@ export class TaskStore {
   claim(id: string, owner: string, leaseUntil: string, timestamp: string): boolean {
     const updated = this.database.prepare(`
       UPDATE tasks SET status = 'running', attempt_count = attempt_count + 1,
-        lease_owner = ?, lease_until = ?, updated_at = ?
+        lease_owner = ?, lease_until = ?, error = NULL, updated_at = ?
       WHERE id = ? AND status = 'queued' AND not_before <= ?
     `).run(owner, leaseUntil, timestamp, id, timestamp);
     return Number(updated.changes) === 1;

@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 
 /**
- * MimiAgent ↔ QQ personal account connector (NapCatQQ / OneBot 11).
+ * MimiAgent ↔ QQ personal account connector (OneBot 11).
  *
  * This connector is background-only: inbound events arrive over an authenticated
- * reverse WebSocket and outbound/read actions use NapCat's HTTP API. It never
- * activates QQ.app or uses Accessibility/UI automation.
+ * reverse WebSocket and outbound/read actions use a loopback OneBot HTTP API.
+ * It can connect either to a plugin hosted by the user's visible QQ process
+ * (for example LLOneBot/LLBot) or to a separately managed NapCat process. It
+ * never activates QQ.app or uses Accessibility/UI automation itself.
  */
 
 import { createHash, timingSafeEqual } from 'node:crypto';
@@ -19,28 +21,37 @@ const DEFAULT_HISTORY_COUNT = 20;
 const MAX_HISTORY_COUNT = 100;
 const MAX_DIRECTORY_COUNT = 500;
 const HTTP_TIMEOUT_MS = 20_000;
-const STATUS_POLL_MS = integerEnv('NC_STATUS_POLL_MS', 30_000, 10_000, 600_000);
+const STATUS_POLL_MS = integerEnv(['QQ_ONEBOT_STATUS_POLL_MS', 'NC_STATUS_POLL_MS'], 30_000, 10_000, 600_000);
 
-const HTTP_URL = parseHttpUrl(process.env.NC_HTTP_URL);
-const WS_PORT = integerEnv('NC_WS_PORT', 3_080, 0, 65_535);
-const ACCESS_TOKEN = process.env.NC_ACCESS_TOKEN?.trim() ?? '';
-const WS_ACCESS_TOKEN = process.env.NC_WS_ACCESS_TOKEN?.trim() || ACCESS_TOKEN;
+const HTTP_URL = parseHttpUrl(firstEnv('QQ_ONEBOT_HTTP_URL', 'NC_HTTP_URL'));
+const WS_PORT = integerEnv(['QQ_ONEBOT_WS_PORT', 'NC_WS_PORT'], 3_080, 0, 65_535);
+const ACCESS_TOKEN = firstEnv('QQ_ONEBOT_ACCESS_TOKEN', 'NC_ACCESS_TOKEN')?.trim() ?? '';
+const WS_ACCESS_TOKEN = firstEnv('QQ_ONEBOT_WS_ACCESS_TOKEN', 'NC_WS_ACCESS_TOKEN')?.trim() || ACCESS_TOKEN;
 
 if (!HTTP_URL) {
-  process.stderr.write('[qq] missing or invalid NC_HTTP_URL\n');
+  process.stderr.write('[qq] missing or invalid QQ_ONEBOT_HTTP_URL (or legacy NC_HTTP_URL)\n');
   process.exit(1);
 }
 if (!WS_ACCESS_TOKEN) {
-  process.stderr.write('[qq] missing NC_WS_ACCESS_TOKEN (or fallback NC_ACCESS_TOKEN)\n');
+  process.stderr.write('[qq] missing QQ_ONEBOT_WS_ACCESS_TOKEN (or HTTP/legacy token fallback)\n');
   process.exit(1);
 }
 
-function integerEnv(name, fallback, min, max) {
-  const raw = process.env[name];
+function firstEnv(...names) {
+  for (const name of names) {
+    const value = process.env[name];
+    if (value !== undefined && value !== '') return value;
+  }
+  return undefined;
+}
+
+function integerEnv(names, fallback, min, max) {
+  const list = Array.isArray(names) ? names : [names];
+  const raw = firstEnv(...list);
   if (raw === undefined || raw === '') return fallback;
   const value = Number(raw);
   if (!Number.isInteger(value) || value < min || value > max) {
-    process.stderr.write(`[qq] ${name} must be an integer between ${min} and ${max}\n`);
+    process.stderr.write(`[qq] ${list[0]} must be an integer between ${min} and ${max}\n`);
     process.exit(1);
   }
   return value;
@@ -52,7 +63,7 @@ function parseHttpUrl(raw) {
     const url = new URL(raw.trim());
     if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) return undefined;
     if (url.protocol === 'http:' && !['127.0.0.1', 'localhost', '::1'].includes(url.hostname)) {
-      process.stderr.write('[qq] plain HTTP is only allowed for a loopback NapCat endpoint\n');
+      process.stderr.write('[qq] plain HTTP is only allowed for a loopback OneBot endpoint\n');
       return undefined;
     }
     return url.href.replace(/\/$/, '');
@@ -98,7 +109,7 @@ function deliveryAck(id, ok, error, uncertain = false) {
   emit({ type: 'delivery_ack', id, ok, ...(error ? { error } : {}), ...(uncertain ? { uncertain: true } : {}) });
 }
 
-async function napcatApi(action, params) {
+async function onebotApi(action, params) {
   const headers = { 'content-type': 'application/json' };
   if (ACCESS_TOKEN) headers.authorization = `Bearer ${ACCESS_TOKEN}`;
   const response = await fetch(`${HTTP_URL}/${action}`, {
@@ -109,18 +120,18 @@ async function napcatApi(action, params) {
   });
   const declaredLength = Number(response.headers.get('content-length'));
   if (Number.isFinite(declaredLength) && declaredLength > MAX_HTTP_RESPONSE_BYTES) {
-    throw new Error(`NapCat response exceeds ${MAX_HTTP_RESPONSE_BYTES} bytes`);
+    throw new Error(`OneBot response exceeds ${MAX_HTTP_RESPONSE_BYTES} bytes`);
   }
   const text = await response.text();
   if (Buffer.byteLength(text) > MAX_HTTP_RESPONSE_BYTES) {
-    throw new Error(`NapCat response exceeds ${MAX_HTTP_RESPONSE_BYTES} bytes`);
+    throw new Error(`OneBot response exceeds ${MAX_HTTP_RESPONSE_BYTES} bytes`);
   }
-  if (!response.ok) throw new Error(`NapCat HTTP ${response.status}`);
+  if (!response.ok) throw new Error(`OneBot HTTP ${response.status}`);
   let body;
   try {
     body = JSON.parse(text);
   } catch {
-    throw new Error('NapCat returned invalid JSON');
+    throw new Error('OneBot returned invalid JSON');
   }
   if (body?.status !== 'ok' && body?.retcode !== 0) {
     throw new Error(String(body?.wording || body?.msg || body?.message || `retcode=${body?.retcode}`));
@@ -265,13 +276,13 @@ async function deliver(message) {
   const text = textPayload(message.payload);
   let data;
   try {
-    data = await napcatApi(type === 'private' ? 'send_private_msg' : 'send_group_msg', {
+    data = await onebotApi(type === 'private' ? 'send_private_msg' : 'send_group_msg', {
       [type === 'private' ? 'user_id' : 'group_id']: id,
       message: text,
     });
   } catch (error) {
     throw new UncertainSendError(
-      `NapCat 发送请求已提交但未获得可靠确认：${error instanceof Error ? error.message : String(error)}`,
+      `OneBot 发送请求已提交但未获得可靠确认：${error instanceof Error ? error.message : String(error)}`,
     );
   }
   return { sent: true, messageId: boundedString(String(data?.message_id ?? ''), 128) || undefined };
@@ -282,7 +293,7 @@ function connectedStatus(status) {
 }
 
 async function healthCheck() {
-  const status = await napcatApi('get_status', {});
+  const status = await onebotApi('get_status', {});
   const connected = connectedStatus(status);
   emitStatus(activeSocket?.readyState === 1 ? 'ready' : 'unavailable', connected ? 'ready' : 'unavailable');
   return {
@@ -302,19 +313,19 @@ async function executeAction(message) {
       if (message.target !== 'all') throw new Error('recent_conversations target must be all');
       const payload = objectPayload(message.payload);
       const count = boundedInteger(payload.count, DEFAULT_HISTORY_COUNT, 1, MAX_HISTORY_COUNT, 'count');
-      return sanitizeRecentContacts(await napcatApi('get_recent_contact', { count }), count);
+      return sanitizeRecentContacts(await onebotApi('get_recent_contact', { count }), count);
     }
     case 'list_friends': {
       if (message.target !== 'all') throw new Error('list_friends target must be all');
       const payload = objectPayload(message.payload);
       const limit = boundedInteger(payload.limit, 100, 1, MAX_DIRECTORY_COUNT, 'limit');
-      return sanitizeFriends(await napcatApi('get_friend_list', { no_cache: false }), limit);
+      return sanitizeFriends(await onebotApi('get_friend_list', { no_cache: false }), limit);
     }
     case 'list_groups': {
       if (message.target !== 'all') throw new Error('list_groups target must be all');
       const payload = objectPayload(message.payload);
       const limit = boundedInteger(payload.limit, 100, 1, MAX_DIRECTORY_COUNT, 'limit');
-      return sanitizeGroups(await napcatApi('get_group_list', { no_cache: false }), limit);
+      return sanitizeGroups(await onebotApi('get_group_list', { no_cache: false }), limit);
     }
     case 'friend_history': {
       const { id } = parseConversationTarget(message.target, ['private']);
@@ -324,7 +335,7 @@ async function executeAction(message) {
       if (payload.reverseOrder !== undefined && typeof payload.reverseOrder !== 'boolean') {
         throw new Error('reverseOrder must be a boolean');
       }
-      return sanitizeHistory(await napcatApi('get_friend_msg_history', {
+      return sanitizeHistory(await onebotApi('get_friend_msg_history', {
         user_id: id, message_seq: messageSeq, count, reverseOrder: payload.reverseOrder ?? false,
       }));
     }
@@ -338,7 +349,7 @@ async function executeAction(message) {
         if (typeof payload.reverseOrder !== 'boolean') throw new Error('reverseOrder must be a boolean');
         params.reverseOrder = payload.reverseOrder;
       }
-      return sanitizeHistory(await napcatApi('get_group_msg_history', params));
+      return sanitizeHistory(await onebotApi('get_group_msg_history', params));
     }
     default:
       throw new Error(`unsupported action: ${message.action}`);
@@ -429,7 +440,7 @@ server.on('upgrade', (request, socket, head) => {
 });
 
 wss.on('connection', (ws) => {
-  process.stderr.write('[qq] NapCat WebSocket connected\n');
+  process.stderr.write('[qq] OneBot reverse WebSocket connected\n');
   emitStatus('ready');
   ws.on('message', (raw) => {
     try {
@@ -441,7 +452,7 @@ wss.on('connection', (ws) => {
     }
   });
   ws.on('close', () => {
-    process.stderr.write('[qq] NapCat WebSocket disconnected\n');
+    process.stderr.write('[qq] OneBot reverse WebSocket disconnected\n');
     if (activeSocket === ws) {
       activeSocket = undefined;
       emitStatus('unavailable');

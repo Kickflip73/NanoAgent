@@ -176,7 +176,9 @@ owner 也可先调用 `get_mimi_settings` 读取完整快照，再用 `update_mi
 
 `routines` 让 MimiAgent 在摘要池为空、没有新 IM 或 CLI 输入时仍能主动工作。新建配置以及缺少该字段的旧配置默认获得两条例程：每天 08:00 的 `morning-plan` 和每天 21:00 的 `evening-close`。若不需要，显式设置 `"routines": []`；也可以对单条设置 `enabled:false`。
 
-默认晨间与晚间例程会先使用 `inspect_mimi_activity` 检查 MimiAgent 自身积压、dead letter 和近期状态变化，再检查日历、消息、天气和生活事项。该只读视图与 `mimi daemon activity [数量]` 复用同一个 Store 查询，只包含有界运行元数据，不包含其他 Event 正文、Run 答案、Outbox payload 或 target。
+默认晨间与晚间例程会先使用 `inspect_mimi_activity` 检查 MimiAgent 自身积压、dead letter 和近期状态变化，再检查日历、消息、天气和生活事项。该只读视图与 `mimi daemon activity [数量]` 复用同一个 Store 查询，只包含有界运行元数据，不包含其他 Event 正文、Run 答案、Outbox payload 或 target。counts 是持久库当前保留窗口内的记录，不是本次进程启动以来的计数器。统计中的 Task 是路由后的执行单元，`conversation` 是一次对话处理而非后台任务，只有 `background` 才是委派后台任务；回答数量时应使用 `tasksByType` 和近期 trigger Event 来源，不得把 `tasks.completed` 总数直接表述为后台任务数。
+
+Schema v14 修复旧 Event/Task cutover 的历史语义：旧 `digested` / `ignored` Event 分别保留为 `digest` / `rejected` 路由，不创建可执行 Task。升级已有 v13 库前会先备份 SQLite/WAL/SHM；修复只删除明确由 v12 迁移生成、带 `task.digested` 证据且没有 Run、Outbox 或子 Task 的幽灵 Task，任何存在执行或投递证据的记录都保留。
 
 非 command 自主 Event 还会获得 `finish_mimi_silently(reason)`。只有完成必要检查并确认没有新变化、风险、实际动作或需要 owner 关注的事项时才应调用；成功 Event 和 Host Run 仍持久化，Event result 保存答案、usage 与有界静默原因，但不创建 Outbox。`command` Event 不注入此工具，Attention 的直接 `notify` 决策也不经过它。该状态只属于当前 attempt，失败、抢占或重试不会沿用，不需要新的表或副作用 ledger。
 

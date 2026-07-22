@@ -41,6 +41,7 @@ try {
     access(path.join(packageRoot, 'examples', 'connectors', 'qq-napcat-connector.mjs')),
     access(path.join(packageRoot, 'scripts', 'install-napcat-macos.mjs'), constants.X_OK),
     access(path.join(packageRoot, 'scripts', 'setup-qq-connector.sh'), constants.X_OK),
+    access(path.join(packageRoot, 'scripts', 'setup-qq-desktop-connector.sh'), constants.X_OK),
     access(path.join(packageRoot, 'examples', 'connectors', 'http-action-connector.mjs')),
     access(path.join(packageRoot, 'examples', 'connectors', 'macos-system-connector.mjs')),
     access(path.join(packageRoot, 'examples', 'connectors', 'macos-life-connector.mjs')),

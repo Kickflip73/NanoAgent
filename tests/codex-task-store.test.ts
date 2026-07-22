@@ -105,3 +105,65 @@ test('Codex task completes directly without handing execution back to Mimi', asy
     store.close();
   }
 });
+
+test('a new task attempt clears the previous attempt error', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-task-retry-error-'));
+  const store = new MimiStore(path.join(root, 'mimi.db'));
+  try {
+    const taskId = randomUUID();
+    const now = new Date();
+    const event = store.appendEvent({
+      id: randomUUID(),
+      externalId: `retry-${taskId}`,
+      source: 'test',
+      type: 'command.received',
+      trust: 'owner',
+      payload: { prompt: 'retry work' },
+      profileId: 'owner',
+      occurredAt: now.toISOString(),
+      receivedAt: now.toISOString(),
+    }).event;
+    store.routeEvent(event.id, {
+      routerVersion: 'test',
+      decision: 'task_created',
+      reasonCode: 'test',
+      tasks: [{
+        id: taskId,
+        type: 'background',
+        idempotencyKey: taskId,
+        triggerEventId: event.id,
+        authorityEventId: event.id,
+        profileId: 'owner',
+        sessionKey: `mimi-task-${taskId}`,
+        objective: { objective: 'retry work' },
+        executor: 'isolated_worker',
+        workspaceAccess: 'write',
+        priority: 70,
+        maxAttempts: 3,
+      }],
+    });
+    const firstStarted = new Date(now.getTime() + 1_000);
+    const first = store.claimTaskById(taskId, 'worker-1', 60_000, firstStarted)!;
+    const attempt = store.beginTaskAttempt(taskId, 'worker-1', first.sessionKey!, 'worker-1', firstStarted);
+    store.failTask(
+      taskId,
+      'worker-1',
+      new Error('previous SIGKILL'),
+      attempt.id,
+      new Date(now.getTime() + 2_000),
+      true,
+    );
+    assert.match(store.getTask(taskId)?.error ?? '', /SIGKILL/);
+
+    const claimed = store.claimTaskById(
+      taskId,
+      'worker-2',
+      60_000,
+      new Date(now.getTime() + 4_000),
+    );
+    assert.equal(claimed?.status, 'running');
+    assert.equal(claimed?.error, undefined);
+  } finally {
+    store.close();
+  }
+});

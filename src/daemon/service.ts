@@ -42,7 +42,7 @@ import { MimiStore } from './store.js';
 import { MimiWebhookServer } from './webhook.js';
 import { AttentionEngine } from './attention.js';
 import { TaskProcessSupervisor } from './task-supervisor.js';
-import { backgroundTaskSummary } from './task-tools.js';
+import { backgroundTaskSummary, inspectBackgroundTaskSummary } from './task-tools.js';
 import { createMimiCommandHostTools } from './host-tools.js';
 import {
   MimiLiveEvents,
@@ -1061,7 +1061,9 @@ export async function runMimiDaemon(config: AppConfig): Promise<void> {
     };
     const taskDetailsWithRuntime = async (task: ReturnType<MimiStore['getTask']>) => {
       if (!task) throw new Error('后台任务不存在');
-      const summary = taskSummaryWithRuntime(task);
+      const summary = task.executor === 'codex'
+        ? { ...await inspectBackgroundTaskSummary(task), worker: taskSummaryWithRuntime(task).worker }
+        : taskSummaryWithRuntime(task);
       const recentEvents = liveEvents.recent(task.id, 8);
       const snapshot = task.executor !== 'codex' && task.sessionKey
         ? await host!.snapshot(task.sessionKey).catch(() => undefined)

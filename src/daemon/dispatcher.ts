@@ -5,6 +5,7 @@ import { MimiHost } from '../runtime/mimi-host.js';
 import type { RuntimeEvent } from '../runtime/hooks.js';
 import { isTerminalRunInterruption, TerminalRunInterruptedError } from '../runtime/run-outcome.js';
 import { CompletionGateError } from '../core/completion.js';
+import { capabilityDisclosureForInput } from '../core/user-intent.js';
 import {
   isPermanentDeliveryError,
   isUncertainDeliveryError,
@@ -15,6 +16,7 @@ import type { ConnectorManager } from './connectors.js';
 import type { MimiDeliveryControl } from './delivery-tools.js';
 import { AttentionEngine } from './attention.js';
 import { createMimiHostTools } from './host-tools.js';
+import { buildOwnerStatusAnswer } from './status-context.js';
 import type { MemoryMaintenanceRuntime } from './memory-maintenance-tools.js';
 import { MimiStore } from './store.js';
 import type { BackgroundTaskBlockRequest, BackgroundTaskPauseResult } from './task-tools.js';
@@ -505,11 +507,21 @@ export class MimiDispatcher {
       preemptTimer = setInterval(checkPreemption, this.options.preemptPollMs ?? 250);
       preemptTimer.unref();
       refreshRunIdleWatchdog();
+      const focusedStatus = event.trust === 'owner'
+        && task.type === 'conversation'
+        && capabilityDisclosureForInput(decision.input!) === 'status';
+      const focusedStatusAnswer = focusedStatus
+        ? await this.host.mutate(decision.sessionId!, async (agent) => {
+            const [plan, goal] = await Promise.all([agent.currentPlan(), agent.currentGoal()]);
+            return buildOwnerStatusAnswer(this.store, decision.sessionId!, task.id, { plan, goal });
+          }, runSignal)
+        : undefined;
       const hostedRun = this.host.execute({
         executionId: task.id,
         sessionId: decision.sessionId!,
         input: decision.input!,
         signal: runSignal,
+        ...(focusedStatusAnswer !== undefined ? { trustedHostAnswer: focusedStatusAnswer } : {}),
         options: {
           ...decision.options,
           executionKey,

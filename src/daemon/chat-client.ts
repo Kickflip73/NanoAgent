@@ -39,6 +39,7 @@ import type {
 } from './types.js';
 import type { SessionSummary } from '../core/session.js';
 import type { MemoryRef, MemoryScope } from '../core/memory.js';
+import { capabilityDisclosureForInput } from '../core/user-intent.js';
 
 const CHAT_COMMANDS: CompletionItem[] = [...COMMANDS];
 const CHAT_RECONNECT_INITIAL_DELAY_MS = 50;
@@ -53,11 +54,16 @@ const TRANSIENT_IPC_DISCONNECT_CODES = new Set([
   'ETIMEDOUT',
 ]);
 
+function runLabel(input: string): string {
+  return capabilityDisclosureForInput(input) === 'status' ? '读取本机状态' : '模型思考中';
+}
+
 type DaemonReconciler = (config: AppConfig, status: DaemonStatus) => Promise<DaemonStatus>;
 
 export interface MimiChatClientOptions {
   submitTimeoutMs?: number;
   submitRetryDeadlineMs?: number;
+  startDaemon?: (config: AppConfig) => Promise<DaemonStatus>;
 }
 
 async function defaultReconcileDaemon(config: AppConfig, status: DaemonStatus): Promise<DaemonStatus> {
@@ -159,7 +165,6 @@ function isTransientIpcDisconnect(error: unknown): error is NodeJS.ErrnoExceptio
 
 export class MimiChatClient {
   private readonly socket: string;
-  private readonly workspaceExplicitlyConfigured: boolean;
   private expectedWorkspaceRoot?: string;
 
   constructor(
@@ -168,12 +173,6 @@ export class MimiChatClient {
     private readonly options: MimiChatClientOptions = {},
   ) {
     this.socket = mimiPaths(config).socket;
-    this.workspaceExplicitlyConfigured = Boolean(
-      preferredEnvironmentValue('MIMI_WORKSPACE', 'AGENT_WORKSPACE'),
-    );
-    if (this.workspaceExplicitlyConfigured) {
-      this.expectedWorkspaceRoot = config.workspaceRoot;
-    }
   }
 
   async connect(): Promise<DaemonStatus> {
@@ -183,18 +182,18 @@ export class MimiChatClient {
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       if (code !== 'ENOENT' && code !== 'ECONNREFUSED') throw error;
-      status = await defaultStartDaemon(this.config);
+      status = await (this.options.startDaemon ?? defaultStartDaemon)(this.config);
     }
     return this.ensureCurrentDaemon(status);
   }
 
   async status(): Promise<DaemonStatus> {
-    const status = await mimiRpc<DaemonStatus>(this.socket, 'status');
+    const status = await this.rpc<DaemonStatus>('status');
     return this.ensureCurrentDaemon(status);
   }
 
   async snapshot(limit = 30, sessionKey?: string): Promise<MimiChatSnapshot> {
-    const snapshot = await mimiRpc<MimiChatSnapshot>(this.socket, 'chat.snapshot', {
+    const snapshot = await this.rpc<MimiChatSnapshot>('chat.snapshot', {
       profileId: 'owner', limit, sessionKey,
     });
     this.assertWorkspace(snapshot.workspaceRoot);
@@ -202,11 +201,13 @@ export class MimiChatClient {
   }
 
   async bootstrap(draftSessionId = `mimi-chat-${randomUUID()}`): Promise<MimiChatSnapshot> {
-    return await mimiRpc<MimiChatSnapshot>(this.socket, 'chat.bootstrap', { draftSessionId });
+    const snapshot = await this.rpc<MimiChatSnapshot>('chat.bootstrap', { draftSessionId });
+    this.assertWorkspace(snapshot.workspaceRoot);
+    return snapshot;
   }
 
   async listSessions(): Promise<SessionSummary[]> {
-    return await mimiRpc<SessionSummary[]>(this.socket, 'chat.sessions');
+    return await this.rpc<SessionSummary[]>('chat.sessions');
   }
 
   async history(sessionKey?: string): Promise<AgentInputItem[]> {
@@ -214,7 +215,7 @@ export class MimiChatClient {
     let offset = 0;
     let revision: string | undefined;
     for (let page = 0; page < 10_000; page += 1) {
-      const result = await mimiRpc<MimiHistoryChunk>(this.socket, 'chat.history', {
+      const result = await this.rpc<MimiHistoryChunk>('chat.history', {
         profileId: 'owner', sessionKey, offset, revision,
       });
       if (revision && result.revision !== revision) throw new Error('Session 历史在读取期间发生变化，请重试 /history');
@@ -240,7 +241,7 @@ export class MimiChatClient {
     timeoutMs = 30_000,
     signal?: AbortSignal,
   ): Promise<T> {
-    return await mimiRpc<T>(this.socket, 'chat.invoke', {
+    return await this.rpc<T>('chat.invoke', {
       operation, value, profileId: 'owner', sessionKey,
     }, timeoutMs, signal);
   }
@@ -357,44 +358,56 @@ export class MimiChatClient {
   }
 
   async cancel(eventId: string, reason?: string): Promise<EventCancelResult> {
-    return await mimiRpc<EventCancelResult>(this.socket, 'task.cancel', { id: eventId, reason });
+    return await this.rpc<EventCancelResult>('task.cancel', { id: eventId, reason });
   }
 
   async listBackgroundTasks(limit = 20): Promise<BackgroundTaskSummary[]> {
-    return await mimiRpc<BackgroundTaskSummary[]>(this.socket, 'tasks.list', { limit });
+    return await this.rpc<BackgroundTaskSummary[]>('tasks.list', { limit });
   }
 
   async inspectBackgroundTask(taskId: string): Promise<BackgroundTaskSummary> {
-    return await mimiRpc<BackgroundTaskSummary>(this.socket, 'tasks.get', { id: taskId });
+    return await this.rpc<BackgroundTaskSummary>('tasks.get', { id: taskId });
   }
 
   async cancelBackgroundTask(taskId: string, reason?: string): Promise<BackgroundTaskCancelResult> {
-    return await mimiRpc<BackgroundTaskCancelResult>(this.socket, 'tasks.cancel', { id: taskId, reason });
+    return await this.rpc<BackgroundTaskCancelResult>('tasks.cancel', { id: taskId, reason });
   }
 
   async pauseBackgroundTask(taskId: string, reason?: string): Promise<BackgroundTaskPauseResult> {
-    return await mimiRpc<BackgroundTaskPauseResult>(this.socket, 'tasks.pause', { id: taskId, reason });
+    return await this.rpc<BackgroundTaskPauseResult>('tasks.pause', { id: taskId, reason });
   }
 
   async resumeBackgroundTask(taskId: string, context?: string): Promise<BackgroundTaskResumeResult> {
-    return await mimiRpc<BackgroundTaskResumeResult>(this.socket, 'tasks.resume', { id: taskId, context });
+    return await this.rpc<BackgroundTaskResumeResult>('tasks.resume', { id: taskId, context });
   }
 
   private assertWorkspace(workspaceRoot: unknown): void {
-    if (this.expectedWorkspaceRoot) {
-      assertDaemonWorkspace(workspaceRoot, this.expectedWorkspaceRoot);
-      return;
-    }
     if (typeof workspaceRoot !== 'string' || !workspaceRoot.trim()) {
       assertDaemonWorkspace(workspaceRoot, this.config.workspaceRoot);
     }
     this.expectedWorkspaceRoot = workspaceRoot;
   }
 
+  private async rpc<T>(
+    method: string,
+    params?: unknown,
+    timeoutMs?: number,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    try {
+      return await mimiRpc<T>(this.socket, method, params, timeoutMs, signal);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== 'ENOENT' && code !== 'ECONNREFUSED') throw error;
+      await this.connect();
+      return await mimiRpc<T>(this.socket, method, params, timeoutMs, signal);
+    }
+  }
+
   private async ensureCurrentDaemon(status: DaemonStatus): Promise<DaemonStatus> {
     this.assertWorkspace(status.workspaceRoot);
     const expectedPermissionMode = this.config.permissionMode ?? 'trusted';
-    const daemonConfig = !this.workspaceExplicitlyConfigured && this.expectedWorkspaceRoot
+    const daemonConfig = this.expectedWorkspaceRoot
       ? adoptWorkspaceConfig(this.config, this.expectedWorkspaceRoot)
       : this.config;
     const upgraded = await this.reconcileDaemon(daemonConfig, status);
@@ -664,7 +677,7 @@ export async function runMimiCli(
       ? await client.snapshot(30, configuredSession)
       : await client.bootstrap();
     const renderer = new TerminalRenderer(process.stderr, process.stdout, normalizeOutputLevel(current.outputLevel));
-    renderer.start('模型思考中', oneShotInput);
+    renderer.start(runLabel(oneShotInput), oneShotInput);
     let streamedAnswer = '';
     try {
       const accepted = await client.submit(oneShotInput, current.sessionId);
@@ -742,7 +755,7 @@ export async function runMimiCli(
       terminal.createWriter(process.stdout),
       normalizeOutputLevel(snapshot.outputLevel),
     );
-    renderer.start('模型思考中', input);
+    renderer.start(runLabel(input), input);
     let streamedAnswer = '';
     try {
       const accepted = await client.submit(input, target.currentSessionId);

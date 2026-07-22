@@ -178,6 +178,9 @@ export class MimiHost {
           input: request.input,
           signal,
           options: request.options,
+          ...(request.trustedHostAnswer !== undefined
+            ? { trustedHostAnswer: request.trustedHostAnswer }
+            : {}),
         }, observer);
         signal.throwIfAborted();
         return result;

@@ -63,6 +63,7 @@
     "examples/openclaw",
     "scripts/install-napcat-macos.mjs",
     "scripts/setup-qq-connector.sh",
+    "scripts/setup-qq-desktop-connector.sh",
     "MIMI.md",
     ".env.example",
     "mcp.example.json",

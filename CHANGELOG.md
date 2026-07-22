@@ -3,6 +3,8 @@
 ## Unreleased
 
 - add opt-in macOS Computer Use through Cua Driver with bounded observations and actions, permission-aware policy, protected artifacts, background-first execution, and verified visible handoff
+- progressively disclose bounded owner tools for status, Session, web, and lightweight questions; answer high-confidence status queries directly from bounded Host state without a model round, omit undisclosed Skill catalogs, cap focused history and output reservation, skip automatic memory work for focused requests, and make automatic embedding recall fail fast without retries
+- add a desktop-QQ coexistence setup path for LLOneBot/LLBot, generalize the QQ bridge to preferred `QQ_ONEBOT_*` settings, and retain legacy NapCat compatibility
 - replace the legacy `MemoryStore` and flat RAG index with a unified profile-isolated MemoryHub backed by Markdown Wiki pages, SQLite FTS5/BM25, optional embedding RRF, source receipts and forget suppressions
 - split `MIMI.md` Soul from hierarchical `AGENTS.md` / `CLAUDE.md` project guidance, and replace legacy memory/RAG tools and CLI commands with the canonical `/memory` surface
 - add an atomic one-time backup/conversion marker for usable legacy memories while skipping todo and unconfirmed entries
@@ -29,6 +31,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- keep Computer Use configuration out of isolated Task IPC so Codex workers can start, preserve worker initialization errors instead of replacing them with a generic exit, and require task inspection evidence for failure attribution
+- keep explicitly requested visible app handoffs on the user's current desktop and require frontmost observation before reporting success
+- let the CLI connect from any directory, re-adopt a replaced Host's workspace, and recover ordinary commands when the daemon socket is briefly unavailable
+- expose bounded, persistent Codex JSONL progress through task inspection, guide Mimi to use it, and keep prior-attempt errors from masquerading as current running failures
+- make repeated background delegation truly idempotent and provide both Codex and its Node shebang runtime when daemon launchd PATH is minimal
+- stop legacy digested/ignored Events from becoming completed Tasks and safely remove artifact-free phantom Tasks during the backed-up v14 upgrade
+- distinguish conversation executions from delegated background tasks in Mimi activity snapshots and include each recent Task's trigger Event source/type
 - validate the physical v12 Event/Task schema and atomically recover empty half-migrated databases instead of trusting `user_version` alone
 - keep the interactive input cursor clear of Terminal.app's IME wrapping boundary and remove high-frequency status redraws that could trigger native macOS 26 Terminal crashes
 - soft-wrap editable CLI input across multiple terminal rows while preserving explicit newlines and cursor placement

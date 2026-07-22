@@ -452,6 +452,7 @@ export class TaskProcessSupervisor {
       } else if (message.type === 'stream') {
         this.options.onStreamEvent?.(taskId, message.event as PendingMimiStreamEvent);
       } else if (message.type === 'error') {
+        record.failureReason = `Task worker 失败：${redact(message.error)}`;
         process.stderr.write(`[MimiAgent] background task ${taskId} failed: ${redact(message.error)}\n`);
       } else if (message.type === 'done') {
         record.gracefulExit = true;

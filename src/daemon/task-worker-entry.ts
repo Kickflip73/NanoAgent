@@ -342,7 +342,21 @@ async function writeCodexSummary(summaryPath: string, value: unknown): Promise<v
 
 process.on('message', (raw: unknown) => {
   if (!initialized) {
-    void run(raw);
+    void run(raw).catch((error: unknown) => {
+      const taskId = raw && typeof raw === 'object' && 'taskId' in raw
+        && typeof raw.taskId === 'string'
+        ? raw.taskId
+        : undefined;
+      const message = error instanceof Error ? error.message : String(error);
+      const report = taskId
+        ? send({ type: 'error', taskId, error: `Task worker 初始化失败：${message}`.slice(0, 4_000) })
+        : Promise.resolve();
+      void report.finally(() => {
+        process.exitCode = 1;
+        process.removeAllListeners('message');
+        if (process.connected) process.disconnect?.();
+      });
+    });
     return;
   }
   const parsed = taskWorkerControlSchema.safeParse(raw);

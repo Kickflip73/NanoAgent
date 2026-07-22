@@ -13,6 +13,7 @@ export interface AgentRunRequest {
   input: string;
   signal?: AbortSignal;
   options?: MimiRunOptions;
+  trustedHostAnswer?: string;
 }
 
 export interface AgentRunResult {
@@ -98,6 +99,22 @@ export class AgentRunService {
     const stopRuntimeEvents = this.agent.onRuntimeEvent((event) => observe(observer.onRuntimeEvent, event));
     await observe(observer.onStart, request.input);
     try {
+      if (request.trustedHostAnswer !== undefined) {
+        request.signal?.throwIfAborted();
+        const effects = await this.agent.completeHostRun(
+          request.input,
+          request.trustedHostAnswer,
+          request.options,
+        );
+        request.signal?.throwIfAborted();
+        const result = {
+          answer: request.trustedHostAnswer,
+          effects,
+          delivery: await request.options?.completionDelivery?.(),
+        } satisfies AgentRunResult;
+        await observe(observer.onComplete, result);
+        return result;
+      }
       stream = await this.agent.stream(request.input, request.signal, request.options);
       for await (const event of stream) {
         streamedAnswer += answerDelta(event);

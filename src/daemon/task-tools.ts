@@ -1,9 +1,13 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { tool, type Tool } from '@openai/agents';
 import { z } from 'zod';
 import type { EventCancelResult } from './dispatcher.js';
 import type { ImmutableEvent, ReplyRoute, TaskRecord } from './types.js';
 import { MimiStore } from './store.js';
+import {
+  readCodexTaskProgress,
+  type CodexProgressEvent,
+} from './codex-task-progress.js';
 
 const MAX_BACKGROUND_TASK_CHILDREN = 8;
 type MaybePromise<T> = T | Promise<T>;
@@ -65,6 +69,14 @@ function taskPrompt(input: z.infer<typeof delegationSchema>): string {
   ].filter(Boolean).join('\n');
 }
 
+function delegatedTaskId(idempotencyKey: string): string {
+  const bytes = createHash('sha256').update(idempotencyKey).digest().subarray(0, 16);
+  bytes[6] = (bytes[6]! & 0x0f) | 0x50;
+  bytes[8] = (bytes[8]! & 0x3f) | 0x80;
+  const hex = bytes.toString('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 export interface BackgroundTaskSummary {
   taskId: string;
   status: TaskRecord['status'];
@@ -81,6 +93,11 @@ export interface BackgroundTaskSummary {
   updatedAt: string;
   result?: unknown;
   error?: string;
+  previousAttemptError?: string;
+  execution?: {
+    leaseActive: boolean;
+    leaseUntil?: string;
+  };
   codex?: {
     runnerPid?: number;
     codexPid?: number;
@@ -90,6 +107,10 @@ export interface BackgroundTaskSummary {
     lastEvent?: string;
     outputJsonlPath?: string;
     summaryPath?: string;
+    logBytes?: number;
+    logUpdatedAt?: string;
+    latestActivity?: string;
+    recentEvents?: CodexProgressEvent[];
   };
 }
 
@@ -97,6 +118,7 @@ export function backgroundTaskSummary(task: TaskRecord): BackgroundTaskSummary {
   const payload = task.objective && typeof task.objective === 'object'
     ? task.objective as Record<string, unknown>
     : {};
+  const retrying = task.status === 'queued' || task.status === 'running';
   return {
     taskId: task.id,
     status: task.status,
@@ -112,10 +134,32 @@ export function backgroundTaskSummary(task: TaskRecord): BackgroundTaskSummary {
     createdAt: task.createdAt,
     updatedAt: task.updatedAt,
     result: task.result,
-    error: task.error,
+    error: retrying ? undefined : task.error,
+    previousAttemptError: retrying ? task.error : undefined,
+    execution: {
+      leaseActive: task.status === 'running'
+        && task.leaseUntil !== undefined
+        && task.leaseUntil > new Date().toISOString(),
+      leaseUntil: task.leaseUntil,
+    },
     ...(task.executor === 'codex' && payload.codex && typeof payload.codex === 'object'
       ? { codex: payload.codex as BackgroundTaskSummary['codex'] }
       : {}),
+  };
+}
+
+export async function inspectBackgroundTaskSummary(task: TaskRecord): Promise<BackgroundTaskSummary> {
+  const summary = backgroundTaskSummary(task);
+  const outputJsonlPath = summary.codex?.outputJsonlPath;
+  if (!outputJsonlPath || task.executor !== 'codex') return summary;
+  const progress = await readCodexTaskProgress(outputJsonlPath);
+  if (!progress) return summary;
+  return {
+    ...summary,
+    codex: {
+      ...summary.codex,
+      ...progress,
+    },
   };
 }
 
@@ -144,7 +188,7 @@ export function createBackgroundTaskTools(context: BackgroundTaskToolContext): T
   const managementTools: Tool[] = [
     tool({
       name: 'list_background_tasks',
-      description: '列出最近的 MimiAgent 后台任务及其 queued/running/completed/failed 状态。用于查看已委派工作；不要循环轮询，重要终态会主动通知。',
+      description: '列出最近的 MimiAgent 后台任务及其 queued/running/completed/failed 状态。这只是概览；用户询问某个 Codex 任务的实际进度时，必须继续调用 inspect_background_task 读取其持久输出日志。不要循环轮询，重要终态会主动通知。',
       parameters: z.object({ limit: z.number().int().min(1).max(50).default(20) }).strict(),
       execute: async ({ limit }) => context.store.listTasks(limit)
         .filter((task) => task.type === 'background')
@@ -152,12 +196,12 @@ export function createBackgroundTaskTools(context: BackgroundTaskToolContext): T
     }),
     tool({
       name: 'inspect_background_task',
-      description: '读取一个后台任务的目标、状态、结果和错误。仅在用户询问或需要继续处理阻塞任务时调用。',
+      description: '读取一个后台任务的目标、状态、结果和错误。Codex 任务还会直接返回持久 JSONL 输出中的最近执行事件、文件修改、命令和 agent 进展，无需再猜测或搜索日志路径。仅在用户询问或需要继续处理阻塞任务时调用。',
       parameters: z.object({ taskId: z.string().uuid() }).strict(),
       execute: async ({ taskId }) => {
         const task = context.store.getTask(taskId);
         if (!task || task.type !== 'background') throw new Error(`后台任务不存在：${taskId}`);
-        return backgroundTaskSummary(task);
+        return inspectBackgroundTaskSummary(task);
       },
     }),
     tool({
@@ -234,15 +278,17 @@ export function createBackgroundTaskTools(context: BackgroundTaskToolContext): T
           .update(JSON.stringify(normalized))
           .digest('hex')
           .slice(0, 24);
-        const taskId = randomUUID();
+        const idempotencyKey = `delegate:${context.task.id}:${digest}`;
+        const taskId = delegatedTaskId(idempotencyKey);
         const taskSessionId = `mimi-task-${taskId}`;
-        if (context.store.taskChildCount(context.task.id) >= MAX_BACKGROUND_TASK_CHILDREN) {
+        if (!context.store.getTask(taskId)
+          && context.store.taskChildCount(context.task.id) >= MAX_BACKGROUND_TASK_CHILDREN) {
           throw new Error(`当前任务最多可直接委派 ${MAX_BACKGROUND_TASK_CHILDREN} 个后台子任务`);
         }
         const inserted = context.store.enqueueTask({
           id: taskId,
           type: 'background',
-          idempotencyKey: `delegate:${context.task.id}:${digest}`,
+          idempotencyKey,
           triggerEventId: context.task.triggerEventId,
           authorityEventId: context.task.authorityEventId,
           parentTaskId: context.task.id,
@@ -251,8 +297,8 @@ export function createBackgroundTaskTools(context: BackgroundTaskToolContext): T
           objective: {
             prompt: taskPrompt(normalized),
             objective: normalized.objective,
-            successCriteria: normalized.successCriteria,
-            context: normalized.context,
+            ...(normalized.successCriteria ? { successCriteria: normalized.successCriteria } : {}),
+            ...(normalized.context ? { context: normalized.context } : {}),
             strategy: normalized.strategy,
             executor: normalized.executor,
             workspaceAccess: normalized.workspaceAccess,

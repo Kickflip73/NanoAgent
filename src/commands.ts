@@ -23,6 +23,11 @@ export interface BackgroundTaskSummary {
   updatedAt?: string;
   result?: unknown;
   error?: string;
+  previousAttemptError?: string;
+  execution?: {
+    leaseActive: boolean;
+    leaseUntil?: string;
+  };
   codex?: {
     runnerPid?: number;
     codexPid?: number;
@@ -32,6 +37,15 @@ export interface BackgroundTaskSummary {
     lastEvent?: string;
     outputJsonlPath?: string;
     summaryPath?: string;
+    logBytes?: number;
+    logUpdatedAt?: string;
+    latestActivity?: string;
+    recentEvents?: Array<{
+      type: string;
+      itemType?: string;
+      status?: string;
+      summary?: string;
+    }>;
   };
   worker?: {
     pid?: number;
@@ -272,6 +286,10 @@ function taskDetails(task: BackgroundTaskSummary): string {
     task.codex?.codexPid ? `Codex PID ${task.codex.codexPid}` : '',
     task.codex?.threadId ? `Codex 线程 ${task.codex.threadId}` : '',
     task.codex?.lastEvent ? `Codex 状态 ${task.codex.lastEvent}` : '',
+    task.codex?.latestActivity ? `Codex 进度 ${task.codex.latestActivity}` : '',
+    task.codex?.logUpdatedAt ? `日志更新  ${task.codex.logUpdatedAt}` : '',
+    task.codex?.logBytes !== undefined ? `日志大小  ${task.codex.logBytes} bytes` : '',
+    task.execution?.leaseActive ? `执行租约  活跃至 ${task.execution.leaseUntil}` : '',
     task.codex?.outputJsonlPath ? `事件产物  ${task.codex.outputJsonlPath}` : '',
     task.codex?.summaryPath ? `结果产物  ${task.codex.summaryPath}` : '',
     ...taskProgress(task),
@@ -279,6 +297,7 @@ function taskDetails(task: BackgroundTaskSummary): string {
     task.updatedAt ? `更新时间  ${task.updatedAt}` : '',
     task.result !== undefined ? `结果\n${taskValue(task.result)}` : '',
     task.error ? `错误\n${task.error}` : '',
+    task.previousAttemptError ? `上次尝试错误\n${task.previousAttemptError}` : '',
   ].filter(Boolean).join('\n');
 }
 

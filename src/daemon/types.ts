@@ -355,6 +355,9 @@ export interface MimiActivityTask {
   id: string;
   type: TaskType;
   status: TaskStatus;
+  triggerEventId?: string;
+  source?: string;
+  eventType?: string;
   priority: number;
   attemptCount: number;
   updatedAt: string;
@@ -395,6 +398,7 @@ export interface MimiActivitySnapshot {
   enabledSchedules: number;
   events: { total: number };
   tasks: Record<TaskStatus, number>;
+  tasksByType: Record<TaskType, Record<TaskStatus, number>>;
   outbox: Record<OutboxStatus, number>;
   recentEvents: MimiActivityEvent[];
   recentTasks: MimiActivityTask[];

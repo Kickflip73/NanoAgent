@@ -1,0 +1,101 @@
+- generic [active] [ref=e1]:
+  - generic:
+    - generic:
+      - heading "刘煜燃" [level=1]
+      - paragraph: 全栈开发者 · 3D 交互探索者 · 开源贡献者
+      - generic:
+        - generic: Java 精通
+        - generic: Golang
+        - generic: Python
+        - generic: TypeScript
+        - generic: Three.js
+        - generic: WebGPU
+      - generic:
+        - generic:
+          - generic: 3+
+          - generic: 实习经历
+        - generic:
+          - generic: "4"
+          - generic: 编程语言
+        - generic:
+          - generic: ∞
+          - generic: 探索边界
+    - generic:
+      - heading "🏢 工作经历" [level=2]
+      - generic:
+        - heading "腾讯 IEG · Golang 开发实习生" [level=3]
+        - paragraph: 2024.05 – 2024.08 · 游戏技术运营部
+        - paragraph: 参与蓝鲸混合云管理平台 bk-hcm，负责资源调度模块的后端开发，涉及 Golang 微服务架构与 Kubernetes 集成。
+        - generic:
+          - generic: Golang
+          - generic: K8s
+          - generic: 微服务
+      - generic:
+        - heading "美团 · Java 开发实习生" [level=3]
+        - paragraph: 2024.03 – 2024.05 · 基础研发平台
+        - paragraph: 参与自动化测试平台 Taas，设计测试用例编排引擎，优化 CI/CD 流水线中测试效率 40%。
+        - generic:
+          - generic: Java
+          - generic: Spring
+          - generic: CI/CD
+      - generic:
+        - heading "喜马拉雅 · Java 开发实习生" [level=3]
+        - paragraph: 2023.09 – 2024.02 · 运营与效能中心
+        - paragraph: 参与低代码平台建设，负责 e签宝电子签章模块集成，支撑日均千级合同签署流程。
+        - generic:
+          - generic: Java
+          - generic: 低代码
+          - generic: e签宝
+    - generic:
+      - heading "🚀 开源项目" [level=2]
+      - generic:
+        - heading "MimiAgent · 个人 AI Agent 运行时" [level=3]
+        - paragraph: TypeScript 全栈项目，常驻系统级 AI 代理，支持 CLI、IM、邮件多渠道交互，具备 Connector 扩展机制和 Daemon 常驻进程。
+        - generic:
+          - generic: TypeScript
+          - generic: AI Agent
+          - generic: CLI
+      - generic:
+        - heading "Jarvis IM 接管方案" [level=3]
+        - paragraph: 自研 AppleScript Connector，通过 osascript 直接操控 QQ 和大象桌面 App，实现 AI 代理的 IM 读写能力。
+        - generic:
+          - generic: AppleScript
+          - generic: Node.js
+          - generic: 自动化
+      - generic:
+        - heading "3D 交互作品集" [level=3]
+        - paragraph: 基于 html-in-canvas + Three.js WebGPU 构建，将网页作为实时 3D 纹理，点击即可碎裂为飘散多边形碎片。
+        - generic:
+          - generic: WebGPU
+          - generic: Three.js
+          - generic: GSAP
+    - generic:
+      - heading "🎓 教育" [level=2]
+      - paragraph:
+        - strong: 西南石油大学
+        - text: · 软件工程 本科 · 2021 – 2025 · 双一流
+      - paragraph: 创数据软件实验室队长 · 优秀学生二等奖学金
+      - generic:
+        - generic: GPA 3.6
+        - generic: 实验室队长
+        - generic: 奖学金
+    - generic:
+      - heading "📬 联系我" [level=2]
+      - paragraph: 📧 3065242502@qq.com · 📱 17323208771
+      - paragraph: "🌐 kickflip.fun · 🐙 GitHub: Kickflip73"
+      - generic:
+        - generic: QQ
+        - generic: GitHub
+        - generic: 博客
+        - generic: 邮箱
+  - generic [ref=e2]:
+    - heading "⚠️ 浏览器不支持" [level=2] [ref=e3]
+    - paragraph [ref=e4]:
+      - text: 此项目依赖 Chrome 141+ 的
+      - code [ref=e5]: drawElementImage
+      - text: API。
+    - paragraph [ref=e6]:
+      - text: 请在 Chrome Canary 中打开
+      - link "chrome://flags/#canvas-draw-element" [ref=e7] [cursor=pointer]:
+        - /url: chrome://flags/#canvas-draw-element
+      - text: 并启用该标志。
