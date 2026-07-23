@@ -6,27 +6,36 @@ import { sessionIdSchema } from '../core/session-id.js';
 export const RUNTIME_OUTPUT_LEVELS = ['answer', 'thinking', 'tools', 'trace'] as const;
 export type RuntimeOutputLevel = typeof RUNTIME_OUTPUT_LEVELS[number];
 
-export type RuntimeAction =
-  | { type: 'switch_session'; sessionId: string }
-  | { type: 'new_session'; sessionId: string }
-  | { type: 'clear_session' }
-  | { type: 'set_output_level'; level: RuntimeOutputLevel }
-  | { type: 'reload_mcp' }
-  | { type: 'exit' };
+const modelNameSchema = z.string().regex(/^[a-zA-Z0-9._:/-]+$/).max(200);
+const modeIdSchema = z.string().regex(/^[a-zA-Z0-9._-]+$/).max(60);
 
-export type RuntimeEffect =
-  | { type: 'session_changed'; sessionId: string }
-  | { type: 'session_cleared'; sessionId: string }
-  | { type: 'output_level_changed'; level: RuntimeOutputLevel }
-  | { type: 'mcp_reloaded' }
-  | { type: 'exit_requested' };
+export const runtimeActionSchema = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('switch_model'), model: modelNameSchema }).strict(),
+  z.object({ type: z.literal('switch_mode'), mode: modeIdSchema }).strict(),
+  z.object({ type: z.literal('switch_session'), sessionId: sessionIdSchema }).strict(),
+  z.object({ type: z.literal('new_session'), sessionId: sessionIdSchema }).strict(),
+  z.object({ type: z.literal('clear_session') }).strict(),
+  z.object({ type: z.literal('set_output_level'), level: z.enum(RUNTIME_OUTPUT_LEVELS) }).strict(),
+  z.object({ type: z.literal('reload_mcp') }).strict(),
+  z.object({ type: z.literal('exit') }).strict(),
+]);
+export type RuntimeAction = z.infer<typeof runtimeActionSchema>;
+
+export const runtimeEffectSchema = z.discriminatedUnion('type', [
+  z.object({ type: z.literal('model_changed'), model: modelNameSchema }).strict(),
+  z.object({ type: z.literal('mode_changed'), mode: modeIdSchema }).strict(),
+  z.object({ type: z.literal('session_changed'), sessionId: sessionIdSchema }).strict(),
+  z.object({ type: z.literal('session_cleared'), sessionId: sessionIdSchema }).strict(),
+  z.object({ type: z.literal('output_level_changed'), level: z.enum(RUNTIME_OUTPUT_LEVELS) }).strict(),
+  z.object({ type: z.literal('mcp_reloaded') }).strict(),
+  z.object({ type: z.literal('exit_requested') }).strict(),
+]);
+export type RuntimeEffect = z.infer<typeof runtimeEffectSchema>;
 
 export interface RuntimeControls {
   status: () => unknown | Promise<unknown>;
   models: () => string[];
   modes: () => Array<{ id: string; label: string; description: string }>;
-  switchModel: (model: string) => void | Promise<void>;
-  switchMode: (mode: string) => void | Promise<void>;
   listSessions: () => unknown | Promise<unknown>;
   history: (limit: number) => Promise<AgentInputItem[]>;
   canAccessSessions?: () => boolean;
@@ -38,17 +47,19 @@ export function createRuntimeControlTools(controls: RuntimeControls): Tool[] {
   return [
     tool({
       name: 'runtime_status',
-      description: '查看 NanoAgent 当前模型、模式、输出等级、Session、工作区、运行时代码目录和扩展状态。',
+      description: '查看 MimiAgent 当前模型、模式、输出等级、Session、工作区、运行时代码目录和扩展状态。',
       parameters: z.object({}),
       execute: controls.status,
     }),
     tool({
       name: 'switch_model',
-      description: '切换 NanoAgent 模型；当前任务继续使用原模型，新模型从下一轮对话生效。',
+      description: '切换 MimiAgent 模型；当前任务继续使用原模型，新模型从下一轮对话生效。',
       parameters: z.object({ model: z.string().min(1) }),
       execute: async ({ model }) => {
-        await controls.switchModel(model);
-        return { model, effective: 'next_turn', available: controls.models() };
+        if (!modelNameSchema.safeParse(model).success) throw new Error('模型名称格式无效');
+        const available = controls.models();
+        controls.schedule({ type: 'switch_model', model });
+        return { model, effective: 'next_turn', available };
       },
     }),
     tool({
@@ -56,8 +67,10 @@ export function createRuntimeControlTools(controls: RuntimeControls): Tool[] {
       description: '切换通用（general）、Plan（plan）或 Ultra Team（ultra）模式；从下一轮对话生效。',
       parameters: z.object({ mode: z.string().min(1) }),
       execute: async ({ mode }) => {
-        await controls.switchMode(mode);
-        return { mode, effective: 'next_turn', available: controls.modes() };
+        const available = controls.modes();
+        if (!available.some((candidate) => candidate.id === mode)) throw new Error(`未知模式：${mode}`);
+        controls.schedule({ type: 'switch_mode', mode });
+        return { mode, effective: 'next_turn', available };
       },
     }),
     tool({
@@ -71,7 +84,7 @@ export function createRuntimeControlTools(controls: RuntimeControls): Tool[] {
     }),
     tool({
       name: 'list_sessions',
-      description: '列出 NanoAgent 持久会话的 ID、时间、轮数和恢复状态；不会读取其他会话内容。',
+      description: '列出 MimiAgent 持久会话的 ID、时间、轮数和恢复状态；不会读取其他会话内容。',
       parameters: z.object({}),
       execute: async () => {
         if (controls.canAccessSessions && !controls.canAccessSessions()) throw new Error('本轮用户没有要求访问其他 Session');
@@ -128,7 +141,7 @@ export function createRuntimeControlTools(controls: RuntimeControls): Tool[] {
     }),
     tool({
       name: 'request_exit',
-      description: '在用户明确要求退出 NanoAgent 时关闭交互进程；本轮回答完成后执行。',
+      description: '在用户明确要求退出 MimiAgent 时关闭交互进程；本轮回答完成后执行。',
       parameters: z.object({}),
       execute: async () => {
         controls.schedule({ type: 'exit' });

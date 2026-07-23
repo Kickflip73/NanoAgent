@@ -83,7 +83,7 @@ function workerPrompt(task: TeamTask, allTasks: TeamTask[], workspaceRoot: strin
   const dependencies = task.dependencies.map((id) => allTasks.find((item) => item.id === id)).filter(Boolean) as TeamTask[];
   return [
     persistent,
-    `你是 NanoAgent Ultra Team 的 ${task.role} worker。${ROLE_INSTRUCTIONS[task.role]}`,
+    `你是 MimiAgent Ultra Team 的 ${task.role} worker。${ROLE_INSTRUCTIONS[task.role]}`,
     '你拥有独立上下文，不得继续委派、改动 Team task list 或扩大任务范围。',
     `工作区：${workspaceRoot}`,
     `任务 ID：${task.id}\n任务：${task.description}`,
@@ -100,10 +100,10 @@ async function defaultWorker(
   workerTools: Tool[],
   signal?: AbortSignal,
 ): Promise<string> {
-  const agent = new Agent({ name: `Nano ${task.role} · ${task.id}`, model: options.model, instructions: prompt, tools: workerTools });
-  const runner = new Runner({ workflowName: `NanoAgent Ultra · ${task.role}`, tracingDisabled: true, traceIncludeSensitiveData: false });
+  const agent = new Agent({ name: `Mimi ${task.role} · ${task.id}`, model: options.model, instructions: prompt, tools: workerTools });
+  const runner = new Runner({ workflowName: `MimiAgent Ultra · ${task.role}`, tracingDisabled: true, traceIncludeSensitiveData: false });
   const result = await runner.run(agent, task.description, {
-    maxTurns: task.role === 'builder' ? 24 : task.role === 'tester' ? 20 : 16,
+    maxTurns: null,
     signal,
     toolExecution: { maxFunctionToolConcurrency: task.role === 'builder' ? 1 : 2 },
   });

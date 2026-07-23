@@ -1,10 +1,42 @@
 [
   {
-    "query": "NanoAgent 使用什么语言和 SDK？",
-    "expectedSource": "knowledge/nano-agent.md"
+    "query": "MimiAgent 使用什么语言和 SDK？",
+    "expectedSource": "knowledge/mimi-agent.md"
   },
   {
-    "query": "NanoAgent 的运行数据保存在哪里？",
-    "expectedSource": "knowledge/nano-agent.md"
+    "query": "MimiAgent 的运行数据保存在哪里？",
+    "expectedSource": "knowledge/mimi-agent.md"
+  },
+  {
+    "query": "一个主 Agent 如何统一 CLI 和 Connector？",
+    "expectedSource": "knowledge/mimi-agent.md"
+  },
+  {
+    "query": "EventRouter Task Queue lease retry Outbox",
+    "expectedSource": "knowledge/mimi-agent.md"
+  },
+  {
+    "query": "外部",
+    "expectedSource": "knowledge/mimi-agent.md"
+  },
+  {
+    "query": "private Wiki 如何按 profile 隔离？",
+    "expectedSource": "knowledge/mimi-agent.md"
+  },
+  {
+    "query": "Embedding 失败后如何检索？",
+    "expectedSource": "knowledge/mimi-agent.md"
+  },
+  {
+    "query": "receipt suppression reindex",
+    "expectedSource": "knowledge/mimi-agent.md"
+  },
+  {
+    "query": "外部事件为什么不能当指令？",
+    "expectedSource": "knowledge/mimi-agent.md"
+  },
+  {
+    "query": "Runtime Core Daemon Connector 的职责边界",
+    "expectedSource": "knowledge/mimi-agent.md"
   }
 ]

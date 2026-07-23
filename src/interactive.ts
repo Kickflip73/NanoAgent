@@ -25,6 +25,7 @@ type Key = { name?: string; ctrl?: boolean; shift?: boolean; meta?: boolean; seq
 
 const clearLine = '\r\x1b[2K';
 const selectionCursor = '\x1b[96m›\x1b[0m';
+const doubleEscapeWindowMs = 350;
 
 function displayWidth(value: string): number {
   const plain = value.replace(/\x1b\[[0-9;]*m/g, '');
@@ -33,6 +34,10 @@ function displayWidth(value: string): number {
     const wide = codePoint >= 0x1f300 || /[\u1100-\u115f\u2e80-\ua4cf\uac00-\ud7a3\uf900-\ufaff\ufe10-\ufe19\ufe30-\ufe6f\uff00-\uff60\uffe0-\uffe6]/u.test(character);
     return width + (wide ? 2 : 1);
   }, 0);
+}
+
+function usableTerminalWidth(value: number | undefined): number {
+  return Number.isFinite(value) && value! >= 20 ? Math.floor(value!) : 80;
 }
 
 export class InteractiveTerminal {
@@ -46,8 +51,6 @@ export class InteractiveTerminal {
   private busy = false;
   private transient = '';
   private runtime: RuntimeStatus = { mode: '标准', model: '未配置', contextUsed: 0, contextWindow: 0 };
-  private statusFrame = 0;
-  private statusTimer?: NodeJS.Timeout;
   private queued: string[] = [];
   private tasks: PlanStep[] = [];
   private outputOpen = false;
@@ -58,6 +61,8 @@ export class InteractiveTerminal {
   private bracketPaste = false;
   private suppressPasteKeypress = false;
   private pasteDataListener?: (chunk: Buffer | string) => void;
+  private resizeListener?: () => void;
+  private escapeTimer?: NodeJS.Timeout;
   private selectState?: {
     items: SelectItem[];
     index: number;
@@ -75,6 +80,8 @@ export class InteractiveTerminal {
     this.started = true;
     this.pasteDataListener = (chunk) => this.handlePasteData(chunk);
     this.input.prependListener('data', this.pasteDataListener);
+    this.resizeListener = () => this.redraw();
+    this.output.on('resize', this.resizeListener);
     readline.emitKeypressEvents(this.input);
     if (this.input.isTTY) {
       this.input.setRawMode(true);
@@ -83,6 +90,10 @@ export class InteractiveTerminal {
     this.input.resume();
     this.input.on('keypress', (text: string, key: Key) => {
       if (this.suppressPasteKeypress || this.bracketPaste) return;
+      if (key.name !== 'escape' && this.escapeTimer) {
+        clearTimeout(this.escapeTimer);
+        this.escapeTimer = undefined;
+      }
       if (key.ctrl && (key.name === 'c' || key.name === 'd')) {
         handlers.onExit();
         return;
@@ -96,7 +107,24 @@ export class InteractiveTerminal {
         return;
       }
       if (key.name === 'escape') {
-        handlers.onEscape();
+        if (!this.buffer.length) {
+          handlers.onEscape();
+          return;
+        }
+        if (this.escapeTimer) {
+          clearTimeout(this.escapeTimer);
+          this.escapeTimer = undefined;
+          this.buffer = [];
+          this.cursor = 0;
+          this.completionIndex = 0;
+          this.redraw();
+          return;
+        }
+        this.escapeTimer = setTimeout(() => {
+          this.escapeTimer = undefined;
+          handlers.onEscape();
+        }, doubleEscapeWindowMs);
+        this.escapeTimer.unref();
         return;
       }
       const shiftedEnter = ((key.name === 'return' || key.name === 'enter') && key.shift)
@@ -207,18 +235,7 @@ export class InteractiveTerminal {
   setBusy(value: boolean): void {
     if (this.busy === value) return;
     this.busy = value;
-    if (this.statusTimer) clearInterval(this.statusTimer);
-    this.statusTimer = undefined;
-    if (value) {
-      this.statusTimer = setInterval(() => {
-        this.statusFrame += 1;
-        this.redraw();
-      }, 80);
-      this.statusTimer.unref();
-    } else {
-      this.transient = '';
-      this.statusFrame = 0;
-    }
+    if (!value) this.transient = '';
     this.redraw();
   }
 
@@ -268,13 +285,15 @@ export class InteractiveTerminal {
 
   close(): void {
     if (this.closed) return;
-    if (this.statusTimer) clearInterval(this.statusTimer);
+    if (this.escapeTimer) clearTimeout(this.escapeTimer);
+    this.escapeTimer = undefined;
     this.eraseUi();
     const selection = this.selectState;
     this.selectState = undefined;
     selection?.resolve();
     this.closed = true;
     if (this.pasteDataListener) this.input.removeListener('data', this.pasteDataListener);
+    if (this.resizeListener) this.output.removeListener('resize', this.resizeListener);
     if (this.input.isTTY) this.output.write('\x1b[?2004l');
     this.output.write('\n');
     if (this.input.isTTY) this.input.setRawMode(false);
@@ -282,9 +301,14 @@ export class InteractiveTerminal {
   }
 
   private get suggestions(): CompletionItem[] {
+    if (this.browsingHistory) return [];
     const value = this.buffer.join('');
     if (!value.startsWith('/') || value.includes(' ')) return [];
     return this.completions.filter((item) => item.value.startsWith(value));
+  }
+
+  private get browsingHistory(): boolean {
+    return this.historyIndex < this.history.length;
   }
 
   private handleSelection(key: Key): void {
@@ -450,33 +474,55 @@ export class InteractiveTerminal {
   }
 
   private inputBox(): { lines: string[]; cursorRow: number; cursorColumn: number } {
-    const width = Math.max(24, (this.output.columns ?? 80) - 1);
     const prefix = '┊> ';
-    const available = width - displayWidth(prefix);
+    const prefixWidth = displayWidth(prefix);
+    const terminalWidth = usableTerminalWidth(this.output.columns);
+    // Terminal.app 2.15 on macOS 26 can crash when IME marked text wraps. The
+    // marked text is owned by the terminal and is invisible to this editor, so
+    // keep enough blank columns after the cursor for an in-progress conversion.
+    const compositionMargin = Math.min(16, Math.max(4, terminalWidth - 8));
+    const width = terminalWidth - compositionMargin;
+    const available = Math.max(2, width - prefixWidth);
     const value = this.buffer.join('');
     const logicalLines = value.split('\n');
     const beforeCursor = this.buffer.slice(0, this.cursor).join('');
-    const cursorRow = beforeCursor.split('\n').length - 1;
+    const logicalCursorRow = beforeCursor.split('\n').length - 1;
     const cursorOffset = Array.from(beforeCursor.split('\n').at(-1) ?? '').length;
-    let cursorColumn = displayWidth(prefix);
-    const lines = logicalLines.map((line, index) => {
-      const linePrefix = index === 0 ? '\x1b[90m┊\x1b[0m> ' : '\x1b[90m┊\x1b[0m  ';
-      if (index !== cursorRow) return `${linePrefix}${this.truncateDisplay(line, available)}`;
+    let cursorRow = 0;
+    let cursorColumn = prefixWidth;
+    let cursorPlaced = false;
+    const lines: string[] = [];
+    for (const [logicalRow, line] of logicalLines.entries()) {
       const characters = Array.from(line);
-      let start = cursorOffset;
-      while (start > 0 && displayWidth(characters.slice(start - 1, cursorOffset).join('')) <= available) start -= 1;
-      if (displayWidth(characters.slice(start, cursorOffset).join('')) > available) start += 1;
-      const visible: string[] = [];
+      const wrapped: Array<{ start: number; end: number; text: string }> = [];
+      let start = 0;
       let used = 0;
-      for (const character of characters.slice(start)) {
+      for (const [index, character] of characters.entries()) {
         const characterWidth = displayWidth(character);
-        if (used + characterWidth > available) break;
-        visible.push(character);
+        if (used > 0 && used + characterWidth > available) {
+          wrapped.push({ start, end: index, text: characters.slice(start, index).join('') });
+          start = index;
+          used = 0;
+        }
         used += characterWidth;
       }
-      cursorColumn = displayWidth(prefix) + displayWidth(characters.slice(start, cursorOffset).join(''));
-      return `${linePrefix}${visible.join('')}`;
-    });
+      wrapped.push({ start, end: characters.length, text: characters.slice(start).join('') });
+
+      for (const [wrappedRow, segment] of wrapped.entries()) {
+        const linePrefix = logicalRow === 0 && wrappedRow === 0
+          ? '\x1b[90m┊\x1b[0m> '
+          : '\x1b[90m┊\x1b[0m  ';
+        lines.push(`${linePrefix}${segment.text}`);
+        if (
+          !cursorPlaced && logicalRow === logicalCursorRow &&
+          cursorOffset >= segment.start && cursorOffset <= segment.end
+        ) {
+          cursorRow = lines.length - 1;
+          cursorColumn = prefixWidth + displayWidth(characters.slice(segment.start, cursorOffset).join(''));
+          cursorPlaced = true;
+        }
+      }
+    }
     return {
       lines,
       cursorRow,
@@ -522,8 +568,7 @@ export class InteractiveTerminal {
   }
 
   private statusLine(): string {
-    const frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-    const icon = this.busy ? frames[this.statusFrame % frames.length] : '◇';
+    const icon = this.busy ? '●' : '◇';
     const state = this.busy ? (this.transient || '运行中') : '就绪';
     const model = this.truncateDisplay(this.runtime.model, 24);
     const text = `${icon} ${state} · 模式 ${this.runtime.mode} · 模型 ${model} · 上下文 ${this.formatTokens(this.runtime.contextUsed)}/${this.formatTokens(this.runtime.contextWindow)}`;

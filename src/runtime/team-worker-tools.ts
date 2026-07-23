@@ -1,7 +1,5 @@
-import os from 'node:os';
-import path from 'node:path';
 import type { Tool } from '@openai/agents';
-import type { AgentPermissionMode } from '../config.js';
+import { privateRuntimePaths, type AgentPermissionMode } from '../config.js';
 import type { TeamTask } from '../core/team.js';
 import { createTools } from '../tools.js';
 
@@ -10,7 +8,7 @@ export interface TeamWorkerToolOptions {
   dataRoot: string;
   permissionMode: AgentPermissionMode;
   task: TeamTask;
-  searchKnowledgeTool?: Tool;
+  memorySearchTool?: Tool;
 }
 
 export function createTeamWorkerTools(options: TeamWorkerToolOptions): Tool[] {
@@ -19,7 +17,7 @@ export function createTeamWorkerTools(options: TeamWorkerToolOptions): Tool[] {
     ...createTools(
       options.workspaceRoot,
       false,
-      [options.dataRoot, path.join(os.homedir(), '.nano-agent')],
+      privateRuntimePaths(options),
       {
         readablePaths: ['.'],
         writablePaths: canWrite ? options.task.paths : [],
@@ -27,6 +25,6 @@ export function createTeamWorkerTools(options: TeamWorkerToolOptions): Tool[] {
         allowShell: false,
       },
     ),
-    ...(options.searchKnowledgeTool ? [options.searchKnowledgeTool] : []),
+    ...(options.memorySearchTool ? [options.memorySearchTool] : []),
   ];
 }

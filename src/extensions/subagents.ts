@@ -63,13 +63,13 @@ export function createSubAgentTools(options: SubAgentToolsOptions): Tool[] {
     researcher.asTool({
       toolName: 'delegate_research',
       toolDescription: '把独立、资料密集的研究子任务交给只读 researcher；简单查询不要委派。',
-      runOptions: { maxTurns: 16 },
+      runOptions: { maxTurns: null },
       onStream: async ({ event }) => forwardEvent(options.onEvent, 'researcher', event.type),
     }),
     reviewer.asTool({
       toolName: 'delegate_review',
       toolDescription: '把边界清晰的代码、文档或方案审查交给只读 reviewer。',
-      runOptions: { maxTurns: 12 },
+      runOptions: { maxTurns: null },
       onStream: async ({ event }) => forwardEvent(options.onEvent, 'reviewer', event.type),
     }),
   ];
@@ -77,7 +77,7 @@ export function createSubAgentTools(options: SubAgentToolsOptions): Tool[] {
     tools.splice(1, 0, architect.asTool({
       toolName: 'delegate_architecture',
       toolDescription: '把边界清晰的架构分析或实施方案设计交给只读 architect。',
-      runOptions: { maxTurns: 16 },
+      runOptions: { maxTurns: null },
       onStream: async ({ event }) => forwardEvent(options.onEvent, 'architect', event.type),
     }));
   }

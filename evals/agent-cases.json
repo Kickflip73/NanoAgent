@@ -11,13 +11,13 @@
   },
   {
     "name": "changes its own runtime mode on request",
-    "input": "请调用 switch_mode 将 NanoAgent 切换到 ultra 模式，然后简短确认。",
+    "input": "请调用 switch_mode 将 MimiAgent 切换到 ultra 模式，然后简短确认。",
     "expectedTools": ["switch_mode"]
   },
   {
     "name": "plans and runs a real Ultra Team wave",
     "input": "这是 Ultra Team 行为测试。必须先调用 set_team_tasks 创建两个无依赖 explorer 子任务，分别计算 1+1 和 2+2；随后必须调用 run_team 并行执行这两个任务，最后简短汇总。",
     "expectedTools": ["set_team_tasks", "run_team"],
-    "env": { "AGENT_MODE": "ultra", "MAX_TURNS": "30" }
+    "env": { "MIMI_MODE": "ultra", "MIMI_MAX_TURNS": "30" }
   }
 ]

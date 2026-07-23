@@ -2,6 +2,12 @@ import { tool } from '@openai/agents';
 import { z } from 'zod';
 import { assertSessionId } from './session-id.js';
 import { AtomicJsonStore } from './state-file.js';
+import {
+  completionContractSchema,
+  completionCriterionSchema,
+  type CompletionContract,
+  type CompletionCriterion,
+} from './completion.js';
 
 export interface PlanStep {
   id: string;
@@ -14,6 +20,9 @@ export type GoalStatus = 'active' | 'paused' | 'completed' | 'failed';
 export interface Goal {
   objective: string;
   status: GoalStatus;
+  acceptanceCriteria?: CompletionCriterion[];
+  completionContract?: CompletionContract;
+  completionEvidence?: string;
   nextAction?: string;
   checkpoint?: string;
   createdAt: string;
@@ -37,6 +46,9 @@ const planStepSchema = z.object({
 const goalSchema = z.object({
   objective: z.string(),
   status: z.enum(['active', 'paused', 'completed', 'failed']),
+  acceptanceCriteria: z.array(completionCriterionSchema).max(8).optional(),
+  completionContract: completionContractSchema.optional(),
+  completionEvidence: z.string().optional(),
   nextAction: z.string().optional(),
   checkpoint: z.string().optional(),
   createdAt: z.string(),
@@ -99,13 +111,19 @@ export class PlanStore {
     return (await this.state.read())[sessionId]?.goal;
   }
 
-  async setGoal(objective: string): Promise<Goal> {
+  async setGoal(
+    objective: string,
+    acceptanceCriteria?: CompletionCriterion[],
+    completionContract?: CompletionContract,
+  ): Promise<Goal> {
     const sessionId = this.sessionId;
     const goal = await this.mutate((plans) => {
       const now = new Date().toISOString();
       const goal: Goal = {
         objective: objective.trim(),
         status: 'active',
+        ...(acceptanceCriteria?.length ? { acceptanceCriteria } : {}),
+        ...(completionContract ? { completionContract } : {}),
         createdAt: now,
         updatedAt: now,
       };
@@ -114,6 +132,58 @@ export class PlanStore {
     });
     await this.notify(sessionId, []);
     return goal;
+  }
+
+  async setGoalAcceptance(criteria: CompletionCriterion[]): Promise<Goal | undefined> {
+    const sessionId = this.sessionId;
+    return this.mutate((plans) => {
+      const state = plans[sessionId];
+      if (!state?.goal || state.goal.status === 'completed') return undefined;
+      state.goal = {
+        ...state.goal,
+        acceptanceCriteria: criteria,
+        updatedAt: new Date().toISOString(),
+      };
+      return state.goal;
+    });
+  }
+
+  async setGoalCompletionContract(contract: CompletionContract): Promise<Goal | undefined> {
+    const sessionId = this.sessionId;
+    return this.mutate((plans) => {
+      const state = plans[sessionId];
+      if (!state?.goal || state.goal.status === 'completed') return undefined;
+      if (state.goal.completionContract
+        && JSON.stringify(state.goal.completionContract) !== JSON.stringify(contract)) {
+        throw new Error('当前 Goal 的 Completion Contract 已锁定，拒绝覆盖');
+      }
+      state.goal = {
+        ...state.goal,
+        completionContract: contract,
+        acceptanceCriteria: contract.criteria,
+        updatedAt: new Date().toISOString(),
+      };
+      return state.goal;
+    });
+  }
+
+  async completeGoalFromGate(evidence: string, expectedCreatedAt: string): Promise<Goal | undefined> {
+    const sessionId = this.sessionId;
+    return this.mutate((plans) => {
+      const state = plans[sessionId];
+      if (!state?.goal || state.goal.status === 'completed') return state?.goal;
+      if (state.goal.createdAt !== expectedCreatedAt) return state.goal;
+      const now = new Date().toISOString();
+      state.goal = {
+        ...state.goal,
+        status: 'completed',
+        completionEvidence: evidence.trim().slice(0, 8_000),
+        checkpoint: evidence.trim().slice(0, 8_000),
+        nextAction: '验收已通过',
+        updatedAt: now,
+      };
+      return state.goal;
+    });
   }
 
   async checkpoint(update: {
@@ -159,7 +229,11 @@ export class PlanStore {
     await this.notify(sessionId, []);
   }
 
-  createTools() {
+  createTools(options: {
+    beforeGoalSet?: () => void | Promise<void>;
+    completionContract?: () => CompletionContract | undefined;
+    onGoalSet?: (goal: Goal) => void | Promise<void>;
+  } = {}) {
     const step = z.object({
       id: z.string().min(1),
       description: z.string().min(1),
@@ -180,9 +254,21 @@ export class PlanStore {
       }),
       tool({
         name: 'set_goal',
-        description: '为需要跨多轮或跨重启继续的长任务设置持久 Goal；普通单轮任务不要使用。',
-        parameters: z.object({ objective: z.string().min(1).max(2_000) }),
-        execute: async ({ objective }) => this.setGoal(objective),
+        description: '为需要跨多轮或跨重启继续的长任务设置持久 Goal，并在开始执行前给出可验证验收条件。',
+        parameters: z.object({
+          objective: z.string().min(1).max(2_000),
+          acceptanceCriteria: z.array(completionCriterionSchema).min(1).max(8),
+        }),
+        execute: async ({ objective, acceptanceCriteria }) => {
+          await options.beforeGoalSet?.();
+          const goal = await this.setGoal(
+            objective,
+            acceptanceCriteria,
+            options.completionContract?.(),
+          );
+          await options.onGoalSet?.(goal);
+          return goal;
+        },
       }),
       tool({
         name: 'update_goal',
@@ -192,7 +278,12 @@ export class PlanStore {
           nextAction: z.string().max(2_000).optional(),
           checkpoint: z.string().max(8_000).optional(),
         }),
-        execute: async (update) => this.checkpoint(update),
+        execute: async (update) => {
+          if (update.status === 'completed') {
+            throw new Error('Goal 不能由模型直接标记 completed；请调用 finish_task 通过 Completion Gate');
+          }
+          return this.checkpoint(update);
+        },
       }),
       tool({
         name: 'show_goal',

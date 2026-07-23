@@ -1,0 +1,388 @@
+{
+  "connectors": {
+    "openclaw-weixin": {
+      "enabled": false,
+      "command": "node",
+      "args": ["/absolute/path/to/MimiAgent/examples/connectors/openclaw-weixin-connector.mjs"],
+      "envAllowlist": ["OPENCLAW_BIN", "OPENCLAW_COMMAND_TIMEOUT_MS", "OPENCLAW_STATE_DIR", "MIMI_DAEMON_SOCKET"],
+      "source": "openclaw-weixin",
+      "trust": "owner",
+      "profileId": "owner",
+      "restart": true,
+      "healthEvents": true,
+      "healthStabilityMs": 5000,
+      "deliveryTimeoutMs": 45000,
+      "actionTimeoutMs": 45000,
+      "actions": {
+        "send_message": { "description": "通过已登录的 OpenClaw 微信通道主动发送文本；target 使用入站事件提供的 account/to 路由" },
+        "health_check": { "description": "检查腾讯 iLink channel account、MimiAgent bridge plugin 与后台 socket 是否同时在线" },
+        "local_history": { "description": "读取本机 OpenClaw 已持久化的有界微信入站历史；target 使用 account/to 路由，不代表腾讯上游历史 API" }
+      }
+    },
+    "radar": {
+      "enabled": false,
+      "command": "node",
+      "args": ["/absolute/path/to/MimiAgent/examples/connectors/radar-connector.mjs"],
+      "envAllowlist": ["MIMI_RADAR_CONFIG", "JARVIS_RADAR_CONFIG", "RADAR_POLL_INTERVAL_MS"],
+      "source": "radar",
+      "trust": "public",
+      "profileId": "owner",
+      "restart": true,
+      "healthEvents": true,
+      "healthStabilityMs": 5000,
+      "deliveryTimeoutMs": 30000,
+      "actionTimeoutMs": 30000,
+      "actions": {
+        "refresh": { "description": "立即刷新全部或指定信息源；target 为 all 或 source ID" },
+        "weather_snapshot": { "description": "查询全部或指定地点的小时天气快照" },
+        "sources": { "description": "列出信息雷达已配置的 source 目录" }
+      }
+    },
+    "file-radar": {
+      "enabled": false,
+      "command": "node",
+      "args": ["/absolute/path/to/MimiAgent/examples/connectors/file-radar-connector.mjs"],
+      "envAllowlist": ["MIMI_FILE_RADAR_CONFIG", "JARVIS_FILE_RADAR_CONFIG", "FILE_RADAR_POLL_INTERVAL_MS"],
+      "source": "file-radar",
+      "trust": "external",
+      "profileId": "owner",
+      "restart": true,
+      "deliveryTimeoutMs": 30000,
+      "actionTimeoutMs": 30000,
+      "actions": {
+        "scan_now": { "description": "立即扫描全部或指定 watch；同一文件连续两次元数据稳定后产生事件" },
+        "recent_files": { "description": "查询全部或指定 watch 的近期文件元数据，不产生事件" },
+        "watches": { "description": "列出全部或指定文件 watch 配置" }
+      }
+    },
+    "daxiang": {
+      "enabled": false,
+      "command": "node",
+      "args": ["/absolute/path/to/MimiAgent/examples/connectors/daxiang-connector.mjs"],
+      "envAllowlist": ["DX_APP_KEY", "DX_APP_SECRET", "DX_ROBOT_ID", "DX_ENV", "DX_CONTENT_TYPE"],
+      "source": "daxiang",
+      "trust": "external",
+      "profileId": "owner",
+      "restart": true,
+      "deliveryTimeoutMs": 30000,
+      "actionTimeoutMs": 30000,
+      "actions": {
+        "send_message": { "description": "向大象单聊或群聊主动发送文本消息" },
+        "health_check": { "description": "验证大象机器人凭据和官方服务端 API 出站连通性，并明确入站事件订阅仍需外部 relay" }
+      }
+    },
+    "qq": {
+      "enabled": false,
+      "command": "node",
+      "args": ["/absolute/path/to/MimiAgent/examples/connectors/qq-napcat-connector.mjs"],
+      "envAllowlist": ["QQ_ONEBOT_HTTP_URL", "QQ_ONEBOT_WS_PORT", "QQ_ONEBOT_ACCESS_TOKEN", "QQ_ONEBOT_WS_ACCESS_TOKEN", "QQ_ONEBOT_STATUS_POLL_MS", "NC_HTTP_URL", "NC_WS_PORT", "NC_ACCESS_TOKEN", "NC_WS_ACCESS_TOKEN", "NC_STATUS_POLL_MS"],
+      "source": "qq",
+      "trust": "external",
+      "profileId": "owner",
+      "restart": true,
+      "deliveryTimeoutMs": 30000,
+      "actionTimeoutMs": 30000,
+      "actions": {
+        "send_message": { "description": "向 QQ 私聊或群聊主动发送文本消息" },
+        "health_check": { "description": "调用 OneBot get_status 并确认反向 WebSocket 入站连接是否在线" },
+        "recent_conversations": { "description": "通过 OneBot 扩展 API 读取近期 QQ 会话；target 为 all" },
+        "list_friends": { "description": "通过 OneBot API 列出有界好友目录；target 为 all" },
+        "list_groups": { "description": "通过 OneBot API 列出有界群目录；target 为 all" },
+        "friend_history": { "description": "读取指定 QQ 好友的有界历史；target 为 private:<QQ号>" },
+        "group_history": { "description": "读取指定 QQ 群的有界历史；target 为 group:<群号>" }
+      }
+    },
+    "http-action": {
+      "enabled": false,
+      "command": "node",
+      "args": ["/absolute/path/to/MimiAgent/examples/connectors/http-action-connector.mjs"],
+      "envAllowlist": [
+        "MIMI_HTTP_ACTION_URL",
+        "JARVIS_HTTP_ACTION_URL",
+        "MIMI_HTTP_EVENT_URL",
+        "JARVIS_HTTP_EVENT_URL",
+        "MIMI_HTTP_ACTION_TOKEN",
+        "JARVIS_HTTP_ACTION_TOKEN",
+        "MIMI_HTTP_ACTION_TIMEOUT_MS",
+        "JARVIS_HTTP_ACTION_TIMEOUT_MS",
+        "MIMI_HTTP_ACTION_MAX_RESPONSE_BYTES",
+        "JARVIS_HTTP_ACTION_MAX_RESPONSE_BYTES",
+        "MIMI_HTTP_EVENT_POLL_INTERVAL_MS",
+        "JARVIS_HTTP_EVENT_POLL_INTERVAL_MS"
+      ],
+      "source": "http-action",
+      "trust": "external",
+      "profileId": "owner",
+      "restart": true,
+      "healthEvents": true,
+      "healthStabilityMs": 5000,
+      "deliveryTimeoutMs": 30000,
+      "actionTimeoutMs": 30000,
+      "actions": {
+        "request": { "description": "向固定 HTTP relay 执行一个通用外部事务；建议按实际系统替换为明确的 action 名和描述" }
+      }
+    },
+    "macos-system": {
+      "enabled": false,
+      "command": "node",
+      "args": ["/absolute/path/to/MimiAgent/examples/connectors/macos-system-connector.mjs"],
+      "envAllowlist": [
+        "MACOS_SYSTEM_POLL_INTERVAL_MS",
+        "MACOS_SYSTEM_BATTERY_LOW_PERCENT",
+        "MACOS_SYSTEM_BATTERY_CRITICAL_PERCENT",
+        "MACOS_SYSTEM_DISK_MIN_PERCENT",
+        "MACOS_SYSTEM_DISK_MIN_GB",
+        "MACOS_SYSTEM_DISK_PATH",
+        "MACOS_SYSTEM_COMMAND_TIMEOUT_MS"
+      ],
+      "source": "macos-system",
+      "trust": "system",
+      "profileId": "owner",
+      "restart": true,
+      "deliveryTimeoutMs": 30000,
+      "actionTimeoutMs": 30000,
+      "actions": {
+        "system_snapshot": { "description": "读取电池、内存、负载、网络和默认磁盘的有界系统快照；target 为 system 或 all" },
+        "battery_status": { "description": "读取当前电池与供电状态；target 为 battery 或 all" },
+        "network_status": { "description": "读取非 loopback 网络接口和在线状态；target 为 network 或 all" },
+        "storage_status": { "description": "读取默认或绝对路径所在文件系统容量；target 为 storage、default 或绝对路径" }
+      }
+    },
+    "macos-life": {
+      "enabled": false,
+      "command": "node",
+      "args": ["/absolute/path/to/MimiAgent/examples/connectors/macos-life-connector.mjs"],
+      "envAllowlist": ["MIMI_DAEMON_DATA_DIR", "JARVIS_DATA_DIR", "MACOS_POLL_INTERVAL_MS", "MACOS_LOOKAHEAD_MINUTES", "MACOS_LIFE_MAX_ITEMS", "MACOS_LIFE_STATE_FILE", "MACOS_CALENDAR", "MACOS_REMINDER_LIST"],
+      "source": "macos-life",
+      "trust": "external",
+      "profileId": "owner",
+      "restart": true,
+      "deliveryTimeoutMs": 30000,
+      "actionTimeoutMs": 30000,
+      "actions": {
+        "notify": { "description": "发送 macOS 系统通知；target 为标题" },
+        "calendar_list": { "description": "查询 macOS 日历；target 为日历名或 *" },
+        "calendar_create": { "description": "创建 macOS 日程；target 为日历名" },
+        "calendar_update": { "description": "按稳定 UID 修改日程标题、时间、地点、备注或全天状态" },
+        "calendar_delete": { "description": "按稳定 UID 删除日程，可用 payload.calendar 缩小范围" },
+        "reminder_list": { "description": "查询 macOS 提醒事项；target 为列表名或 *" },
+        "reminder_create": { "description": "创建 macOS 提醒事项；target 为列表名" },
+        "reminder_complete": { "description": "完成 macOS 提醒事项；target 为提醒 ID" },
+        "reminder_update": { "description": "按稳定 ID 修改提醒标题、到期时间、备注、优先级、完成或旗标状态" },
+        "reminder_delete": { "description": "按稳定 ID 删除提醒，可用 payload.list 缩小范围" }
+      }
+    },
+    "macos-mail": {
+      "enabled": false,
+      "command": "node",
+      "args": ["/absolute/path/to/MimiAgent/examples/connectors/macos-mail-connector.mjs"],
+      "envAllowlist": ["MACOS_MAIL_POLL_INTERVAL_MS", "MACOS_MAIL_MAX_UNREAD", "MACOS_MAIL_BODY_CHARS", "MACOS_MAIL_ACCOUNT"],
+      "source": "mail",
+      "trust": "external",
+      "profileId": "owner",
+      "restart": true,
+      "deliveryTimeoutMs": 30000,
+      "actionTimeoutMs": 30000,
+      "actions": {
+        "list_unread": { "description": "列出 Apple Mail 未读邮件；target 为账号名或 *" },
+        "search_messages": { "description": "按发件人/主题、已读和旗标筛选统一收件箱；target 为账号名或 *" },
+        "search_mailbox_messages": { "description": "在显式账号和 mailboxPath 中搜索历史邮件；后续按 ID 动作将结果 account/path 作为 payload.source" },
+        "read_message": { "description": "读取单封邮件和附件元数据；target 为 message ID，历史邮件可传 payload.source" },
+        "list_mailboxes": { "description": "递归列出账号邮箱路径；target 为账号名或 *" },
+        "list_attachments": { "description": "列出邮件附件元数据；target 为 message ID，历史邮件可传 payload.source" },
+        "save_attachment": { "description": "保存指定附件到显式绝对路径；target 为 message ID，历史邮件可传 payload.source" },
+        "send_message": { "description": "通过 Apple Mail 发信，可附加本地普通文件；target 为主收件人" },
+        "reply_message": { "description": "回复 Apple Mail 邮件，可附加本地普通文件；历史邮件可传 payload.source" },
+        "mark_read": { "description": "修改 Apple Mail 已读状态；历史邮件可传 payload.source" },
+        "set_flagged": { "description": "设置邮件旗标和 0～6 色号；历史邮件可传 payload.source" },
+        "move_message": { "description": "把邮件移动到显式 account/path；历史邮件可传 payload.source" },
+        "delete_message": { "description": "删除指定邮件；历史邮件可传 payload.source" },
+        "create_draft": { "description": "创建可带本地附件的 Apple Mail 草稿；target 为主收件人" }
+      }
+    },
+    "macos-messages": {
+      "enabled": false,
+      "command": "node",
+      "args": ["/absolute/path/to/MimiAgent/examples/connectors/macos-messages-connector.mjs"],
+      "envAllowlist": ["MACOS_MESSAGES_DB", "MACOS_MESSAGES_POLL_INTERVAL_MS", "MACOS_MESSAGES_MAX_EVENTS", "MACOS_MESSAGES_LOOKBACK_HOURS"],
+      "source": "messages",
+      "trust": "external",
+      "profileId": "owner",
+      "restart": true,
+      "deliveryTimeoutMs": 30000,
+      "actionTimeoutMs": 30000,
+      "actions": {
+        "list_chats": { "description": "列出 Messages 最近会话；target 为 all" },
+        "recent_messages": { "description": "读取会话近期消息；target 为 chat GUID 或 identifier" },
+        "list_attachments": { "description": "列出指定消息的本地附件元数据；target 为 message GUID 或本地 ID" },
+        "save_attachment": { "description": "保存指定消息附件到显式绝对路径；target 为 message GUID 或本地 ID" },
+        "send_message": { "description": "发送 iMessage/SMS/RCS 文本和本地文件；target 为 chat GUID、参与者 ID 或 handle" }
+      }
+    },
+    "macos-contacts": {
+      "enabled": false,
+      "command": "node",
+      "args": ["/absolute/path/to/MimiAgent/examples/connectors/macos-contacts-connector.mjs"],
+      "envAllowlist": [],
+      "source": "contacts",
+      "trust": "external",
+      "profileId": "owner",
+      "restart": true,
+      "deliveryTimeoutMs": 30000,
+      "actionTimeoutMs": 30000,
+      "actions": {
+        "search_contacts": { "description": "按姓名、组织、邮箱或电话查询联系人；target 为关键词或 *" },
+        "get_contact": { "description": "读取联系人详情；target 为稳定 contact ID" },
+        "create_contact": { "description": "创建联系人；target 固定为 new" },
+        "update_contact": { "description": "更新联系人标量字段或追加邮箱/电话；target 为 contact ID" }
+      }
+    },
+    "macos-notes": {
+      "enabled": false,
+      "command": "node",
+      "args": ["/absolute/path/to/MimiAgent/examples/connectors/macos-notes-connector.mjs"],
+      "envAllowlist": [],
+      "source": "notes",
+      "trust": "external",
+      "profileId": "owner",
+      "restart": true,
+      "deliveryTimeoutMs": 30000,
+      "actionTimeoutMs": 30000,
+      "actions": {
+        "list_folders": { "description": "列出 Notes 账号和文件夹；target 为 all、账号名或账号 ID" },
+        "search_notes": { "description": "按标题和纯文本搜索笔记；target 为关键词或 *" },
+        "read_note": { "description": "读取笔记正文和附件元数据；target 为 note ID" },
+        "create_note": { "description": "创建笔记；target 为 default 或 folder ID" },
+        "update_note": { "description": "更新笔记标题或正文；target 为 note ID" },
+        "append_note": { "description": "向笔记追加正文；target 为 note ID" }
+      }
+    },
+    "macos-shortcuts": {
+      "enabled": false,
+      "command": "node",
+      "args": ["/absolute/path/to/MimiAgent/examples/connectors/macos-shortcuts-connector.mjs"],
+      "envAllowlist": [],
+      "source": "shortcuts",
+      "trust": "external",
+      "profileId": "owner",
+      "restart": true,
+      "deliveryTimeoutMs": 30000,
+      "actionTimeoutMs": 900000,
+      "actions": {
+        "list_shortcuts": { "description": "列出全部或指定文件夹中的快捷指令；target 为 all 或文件夹名/ID" },
+        "list_folders": { "description": "列出快捷指令文件夹；target 为 all" },
+        "run_shortcut": { "description": "按名称或 ID 运行快捷指令，支持文本/文件输入和文件/stdout 输出" }
+      }
+    },
+    "macos-desktop": {
+      "enabled": false,
+      "command": "node",
+      "args": ["/absolute/path/to/MimiAgent/examples/connectors/macos-desktop-connector.mjs"],
+      "envAllowlist": [
+        "MIMI_DAEMON_DATA_DIR",
+        "JARVIS_DATA_DIR",
+        "MACOS_DESKTOP_CLIPBOARD_POLL_MS",
+        "MACOS_DESKTOP_CLIPBOARD_EVENT_CHARS",
+        "MACOS_DESKTOP_COMMAND_TIMEOUT_MS",
+        "MACOS_DESKTOP_STATE_FILE"
+      ],
+      "source": "desktop",
+      "trust": "external",
+      "profileId": "owner",
+      "restart": true,
+      "deliveryTimeoutMs": 30000,
+      "actionTimeoutMs": 30000,
+      "actions": {
+        "desktop_context": { "description": "读取前台应用、窗口和可选文本剪贴板上下文；target 为 all" },
+        "frontmost_app": { "description": "读取当前前台应用；target 为 all" },
+        "list_apps": { "description": "列出运行中的应用；target 为 all" },
+        "list_windows": { "description": "列出指定或前台应用的窗口；target 为应用名、bundle ID 或 frontmost" },
+        "activate_app": { "description": "激活应用；target 为应用名或 bundle ID" },
+        "open_item": { "description": "打开 URL 或绝对路径，可选指定应用；target 为 URL/路径" },
+        "clipboard_read": { "description": "读取有界文本剪贴板；target 为 clipboard" },
+        "clipboard_write": { "description": "写入或清空文本剪贴板；target 为 clipboard" },
+        "clipboard_watch_status": { "description": "读取剪贴板感知是否启用及轮询间隔；target 为 clipboard" },
+        "clipboard_watch_start": { "description": "持久启用剪贴板变化感知；target 为 clipboard，可设置 payload.pollIntervalMs" },
+        "clipboard_watch_stop": { "description": "持久停止剪贴板变化感知；target 为 clipboard" },
+        "keyboard_type": { "description": "向指定或前台应用输入有界文本和 modifier；target 为应用名/bundle ID/frontmost" },
+        "keyboard_key": { "description": "向指定或前台应用发送 macOS key code；target 为应用名/bundle ID/frontmost" },
+        "click_menu": { "description": "点击应用的一级菜单项；target 为应用名/bundle ID/frontmost" }
+      }
+    },
+    "macos-browser": {
+      "enabled": false,
+      "command": "node",
+      "args": ["/absolute/path/to/MimiAgent/examples/connectors/macos-browser-connector.mjs"],
+      "envAllowlist": ["MACOS_BROWSER_COMMAND_TIMEOUT_MS"],
+      "source": "browser",
+      "trust": "external",
+      "profileId": "owner",
+      "restart": true,
+      "deliveryTimeoutMs": 30000,
+      "actionTimeoutMs": 30000,
+      "actions": {
+        "list_tabs": { "description": "列出 Safari、Chrome 或全部浏览器标签；target 为 safari、chrome 或 all" },
+        "active_tab": { "description": "读取浏览器最前窗口的当前标签；target 为 safari 或 chrome" },
+        "open_tab": { "description": "用指定浏览器打开 http/https URL；target 为 safari 或 chrome" },
+        "navigate_tab": { "description": "导航指定标签；target 为 safari:<window>:<tab> 或 chrome:<window>:<tab>" },
+        "activate_tab": { "description": "激活指定标签和浏览器" },
+        "close_tab": { "description": "关闭指定标签" },
+        "reload_tab": { "description": "刷新指定标签" },
+        "page_text": { "description": "读取指定标签的有界可见正文" },
+        "execute_javascript": { "description": "在指定标签执行有界 JavaScript DOM 操作" }
+      }
+    },
+    "macos-screen": {
+      "enabled": false,
+      "command": "node",
+      "args": ["/absolute/path/to/MimiAgent/examples/connectors/macos-screen-connector.mjs"],
+      "envAllowlist": ["MACOS_SCREEN_COMMAND_TIMEOUT_MS"],
+      "source": "screen",
+      "trust": "external",
+      "profileId": "owner",
+      "restart": true,
+      "deliveryTimeoutMs": 30000,
+      "actionTimeoutMs": 90000,
+      "actions": {
+        "capture_screen": { "description": "将主屏、display、window 或矩形区域截图保存为显式绝对 PNG 路径" },
+        "ocr_image": { "description": "使用 macOS Vision 对绝对路径图片执行有界本地 OCR" },
+        "read_screen": { "description": "临时截图并 OCR 当前屏幕区域，返回后立即删除图片" }
+      }
+    },
+    "macos-voice": {
+      "enabled": false,
+      "command": "node",
+      "args": ["/absolute/path/to/MimiAgent/examples/connectors/macos-voice-connector.mjs"],
+      "envAllowlist": [
+        "MIMI_DAEMON_DATA_DIR",
+        "JARVIS_DATA_DIR",
+        "MACOS_VOICE_LISTEN",
+        "MACOS_VOICE_LOCALE",
+        "MACOS_VOICE_ON_DEVICE",
+        "MACOS_VOICE_WAKE_PHRASES",
+        "MACOS_VOICE_SEGMENT_SECONDS",
+        "MACOS_VOICE_MAX_CHARS",
+        "MACOS_VOICE_DUPLICATE_WINDOW_MS",
+        "MACOS_VOICE_COMMAND_TIMEOUT_MS",
+        "MACOS_VOICE_REPLY_MAX_CHARS",
+        "MACOS_VOICE_REPLY_RATE",
+        "MACOS_VOICE_STATE_FILE"
+      ],
+      "source": "voice",
+      "trust": "external",
+      "profileId": "owner",
+      "restart": true,
+      "deliveryTimeoutMs": 60000,
+      "actionTimeoutMs": 900000,
+      "actions": {
+        "speak": { "description": "使用 macOS say 朗读文本；target 为 default 或系统 voice 名称" },
+        "list_voices": { "description": "列出系统可用 voice；target 为 all" },
+        "transcribe_audio": { "description": "使用 Speech Framework 转写绝对路径音频文件" },
+        "listener_status": { "description": "读取语音 listener 状态；target 为 listener" },
+        "listener_start": { "description": "启动并持久启用唤醒短语监听，Connector 或 Daemon 重启后继续生效" },
+        "listener_stop": { "description": "停止并持久关闭唤醒短语监听" },
+        "listener_restart": { "description": "重启并持久启用唤醒短语监听" }
+      }
+    }
+  }
+}

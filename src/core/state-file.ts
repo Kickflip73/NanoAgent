@@ -79,7 +79,7 @@ export async function withExclusiveFileLock<R>(
   signal?: AbortSignal,
 ): Promise<R> {
   const digest = createHash('sha256').update(path.resolve(file)).digest('hex');
-  const lockTarget = path.join(os.tmpdir(), 'nano-agent-file-locks', digest);
+  const lockTarget = path.join(os.tmpdir(), 'mimi-agent-file-locks', digest);
   return enqueue(`external:${lockTarget}`, async () => {
     const release = await acquireLock(lockTarget, signal);
     let failed = false;

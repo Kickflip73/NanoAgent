@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "pollIntervalMs": 30000,
+  "lookbackMinutes": 60,
+  "maxEventsPerPoll": 100,
+  "maxScanEntries": 5000,
+  "watches": [
+    {
+      "id": "downloads",
+      "path": "~/Downloads",
+      "recursive": true,
+      "maxDepth": 2,
+      "ignoreHidden": true,
+      "extensions": [".pdf", ".docx", ".xlsx", ".pptx", ".zip", ".png", ".jpg"],
+      "kind": "alert",
+      "priority": 75
+    },
+    {
+      "id": "urgent-inbox",
+      "path": "~/MimiAgent/Inbox",
+      "recursive": false,
+      "ignoreHidden": true,
+      "extensions": [],
+      "kind": "alert",
+      "priority": 90
+    }
+  ]
+}

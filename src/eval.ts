@@ -1,6 +1,7 @@
-import { readFile, rm } from 'node:fs/promises';
+import { copyFile, mkdir, mkdtemp, readFile, rm } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
-import { RagStore } from './extensions/rag.js';
+import { createMemoryHub } from './extensions/memory/hub.js';
 
 interface EvalCase {
   query: string;
@@ -9,18 +10,26 @@ interface EvalCase {
 
 async function main(): Promise<void> {
   const root = process.cwd();
-  const temporaryIndex = path.join(root, '.nano-agent', 'eval-rag-index.json');
+  const temporaryRoot = await mkdtemp(path.join(os.tmpdir(), 'mimi-memory-eval-'));
+  const temporaryData = path.join(temporaryRoot, '.mimi-agent');
   const cases = JSON.parse(await readFile(path.join(root, 'evals', 'cases.json'), 'utf8')) as EvalCase[];
-  const rag = new RagStore(root, temporaryIndex);
-  await rag.index('knowledge');
+  const sources = [...new Set(cases.map((item) => item.expectedSource))];
+  for (const source of sources) {
+    const destination = path.join(temporaryRoot, source);
+    await mkdir(path.dirname(destination), { recursive: true });
+    await copyFile(path.join(root, source), destination);
+  }
+  const hub = await createMemoryHub({ workspaceRoot: temporaryRoot, dataRoot: temporaryData, profileId: 'eval', cutover: false });
+  const context = { profileId: 'eval', workspaceRoot: temporaryRoot, sessionId: 'eval', runId: 'eval', cause: { trust: 'owner' as const, source: 'eval' } };
+  for (const source of sources) await hub.ingest(source, context);
   let passed = 0;
   for (const item of cases) {
-    const matches = await rag.search(item.query, 3);
-    const ok = matches.some((match) => match.source === item.expectedSource);
+    const matches = await hub.search(item.query, context, { scope: 'workspace', limit: 3 });
+    const ok = matches.some((match) => match.sourceRefs.some((source) => source.id === item.expectedSource));
     console.log(`${ok ? '✓' : '✗'} ${item.query}`);
     if (ok) passed += 1;
   }
-  await rm(temporaryIndex, { force: true });
+  await rm(temporaryRoot, { recursive: true, force: true });
   console.log(`\n${passed}/${cases.length} retrieval evals passed`);
   if (passed !== cases.length) process.exitCode = 1;
 }

@@ -1,11 +1,228 @@
 # Changelog
 
+## Unreleased
+
+- remove committed local credentials, machine identifiers, databases, browser captures, personal workspace assets, unrelated demo projects, and unpublished personal Skills from the core repository
+- keep Computer Use tool schemas compatible with current Agents SDK validation while preserving runtime Zod checks
+- declare WebSocket test types directly, make retention tests use trusted ingestion time, and ratchet coverage gates to the measured repository baseline
+- add opt-in macOS Computer Use through Cua Driver with bounded observations and actions, permission-aware policy, protected artifacts, background-first execution, and verified visible handoff
+- progressively disclose bounded owner tools for status, Session, web, and lightweight questions; answer high-confidence status queries directly from bounded Host state without a model round, omit undisclosed Skill catalogs, cap focused history and output reservation, skip automatic memory work for focused requests, and make automatic embedding recall fail fast without retries
+- add a desktop-QQ coexistence setup path for LLOneBot/LLBot, generalize the QQ bridge to preferred `QQ_ONEBOT_*` settings, and retain legacy NapCat compatibility
+- replace the legacy `MemoryStore` and flat RAG index with a unified profile-isolated MemoryHub backed by Markdown Wiki pages, SQLite FTS5/BM25, optional embedding RRF, source receipts and forget suppressions
+- split `MIMI.md` Soul from hierarchical `AGENTS.md` / `CLAUDE.md` project guidance, and replace legacy memory/RAG tools and CLI commands with the canonical `/memory` surface
+- add an atomic one-time backup/conversion marker for usable legacy memories while skipping todo and unconfirmed entries
+- index complete rounds as owner-gated episode evidence and add multi-page compilation plans, supersession intervals, deterministic lint, recurring Error Book entries, audit/conflict/capture commands, and bounded semantic maintenance
+- register terminal Task observations transactionally and consolidate them through low-priority profile-scoped maintenance Tasks with strict tool, evidence, trust, page, retry, and fairness limits
+- back up Mimi SQLite/WAL/SHM and legacy user Soul before cutover, move identifiable owner facts into private Wiki, and auto-create minimal AGENTS guidance only for writable development tasks
+
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
+
+## [Unreleased]
+
+### Changed
+
+- add a detached `codex` background executor that records process/thread artifacts and commits its own terminal result without Mimi fallback or validation
+- split immutable daemon Events from executable Tasks, with atomic schema v12 cutover and no dual-write compatibility path
+- move lease, retry, control, attempt, lifecycle, schedule occurrence, and Outbox ownership to Task IDs
+- separate Event timeline and Task management in daemon CLI/IPC, including Task-only dead-letter retry
+- open the CLI on an unpersisted draft, create its Session only on the first message, and derive evolving topic titles from conversation content
+
+### Fixed
+
+- keep Computer Use configuration out of isolated Task IPC so Codex workers can start, preserve worker initialization errors instead of replacing them with a generic exit, and require task inspection evidence for failure attribution
+- keep explicitly requested visible app handoffs on the user's current desktop and require frontmost observation before reporting success
+- let the CLI connect from any directory, re-adopt a replaced Host's workspace, and recover ordinary commands when the daemon socket is briefly unavailable
+- expose bounded, persistent Codex JSONL progress through task inspection, guide Mimi to use it, and keep prior-attempt errors from masquerading as current running failures
+- make repeated background delegation truly idempotent and provide both Codex and its Node shebang runtime when daemon launchd PATH is minimal
+- stop legacy digested/ignored Events from becoming completed Tasks and safely remove artifact-free phantom Tasks during the backed-up v14 upgrade
+- distinguish conversation executions from delegated background tasks in Mimi activity snapshots and include each recent Task's trigger Event source/type
+- validate the physical v12 Event/Task schema and atomically recover empty half-migrated databases instead of trusting `user_version` alone
+- keep the interactive input cursor clear of Terminal.app's IME wrapping boundary and remove high-frequency status redraws that could trigger native macOS 26 Terminal crashes
+- soft-wrap editable CLI input across multiple terminal rows while preserving explicit newlines and cursor placement
+- clear a non-empty CLI draft with double Escape while retaining the existing single-Escape action
+- keep Up/Down navigation in input history when a recalled entry such as `/help` also matches command suggestions
+- avoid repeating Markdown code gutters inside a source line when delayed streaming chunks flush before its newline
+- let the process supervisor schedule persisted `codex` tasks and forbid failed background work from falling back to execution in the current Session
+- fall back to a readable input width when a TTY temporarily reports zero columns instead of collapsing soft-wrapped input to two characters per row
+
+## [0.11.7] - 2026-07-20 11:47
+
+### Fixed
+
+- remove fixed turn limits (@Kickflip73)
+
+## [0.11.6] - 2026-07-20 11:41
+
+### Fixed
+
+- prevent repeated task execution (@Kickflip73)
+
+## [0.11.5] - 2026-07-20 11:25
+
+### Fixed
+
+- tolerate legacy file residue during upgrade (@Kickflip73)
+
+## [0.11.4] - 2026-07-20 11:15
+
+### Fixed
+
+- harden unattended execution reliability (@Kickflip73)
+
+## [0.11.3] - 2026-07-20 09:57
+
+### Fixed
+
+- bound duplicate execution and delivery (@Kickflip73)
+
+## [0.11.2] - 2026-07-20 00:59
+
+### Fixed
+
+- prevent duplicate connector deliveries (@Kickflip73)
+
+## [0.11.1] - 2026-07-20 00:25
+
+### Fixed
+
+- preserve completion evidence across resumed runs (@Kickflip73)
+
+## [Unreleased]
+
+### Changed
+
+- upgrade the lightweight coding I/O loop with bounded recursive directory discovery, path-only and ripgrep-backed regex/glob/context search, ranged digest-bearing reads, stale-safe unified-diff patches, and private-data-filtered Git change inspection
+- remove generated max-turn defaults and fixed-count repeated-tool termination; normal Agent, SubAgent, and Team runs now stop from durable task state, explicit cancellation, timeout, or an operator-configured limit
+- scope Completion Gate enforcement to explicit persistent Goals, stop replaying whole Events after an unfinished Goal, and reuse consecutive identical side-effect results instead of executing them again
+- harden unattended execution with secret-free Shell environments, full process-group cleanup, public-network-only HTTP requests, persistent Connector inbound ACKs, poison-row quarantine, provider-bound model preferences, build-aware Daemon upgrades, and per-attempt logical side-effect identities
+- replace fixed-count stability patches with evidence-aware completion progress, immutable Event-to-Session binding, route-scoped Outbox lanes, prompt-budgeted briefings, protocol-preserving context compaction, and persisted Connector delivery receipts
+- keep pure answers out of execution gating, isolate stale Goal/Plan/recovery context, preserve delivery suppression across crash recovery, batch briefing/context protocol units, and prevent one blocked IM channel from holding up another
+- disable the generic NapCat OneBot client after a remembered QQ account has an account-specific client, preventing a permanent duplicate reverse-WebSocket reconnect loop
+- keep CLI submission and event streaming alive across transient IPC timeouts, reconcile ambiguous submissions by stable Event ID, and forbid detached Shell work that escapes task ownership
+- require Completion Contracts for execution tasks, keep failed checks inside the current task, and reject terminal success unless real ledger receipts, artifacts, tests and Plan state satisfy every criterion; external actions require confirmed rather than accepted delivery
+- unify active source, tools, scripts, configuration examples, launchd identifiers and OpenClaw bridge names under MimiAgent, with old data handled only by the one-way migration boundary
+- remove QQ/WeChat UI automation from fresh default configuration and document background-only transports: Tencent iLink Bot for Weixin and authenticated NapCat/OneBot for personal QQ
+- keep the macOS NapCat loader, Shell, OneBot state and guarded launcher in the owner-only MimiAgent runtime instead of QQ's App Sandbox container; suppress raw startup logs, migrate duplicate OneBot entries, clear stale QR images before every start, and enable remembered-account quick login only for an exact NapCat-supported QQ build/architecture
+- preserve QQ user/group/message identifiers as strings and add bounded recent-conversation, directory and friend/group history actions to the NapCat connector
+- require OpenClaw Weixin readiness to verify both the Tencent channel account and the MimiAgent bridge, and expose a background health action
+- add bounded local OpenClaw Weixin inbound-history recovery for messages retained in current or deleted session archives without claiming an upstream Tencent history API
+- route OpenClaw Weixin through the inbound-only `inbound_claim` hook (instead of outbound `before_dispatch`), accepting account/sender fields from event or context, text-part bodies, and an explicit account fallback
+- normalize legacy cross-provider assistant message IDs before OpenAI Responses calls, keep HTTP tool schemas portable across strict providers, and treat terminal provider 4xx responses as single-attempt background failures instead of quota-consuming retry storms
+- replace the global single-Agent execution lane with keyed Session actors: the same Session remains FIFO while different Sessions run concurrently under `MIMI_SESSION_MAX_CONCURRENCY`
+- keep one persistent Kernel as the owner of event durability, scheduling, Attention, Connector brokering and Outbox delivery; idle maintenance does not call the model
+- restore the original CLI expectation that authenticated local owner General/Ultra runs have Shell and full built-in execution by default; migrate the legacy template's implicit workspace value, keep Plan and unmatched external events restricted, expose effective execution access in `/status`, and compare the daemon's reported permission so an idle old worker or stale launchd plist is safely replaced
+- treat Event `trust` strictly as provenance: source policies now use fixed `reply` or `work` access (legacy omissions default to `reply`), and durable background tasks recompute that authority from a retained conversation root while malformed roots fail closed
+- let authenticated owner runs use configured Connector actions and explicitly trusted MCP tools without switching the unrelated local file/Shell permission mode; make `/tools` reflect the complete permission-filtered Daemon Host/MCP catalog; enable the native WeChat sender on fresh macOS initialization and wait for cold-started WeChat UI readiness when Accessibility is available
+- keep `connector_action` schemas compact and discover dynamic channel catalogs through exact Connector or keyword-filtered `inspect_mimi_capabilities` queries, avoiding repeated multi-kilobyte tool descriptions
+- make the native WeChat sender honor daemon transaction deadlines, terminate timed-out AppleScript work, and verify that the editor cleared before recording a send as successful; migrate legacy 30-second WeChat timeouts and add missing default macOS connectors without enabling credential-backed channels
+- dead-letter uncertain Connector deliveries on the first failed attempt instead of automatically retrying a message whose remote side effect may already have occurred
+- treat expired `sending` leases as uncertain crash outcomes and dead-letter them atomically; extend the normal Outbox lease beyond every built-in delivery timeout so a live slow send cannot be reclaimed by another worker
+- bound system notification delivery, gate daemon shutdown against Connector/Attention management mutations, and require launchd credentials to exist in the persisted environment file instead of accepting a shell-only key
+- protect native MCP transport calls with the Daemon execution ledger and invalidate SDK tool caches on hot reload, so successful or uncertain external transactions are not silently repeated
+- preserve every resolved non-secret runtime setting across detached and launchd starts, and upgrade an idle same-workspace legacy Daemon before a CLI reuses it while retaining an installed launchd supervisor
+- migrate a legacy built-in Connector command from bare `node` to the packaged absolute Node executable when its script identity still matches, while preserving owner-custom commands; this prevents launchd `ENOENT` restart loops
+- migrate the exact legacy `macos-system` provenance defaults to `source=macos-system` and `trust=system`, so its local health events receive the intended bounded recovery tools
+- distinguish Connector process liveness from inbound/outbound readiness, including explicit unconfirmed UI-automation delivery
+- unify interactive and one-shot usage with MimiAgent Daemon and its durable Owner Session; remove the parallel in-process CLI path and expose only the `mimi` command
+- proxy the original MimiAgent session, model, mode, Skill, MCP, Memory, Plan and Goal CLI controls to the same daemon-owned Agent
+- add non-sending Daxiang and QQ health actions that distinguish configured outbound APIs from missing inbound callback/WebSocket paths
+- rename the product and primary package/CLI/API to MimiAgent, with canonical `MIMI_*` configuration and `MIMI.md`; retain the `MimiAgent` API alias, `AGENT_*`/`JARVIS_*`, `MIMI.md` and safe legacy data-directory compatibility, while removing the old `mimi-agent` shell alias
+- keep `workspace` and `read-only` as explicit fail-closed deployment profiles and apply event policy to Host-provided tools
+- make CLI commands and Daemon events share one serialized `MimiHost`, one `CommandHandler`, and FileSession as the only transcript truth
+- extract a shared AgentRunService and provider bootstrap so interactive CLI and headless events use the same durable run lifecycle
+- retain event-scoped semantic side-effect ledgers until the durable event transaction commits, preventing changed SDK call IDs from replaying successful actions after a crash
+- persist deferred model, mode, output and Session RuntimeActions in completion receipts and replay their effects at most once after a daemon crash
+- bound default CLI snapshots, page complete canonical history and Memory with revision checks, and keep Event/Run/Outbox/Schedule list RPCs on compact summaries with explicit detail lookup
+- authenticate QQ/NapCat reverse WebSocket upgrades, separate optional HTTP/WS credentials, enforce one upstream and bound inbound frames
+- ignore empty Mimi/Nano migration residue while still rejecting two populated runtime roots
+- reject symlinks for automatically discovered workspace and daemon state roots
+- forward live Plan updates and terminal RuntimeEffects from the daemon-owned Agent to the default CLI
+- remove the unused Approval/Mandate execution path and keep its minimal schema through v6 while preserving legacy tables during upgrades
+
+### Added
+
+- add optional durable Codex CLI task execution with progress, cancellation and same-Event fallback to Mimi for independent completion-gate verification
+- add a digest-verified, build-gated and reversible macOS NapCat CLI installer with owner-only OneBot configuration, a background LaunchAgent, persistent private-QQ selection, Tencent Team ID/Apple execution-policy verification before patching, ad-hoc signing of only the patched copy, a prohibited Electron activation policy, and guards that refuse to launch while either system/private ordinary QQ is running or after an upgrade resets the managed entry
+- migrate exact legacy Mimi OneBot HTTP/reverse-WS names to one canonical entry so upgrades cannot bind the same loopback port twice
+- add durable background-task delegation with isolated Task Sessions, bounded OS child-process workers, safe-point pause/resume/cancel controls, persistent blocked-input requests and `/tasks` / `/task` management; write tasks run workspace-exclusively, read tasks may run concurrently, and completion or required-input prompts return through the existing Outbox path without blocking the originating conversation
+- persist running Task pause/cancel intent before acknowledging it, so lost worker IPC or a Kernel restart cannot replay cancelled work or forget a requested pause; cancel takes precedence and recovery settles at a safe durable state
+- authenticate OpenClaw Weixin owner traffic with an exact `ownerSenders` allowlist instead of treating channel pairing as owner identity
+- add conversation-controlled, auto-expiring Attention snooze for deferring non-urgent autonomy and scheduled briefings
+- route voice wake-command results through the reliable Connector Outbox, read bounded replies aloud without self-wakeups, and persist listener enablement across restarts
+- add conversation-controlled persistent clipboard change sensing to the macOS Desktop Connector
+- add the MimiAgent long-running daemon with SQLite WAL inbox/outbox, leases, retries, schedules, run audit, Unix Socket control and macOS launchd installation
+- add per-event provenance with external/public isolation from Session history, Memory, local files, Shell, MCP and external writes
+- add durable completed-execution receipts so a crash between Session completion and Event/Outbox commit does not repeat the model run
+- add isolated NDJSON child-process Connectors and a localhost-only authenticated Webhook for IM, news, weather and automation sources
+- add proactive system/connector notifications with durable delivery acknowledgements
+- add configurable MimiAgent attention policies with quiet hours, autonomous-run budgets, ordered source rules, durable digest items and proactive scheduled briefings
+- add conversation-triggered immediate briefings over the same atomic digest, event and delivery path
+- add self-wakeup tools for one-time follow-ups and bounded recurring routines, with inherited sessions, durable schedules and semantic retry deduplication
+- add self-closing conditional watches that keep advancing a matter until its explicit completion condition is met
+- wake conditional watches immediately on related Session events while retaining interval fallback and resolved cross-channel context
+- add bounded same-Session activity recovery from existing Event and Run records without duplicating workflow state
+- allow same-Session owner corrections to interrupt and cancel superseded active work
+- unify each owner profile across CLI and authenticated Connector sessions, with direct commands treated as urgent
+- route proactive work to each profile's recent owner Connector with bounded expiry and configured fallback
+- invalidate a profile's failed recent Connector route atomically with terminal Outbox fallback
+- archive queued schedule occurrences atomically when their schedule is cancelled
+- add a compact daemon execution contract that consistently drives direct action, durable follow-up, memory and quiet completion
+- add Connector Action Bridge request/result messaging, capability discovery and active Daxiang/QQ message sending
+- add a dependency-free macOS life connector for Calendar, Reminders and notifications, with proactive upcoming, changed, deleted, completed and urgent overdue events plus meeting preparation/follow-up execution guidance
+- add a dependency-free information radar connector for bounded RSS/Atom polling, Open-Meteo threshold events and on-demand snapshots
+- add a dependency-free file activity radar for bounded metadata-only polling of Downloads, shared inboxes and automation outputs
+- turn File Radar into an actionable inbox with two-scan file stability, direct processing guidance and follow-up extraction
+- add a dependency-free Apple Mail connector for unread events, reading, sending, replying, read state and drafts
+- add bounded Apple Mail attachment metadata, atomic explicit saves, and local-file attachments for send, draft and reply workflows
+- add bounded Apple Mail inbox search, recursive mailbox discovery, flags, explicit moves and deletion for autonomous inbox triage
+- make Apple Mail unread events immediately actionable with full-message/attachment triage, direct reply/organization guidance and reply watches
+- add a lightweight macOS Messages connector for read-only incoming/history access and JXA-based iMessage, SMS and RCS sending
+- add bounded Messages attachment metadata, atomic explicit saves, and native file sending for action and Outbox workflows
+- make Messages inbound events reply-safe transactions with contextual history, silent no-op handling, duplicate-reply prevention and follow-up watches
+- add a dependency-free macOS Contacts connector for contact resolution, details, creation and incremental updates
+- add a dependency-free Apple Notes connector for folders, bounded search/read, creation, replacement and append workflows
+- add a dependency-free macOS Shortcuts connector for discovering and running existing personal automations with bounded text, binary and file IO
+- add durable Connector outage and stable-recovery events with restart-flap suppression and Attention-aware owner notifications
+- turn trusted Connector and macOS resource alerts into bounded self-healing transactions with recovery watches and uncertain-action replay protection
+- add a dependency-free macOS desktop connector for app/window context, clipboard awareness, application activation, opening items, menus and keyboard control
+- add hot-reloadable daemon Standing Orders with bounded global and source/kind/actor/conversation-specific substitute-decision policies
+- add a dependency-free Safari/Chrome connector for authenticated tab discovery, navigation, bounded page text and JavaScript DOM actions
+- add a native macOS screen connector for bounded screenshots and local Vision OCR without continuous recording or image history
+- add a native macOS voice connector for wake-phrase owner commands, bounded audio transcription and echo-suppressed system speech
+- add timezone-aware Daily Routines with weekday filters, startup catch-up and event-key idempotency for proactive owner workflows
+- add autonomous long-term memory for durable owner preferences, facts, decisions and commitments, with run provenance, legacy isolation and bounded storage
+- add owner-managed cross-channel people aliases with stable Person sessions, trusted relationship context and person-aware memory recall
+- add idempotent MimiAgent first-run initialization with absolute packaged Connector paths, open-by-default native macOS capabilities, owner-config preservation and a read-only `daemon doctor` covering live Connector outages and dead letters
+- add a zero-dependency macOS system Connector for bounded battery, memory, load, network and storage snapshots plus proactive low-resource and connectivity events
+- complete the macOS life transaction loop with stable-ID Calendar and Reminders update/delete actions, bounded fields and no-replay semantics
+- add atomic, opt-out Connector action catalog upgrades so existing installations gain new built-in capabilities without overwriting owner runtime settings
+- add explicit in-process Connector hot reload with validate-before-swap, in-flight transaction protection and stale notification route cleanup
+- add safe urgent-event preemption for long-running daemon work while preserving single-Agent execution and in-flight tool transactions
+- add explicit same-ID retry and archival controls for Event and Outbox dead letters without automatic replay or approval layers
+- add bounded MimiAgent runtime self-inspection shared by proactive Agent routines and the daemon activity CLI/RPC
+- add dynamic bounded Connector capability inspection and online/offline/disabled action discovery for autonomous channel selection
+- add explicit Apple Mail historical-mailbox search and reusable source locators for read, attachment, reply, flag, move and delete workflows
+- add an owner default reply route so autonomous results, briefings, routines and follow-up schedules can reliably reach a concrete Connector conversation
+- add authenticated callback-relay reply routing with actor/conversation provenance, Connector targets, durable deduplication and explicit no-reply semantics
+- add auditable silent completion for no-change autonomous checks while structurally preserving replies for direct commands
+- add conversational Daily Routine listing, atomic upsert and removal without manual assistant configuration edits
+- invalidate queued Daily Routine triggers before execution when their configuration is changed, disabled or removed
+- add a zero-dependency generic HTTP Connector for cursor-based event intake, closed-loop replies and arbitrary external service transactions
+- add conversational atomic enable/disable control for configured Connectors without exposing credentials or process configuration
+- add conversational Standing Order listing, idempotent addition and removal with immediate daemon decisions
+- add conversational source-, kind-, actor- and conversation-scoped policy management with atomic stable-ID updates
+- add conversational cross-channel People listing, atomic upsert and removal with immediate identity resolution
+- add conversational ordered Attention rule management for immediate run, digest, notify and ignore classification
+- add conversational full-snapshot MimiAgent settings management without overwriting independently managed daemon domains
+- add Agent-triggered Connector hot reload with discoverable config paths and existing in-flight transaction protection
+- add atomic dead-letter escalation for failed events and non-system deliveries with bounded, non-recursive system fallbacks
+- add a hot-reloadable Agent idle watchdog and retry-free graceful daemon shutdown recovery
+- add schema v6 indexed history retention with active/dead-letter reference protection and low-frequency dispatcher maintenance
 
 ## [0.11.0] - 2026-07-14 18:16
 
@@ -19,14 +236,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - add cross-process atomic JSON state, corruption quarantine, run ownership CAS, and an at-most-once ledger for local side-effect tools
 - add workspace/read-only/trusted local permission profiles with workspace-safe defaults and Team builder path confinement
-- add the conflict-free `nano-agent` executable, clean builds, direct OpenAI dependency, coverage command, and Node 22 CI
+- add the conflict-free `mimi-agent` executable, clean builds, direct OpenAI dependency, coverage command, and Node 22 CI
 - persist per-session run checkpoints so interrupted, failed, and process-exited tasks can resume from their latest recorded phase
 - add layered context management with tool-result microcompaction, persistent context collapse, `/compact`, and final complete-turn truncation
 - show recoverable sessions and detailed raw/effective/archive context usage in the CLI
 
 ### Changed
 
-- position NanoAgent as both a lightweight general local Agent product and a reusable bounded multi-Agent orchestration framework
+- position MimiAgent as both a lightweight general local Agent product and a reusable bounded multi-Agent orchestration framework
 - make `/resume` explicitly best-effort, split runtime component initialization and Session-state rendering, and prevent cancelled SDK streams from being marked completed
 - make Team waves atomically claim 1–4 ready tasks, require explicit retry after orphaned leases, and remove unsandboxed Shell from workers
 - make `/resume` combine automatic run progress with Goal, Plan, and Ultra Team state instead of requiring a Goal
@@ -72,15 +289,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - expose model, mode, output, Session, history, runtime status, and MCP lifecycle controls as Agent-callable tools
 - defer destructive Session and terminal changes until the active turn is fully persisted
-- expose both workspace and NanoAgent runtime roots so the Agent can inspect and modify its own code with existing file and Shell tools
+- expose both workspace and MimiAgent runtime roots so the Agent can inspect and modify its own code with existing file and Shell tools
 
 ## [0.8.0] - 2026-07-14
 
 ### Added
 
-- add user-level `~/.nano-agent/NANO.md` and project-level `<workspace>/NANO.md` persistent instructions
+- add user-level `~/.mimi-agent/MIMI.md` and project-level `<workspace>/MIMI.md` persistent instructions
 - reload both instruction files before every Agent turn, with explicit project-over-user precedence
-- add `/instructions` discovery and truncation status plus a project `NANO.md` example
+- add `/instructions` discovery and truncation status plus a project `MIMI.md` example
 
 ## [0.7.1] - 2026-07-14
 
@@ -105,7 +322,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- reposition NanoAgent as a lightweight general-purpose Agent for real work rather than an educational-only example
+- reposition MimiAgent as a lightweight general-purpose Agent for real work rather than an educational-only example
 - split model creation, instructions, hooks, and the Agent composition root into `runtime/`
 - make context trimming token-aware and replace raw JSON history snippets with structured summaries
 - keep complete conversation turns within the context budget and reserve output capacity
@@ -115,7 +332,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- prevent one unavailable MCP Server from blocking NanoAgent startup
+- prevent one unavailable MCP Server from blocking MimiAgent startup
 - retain healthy MCP connections when a hot reload contains an invalid or unavailable replacement
 - prevent Skill resources from escaping their root through traversal or symbolic links
 - preserve legacy Plan JSON while migrating sessions to Goal-aware task state
@@ -208,4 +425,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- publish NanoAgent learning example (@Kickflip73)
+- publish MimiAgent learning example (@Kickflip73)

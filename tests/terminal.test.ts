@@ -124,18 +124,55 @@ test('flushes a one-line answer incrementally before completion', async () => {
   renderer.stop();
 });
 
+test('does not repeat the code gutter when one source line arrives in delayed chunks', async () => {
+  const status = new BufferWriter();
+  const answer = new BufferWriter();
+  answer.isTTY = true;
+  const renderer = new TerminalRenderer(status, answer);
+
+  renderer.start();
+  renderer.handle({
+    type: 'raw_model_stream_event',
+    data: { type: 'output_text_delta', delta: '```js\nconst store = require("./main' },
+  } as RunStreamEvent);
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  renderer.handle({
+    type: 'raw_model_stream_event',
+    data: { type: 'output_text_delta', delta: '/store.js");\n```\n' },
+  } as RunStreamEvent);
+  renderer.finish();
+
+  const plain = answer.value.replace(/\x1b\[[0-9;]*m/g, '');
+  assert.match(plain, /│ const store = require\("\.\/main\/store\.js"\);/);
+  assert.doesNotMatch(plain, /main\s+│\s+\/store/);
+  assert.equal((plain.match(/│/g) ?? []).length, 1);
+});
+
+test('keeps TTY run status static instead of redrawing during IME input', async () => {
+  const status = new BufferWriter();
+  status.isTTY = true;
+  const renderer = new TerminalRenderer(status, new BufferWriter());
+
+  renderer.start();
+  status.value = '';
+  await new Promise((resolve) => setTimeout(resolve, 90));
+
+  assert.equal(status.value, '');
+  renderer.stop();
+});
+
 test('renders a compact project banner without ANSI in plain output', () => {
   const banner = renderBanner({
     version: '0.5.0',
     provider: 'deepseek',
     model: 'deepseek-chat',
     sessionTitle: '优化终端交互',
-    workspaceRoot: '/tmp/NanoAgent',
+    workspaceRoot: '/tmp/MimiAgent',
     skillCount: 2,
     mcpServers: ['filesystem'],
   }, false);
 
-  assert.match(banner, /^NanoAgent v0\.5\.0\n轻量级 Agent 助手\n模型/m);
+  assert.match(banner, /^MimiAgent v0\.5\.0\n全天候个人 Agent\n模型/m);
   assert.match(banner, /优化终端交互/);
   assert.doesNotMatch(banner, /◉|╭|Esc/);
   assert.doesNotMatch(banner, /\x1b/);
@@ -207,7 +244,7 @@ test('filters execution events by output level', () => {
     renderer.handle({
       type: 'run_item_stream_event',
       name: 'tool_output',
-      item: { rawItem: { name: 'read_file' }, output: 'NanoAgent 文件正文' },
+      item: { rawItem: { name: 'read_file' }, output: 'MimiAgent 文件正文' },
     } as unknown as RunStreamEvent);
     renderer.handle({
       type: 'raw_model_stream_event',
@@ -228,12 +265,12 @@ test('filters execution events by output level', () => {
   const tools = render('tools');
   assert.match(tools.status, /read_file/);
   assert.match(tools.status, /● 工具  read_file  \{"path":"README\.md"\}/);
-  assert.match(tools.status, /└ 结果  read_file  NanoAgent 文件正文/);
+  assert.match(tools.status, /└ 结果  read_file  MimiAgent 文件正文/);
 
   const trace = render('trace');
   assert.match(trace.status, /读取 README\.md 并总结/);
   assert.match(trace.status, /\{"path":"README\.md"\}/);
-  assert.match(trace.status, /NanoAgent 文件正文/);
+  assert.match(trace.status, /MimiAgent 文件正文/);
 
   const colored = render('trace', true);
   assert.match(colored.status, /\x1b\[90m◆ Agent\x1b\[0m/);

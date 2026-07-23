@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "pollIntervalMs": 300000,
+  "requestTimeoutMs": 15000,
+  "maxResponseBytes": 2000000,
+  "sources": [
+    {
+      "id": "openai-news",
+      "type": "feed",
+      "url": "https://openai.com/news/rss.xml",
+      "priority": 40,
+      "maxItems": 20,
+      "includeKeywords": [],
+      "excludeKeywords": []
+    },
+    {
+      "id": "shanghai-weather",
+      "type": "open-meteo",
+      "latitude": 31.2304,
+      "longitude": 121.4737,
+      "timezone": "Asia/Shanghai",
+      "horizonHours": 24,
+      "priority": 90,
+      "thresholds": {
+        "precipitationProbability": 80,
+        "windGustKmh": 60,
+        "temperatureHighC": 37,
+        "temperatureLowC": -5,
+        "weatherCodes": [65, 67, 75, 77, 82, 86, 95, 96, 99]
+      }
+    }
+  ]
+}

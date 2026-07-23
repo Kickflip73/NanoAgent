@@ -123,6 +123,47 @@ test('supports shift-enter newlines and command-arrow line jumps', () => {
   terminal.close();
 });
 
+test('clears editable input with double escape without cancelling the active task', () => {
+  const input = new FakeInput();
+  const output = new FakeOutput();
+  const lines: string[] = [];
+  let escapes = 0;
+  const terminal = new InteractiveTerminal([], input as never, output as never);
+  terminal.start({
+    onLine: (line) => lines.push(line),
+    onEscape: () => { escapes += 1; },
+    onExit: () => undefined,
+  });
+
+  for (const character of '需要清空') input.emit('keypress', character, { sequence: character });
+  input.emit('keypress', '', { name: 'escape' });
+  input.emit('keypress', '', { name: 'escape' });
+  input.emit('keypress', '\r', { name: 'return' });
+
+  assert.equal(escapes, 0);
+  assert.deepEqual(lines, []);
+  terminal.close();
+});
+
+test('preserves the single escape action after the double-escape window', async () => {
+  const input = new FakeInput();
+  const output = new FakeOutput();
+  let escapes = 0;
+  const terminal = new InteractiveTerminal([], input as never, output as never);
+  terminal.start({
+    onLine: () => undefined,
+    onEscape: () => { escapes += 1; },
+    onExit: () => undefined,
+  });
+
+  input.emit('keypress', '草', { sequence: '草' });
+  input.emit('keypress', '', { name: 'escape' });
+  await new Promise((resolve) => setTimeout(resolve, 380));
+
+  assert.equal(escapes, 1);
+  terminal.close();
+});
+
 test('keeps editable input history isolated by session', () => {
   const input = new FakeInput();
   const output = new FakeOutput();
@@ -146,7 +187,31 @@ test('keeps editable input history isolated by session', () => {
   terminal.close();
 });
 
-test('keeps queue and animated runtime status above the bottom input box', async () => {
+test('continues browsing history when a recalled entry matches slash command suggestions', () => {
+  const input = new FakeInput();
+  const output = new FakeOutput();
+  const lines: string[] = [];
+  const terminal = new InteractiveTerminal([
+    { value: '/help', description: '帮助' },
+    { value: '/history', description: '历史' },
+  ], input as never, output as never);
+  terminal.start({ onLine: (line) => lines.push(line), onEscape: () => undefined, onExit: () => undefined });
+
+  for (const value of ['普通历史', '/help']) {
+    for (const character of value) input.emit('keypress', character, { sequence: character });
+    input.emit('keypress', '\r', { name: 'return' });
+  }
+  output.value = '';
+  input.emit('keypress', '', { name: 'up' });
+  assert.doesNotMatch(output.value, /帮助|历史/);
+  input.emit('keypress', '', { name: 'up' });
+  input.emit('keypress', '\r', { name: 'return' });
+
+  assert.deepEqual(lines, ['普通历史', '/help', '普通历史']);
+  terminal.close();
+});
+
+test('keeps queue and static runtime status above the bottom input box', async () => {
   const input = new FakeInput();
   const output = new FakeOutput();
   output.columns = 100;
@@ -163,10 +228,88 @@ test('keeps queue and animated runtime status above the bottom input box', async
   ]);
 
   const plain = output.value.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '');
-  assert.match(plain, /↳ 排队  排队中的第一条对话内容\n↳ 排队.*\.\.\.\n⠋ 运行中 · 模式 编码 · 模型 deepseek-chat · 上下文 1\.2k\/128k\n┊>/);
+  assert.match(plain, /↳ 排队  排队中的第一条对话内容\n↳ 排队.*\.\.\.\n● 运行中 · 模式 编码 · 模型 deepseek-chat · 上下文 1\.2k\/128k\n┊>/);
   output.value = '';
   await new Promise((resolve) => setTimeout(resolve, 90));
-  assert.match(output.value.replace(/\x1b\[[0-9;]*[A-Za-z]/g, ''), /⠙ 运行中/);
+  assert.equal(output.value, '');
+  terminal.close();
+});
+
+test('keeps the input cursor away from the right edge for IME composition', () => {
+  const input = new FakeInput();
+  const output = new FakeOutput();
+  output.columns = 32;
+  const terminal = new InteractiveTerminal([], input as never, output as never);
+  terminal.start({ onLine: () => undefined, onEscape: () => undefined, onExit: () => undefined });
+  output.value = '';
+
+  for (const character of 'a'.repeat(80)) input.emit('keypress', character, { sequence: character });
+
+  const cursorColumns = [...output.value.matchAll(/\x1b\[(\d+)C/g)]
+    .map((match) => Number(match[1]));
+  assert.ok(cursorColumns.length > 0);
+  assert.ok(cursorColumns.every((column) => column <= 16));
+  terminal.close();
+});
+
+test('soft-wraps long editable input to the current terminal width', () => {
+  const input = new FakeInput();
+  const output = new FakeOutput();
+  output.columns = 32;
+  const terminal = new InteractiveTerminal([], input as never, output as never);
+  terminal.start({ onLine: () => undefined, onEscape: () => undefined, onExit: () => undefined });
+
+  for (const character of 'abcdefghijklmnopqrst') input.emit('keypress', character, { sequence: character });
+  output.value = '';
+  terminal.setRuntimeStatus({ mode: '标准', model: 'test', contextUsed: 0, contextWindow: 0 });
+
+  const plain = output.value.replace(/\x1b\[[?0-9;]*[A-Za-z~]/g, '');
+  assert.match(plain, /┊> abcdefghijklm\n┊  nopqrst/);
+  assert.match(output.value, /\x1b\[10C$/);
+
+  output.value = '';
+  output.columns = 52;
+  output.emit('resize');
+  const resized = output.value.replace(/\x1b\[[?0-9;]*[A-Za-z~]/g, '');
+  assert.match(resized, /┊> abcdefghijklmnopqrst/);
+  assert.doesNotMatch(resized, /┊  nopqrst/);
+  terminal.close();
+});
+
+test('uses a readable fallback width while the TTY reports zero columns', () => {
+  const input = new FakeInput();
+  const output = new FakeOutput();
+  output.columns = 0;
+  const terminal = new InteractiveTerminal([], input as never, output as never);
+  terminal.start({ onLine: () => undefined, onEscape: () => undefined, onExit: () => undefined });
+  output.value = '';
+
+  for (const character of 'abcdefghijklmnopqrstuvwxyz') {
+    input.emit('keypress', character, { sequence: character });
+  }
+
+  const plain = output.value.replace(/\x1b\[[?0-9;]*[A-Za-z~]/g, '');
+  assert.match(plain, /┊> abcdefghijklmnopqrstuvwxyz/);
+  assert.doesNotMatch(plain, /\n┊  /);
+  terminal.close();
+});
+
+test('wraps wide characters without splitting explicit input lines', async () => {
+  const input = new FakeInput();
+  const output = new FakeOutput();
+  output.columns = 32;
+  const lines: string[] = [];
+  const terminal = new InteractiveTerminal([], input as never, output as never);
+  terminal.start({ onLine: (line) => lines.push(line), onEscape: () => undefined, onExit: () => undefined });
+  output.value = '';
+
+  input.emit('data', Buffer.from('\x1b[200~甲乙丙丁戊己庚\n辛壬癸\x1b[201~'));
+
+  const plain = output.value.replace(/\x1b\[[?0-9;]*[A-Za-z~]/g, '');
+  assert.match(plain, /┊> 甲乙丙丁戊己\n┊  庚\n┊  辛壬癸/);
+  await Promise.resolve();
+  input.emit('keypress', '\r', { name: 'return' });
+  assert.deepEqual(lines, ['甲乙丙丁戊己庚\n辛壬癸']);
   terminal.close();
 });
 
