@@ -34,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- serialize Attention configuration updates across processes so concurrent rule, routine, people, and settings mutations cannot overwrite each other
 - keep Computer Use configuration out of isolated Task IPC so Codex workers can start, preserve worker initialization errors instead of replacing them with a generic exit, and require task inspection evidence for failure attribution
 - keep explicitly requested visible app handoffs on the user's current desktop and require frontmost observation before reporting success
 - let the CLI connect from any directory, re-adopt a replaced Host's workspace, and recover ordinary commands when the daemon socket is briefly unavailable

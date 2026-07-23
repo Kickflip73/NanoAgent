@@ -4,6 +4,7 @@ import path from 'node:path';
 import { z } from 'zod';
 import { computerAccessSchema, type ComputerAccess } from '../extensions/computer/types.js';
 import { sessionIdSchema } from '../core/session-id.js';
+import { withExclusiveFileLock } from '../core/state-file.js';
 import {
   decideEvent,
   derivedSessionId,
@@ -924,7 +925,7 @@ export class AttentionEngine {
   }
 
   private async mutateConfig(mutator: (config: AttentionConfig) => AttentionConfig): Promise<void> {
-    const operation = this.configMutation.then(async () => {
+    const operation = this.configMutation.then(() => withExclusiveFileLock(this.configFile, async () => {
       const current = await AttentionEngine.read(this.configFile);
       const next = attentionConfigSchema.parse(mutator(structuredClone(current)));
       if (JSON.stringify(next) === JSON.stringify(current)) {
@@ -939,7 +940,7 @@ export class AttentionEngine {
       } finally {
         await rm(temporary, { force: true });
       }
-    });
+    }));
     this.configMutation = operation.catch(() => undefined);
     await operation;
   }
