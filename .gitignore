@@ -16,3 +16,16 @@ tmp/
 docs/sessions/
 hand_landmarker.task
 .package-smoke-*/
+
+# Runtime credentials, identities, databases, and browser artifacts
+data/
+*.db
+*.db-wal
+*.db-shm
+.playwright-cli/
+
+# Local visual and connector artifacts
+screenshots/
+recordings/
+computer-artifacts/
+*.local-identity

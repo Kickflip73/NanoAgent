@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { MimiAgent } from './agent.js';
+import { SECURITY_PROFILES } from './config.js';
 import type { MemoryRef, MemoryScope } from './core/memory.js';
 import type { SessionSummary } from './core/session.js';
 import { OUTPUT_LEVELS, type OutputLevel } from './terminal.js';
@@ -141,6 +142,7 @@ export interface CommandTarget {
 
 export const COMMANDS = [
   { value: '/status', description: '查看运行状态' },
+  { value: '/security', description: '查看安全档位、权限边界和切换方式' },
   { value: '/model', description: '查看或切换模型' },
   { value: '/mode', description: '查看或切换运行模式' },
   { value: '/output', description: '调整执行过程展示等级' },
@@ -169,6 +171,7 @@ export const COMMANDS = [
 
 const HELP = `内置命令：
   /status             查看模型、会话和扩展状态
+  /security           查看 Safe / Workstation / Full Owner 权限边界
   /model [name]       查看或切换当前模型
   /mode [name]        查看或切换运行模式
   /output [level]     调整答案、思考、工具或详细事件展示
@@ -321,7 +324,7 @@ export class CommandHandler {
 
     if (command === '/exit') return 'exit';
     if (command === '/help') return this.handled(HELP);
-    const draftSafeCommands = new Set(['/new', '/sessions', '/session', '/switch', '/tasks', '/task']);
+    const draftSafeCommands = new Set(['/new', '/sessions', '/session', '/switch', '/tasks', '/task', '/security']);
     if (this.agent.sessionReady === false && !draftSafeCommands.has(command ?? '')) {
       return this.handled('当前是尚未创建的新对话。发送第一条消息后才会创建 Session；也可以先用 /sessions 切换到已有对话。');
     }
@@ -334,9 +337,15 @@ export class CommandHandler {
           : info.permissionMode === 'workspace'
             ? '工作区受限（Shell 关闭）'
             : '只读（Shell 关闭）';
+      const securityLabel = info.securityProfile?.label ?? (
+        info.permissionMode === 'trusted'
+          ? 'Full Owner'
+          : info.permissionMode === 'workspace' ? 'Workstation' : 'Safe'
+      );
       return this.handled([
         `模型      ${info.provider} / ${info.model}`,
         `模式      ${info.mode.label}`,
+        `安全档位  ${securityLabel}`,
         `执行      ${executionAccess}`,
         `输出      ${this.ui.getOutputLevel?.() ?? 'tools'}`,
         `会话      ${info.sessionId}`,
@@ -347,6 +356,32 @@ export class CommandHandler {
         `MCP       ${info.mcpServers.join(', ') || '未连接'}`,
         `Team      ${info.team.total ? `${info.team.completed}/${info.team.total} 完成 · ${info.team.running} 运行` : '未启用'}`,
         `Guidance  ${info.guidanceFiles.length ? `${info.guidanceFiles.length} 个已加载` : '未配置'}`,
+      ].join('\n'));
+    }
+    if (command === '/security') {
+      const info = await this.agent.runtimeInfo();
+      const active = info.securityProfile?.id ?? (
+        info.permissionMode === 'trusted'
+          ? 'full-owner'
+          : info.permissionMode === 'workspace' ? 'workstation' : 'safe'
+      );
+      const capabilities = (profile: keyof typeof SECURITY_PROFILES): string => {
+        const value = SECURITY_PROFILES[profile];
+        return [
+          value.shell ? 'Shell' : '无 Shell',
+          value.externalTransactions ? '外部写事务' : '无外部写事务',
+          value.computerUse ? 'Computer Use' : '无 Computer Use',
+          value.trustedWorkspaceMcp ? '受信工作区 MCP' : '无受信工作区 MCP',
+        ].join(' · ');
+      };
+      return this.handled([
+        `当前档位  ${SECURITY_PROFILES[active].label} (${active}/${info.permissionMode ?? SECURITY_PROFILES[active].permissionMode})`,
+        `${active === 'safe' ? '●' : '○'} Safe        只读工作区 · ${capabilities('safe')}`,
+        `${active === 'workstation' ? '●' : '○'} Workstation 工作区可写 · ${capabilities('workstation')}`,
+        `${active === 'full-owner' ? '●' : '○'} Full Owner  当前 OS 用户权限 · ${capabilities('full-owner')}`,
+        '',
+        '切换方式：在受保护的 ~/.mimi-agent/.env 中设置 MIMI_SECURITY_PROFILE=safe|workstation|full-owner，',
+        '并移除冲突的 MIMI_PERMISSION_MODE 或设为对应 read-only|workspace|trusted，然后安全重启 MimiAgent。',
       ].join('\n'));
     }
     if (command === '/model') {

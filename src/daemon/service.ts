@@ -10,6 +10,7 @@ import { parse as parseDotenv } from 'dotenv';
 import {
   preferredEnvironmentValue,
   resolveEnvironmentFile,
+  securityProfileSummary,
   type AgentPermissionMode,
   type AppConfig,
 } from '../config.js';
@@ -43,6 +44,18 @@ import { MimiWebhookServer } from './webhook.js';
 import { AttentionEngine } from './attention.js';
 import { TaskProcessSupervisor } from './task-supervisor.js';
 import { backgroundTaskSummary, inspectBackgroundTaskSummary } from './task-tools.js';
+import { buildDaemonHealth, type DaemonHealthSnapshot } from './health-model.js';
+import {
+  inspectDiagnosticStorage,
+  type DiagnosticStorageSnapshot,
+} from './diagnostics.js';
+import { rotateDaemonLogs } from './log-maintenance.js';
+import {
+  BACKGROUND_DEFAULTS_VERSION,
+  defaultConnectorEnabled,
+  LEGACY_VISIBLE_MACOS_CONNECTORS,
+  legacyVisibleConnectorsToDisable,
+} from './background-defaults.js';
 import { createMimiCommandHostTools } from './host-tools.js';
 import {
   MimiLiveEvents,
@@ -296,20 +309,6 @@ const CONNECTOR_TEMPLATE_ROOTS = [
   '/absolute/path/to/MimiAgent',
   '/absolute/path/to/MimiAgent',
 ] as const;
-const DEFAULT_MACOS_CONNECTORS = new Set([
-  'macos-system',
-  'macos-life',
-  'macos-mail',
-  'macos-messages',
-  'macos-contacts',
-  'macos-notes',
-  'macos-shortcuts',
-  'macos-desktop',
-  'macos-browser',
-  'macos-screen',
-  'macos-voice',
-]);
-
 export interface MimiInitialization {
   root: string;
   connectors: { file: string; created: boolean; updatedActions: number; total: number; enabled: string[] };
@@ -339,6 +338,7 @@ export interface MimiDoctorReport {
   daemon: {
     running: boolean;
     status?: DaemonStatus;
+    health?: DaemonHealthSnapshot;
     activity?: {
       needsAttention: boolean;
       workPending: number;
@@ -353,6 +353,7 @@ export interface MimiDoctorReport {
     ready?: boolean;
     diagnostics?: Record<string, unknown>;
   };
+  storage?: DiagnosticStorageSnapshot;
   issues: string[];
   nextActions: string[];
 }
@@ -489,9 +490,10 @@ function localConnectorConfig(
   platform: NodeJS.Platform,
 ): ConnectorFileConfig {
   return {
+    backgroundDefaultsVersion: BACKGROUND_DEFAULTS_VERSION,
     connectors: Object.fromEntries(Object.entries(template.connectors).map(([id, connector]) => [id, {
       ...connector,
-      enabled: platform === 'darwin' && DEFAULT_MACOS_CONNECTORS.has(id),
+      enabled: defaultConnectorEnabled(id, platform),
       command: connector.command === 'node' ? process.execPath : connector.command,
       args: connector.args.map((argument) => CONNECTOR_TEMPLATE_ROOTS.reduce(
         (resolved, placeholder) => resolved.replaceAll(placeholder, root),
@@ -562,6 +564,27 @@ async function mergeTemplateActions(
   let updatedActions = 0;
   let changed = false;
   const connectors = { ...current.connectors };
+  let backgroundDefaultsVersion = current.backgroundDefaultsVersion;
+  if (backgroundDefaultsVersion < BACKGROUND_DEFAULTS_VERSION) {
+    const canonical = new Set<string>();
+    for (const id of LEGACY_VISIBLE_MACOS_CONNECTORS) {
+      const connector = connectors[id];
+      const packaged = template.connectors[id];
+      if (!connector?.enabled || !packaged || !await sameConnectorScript(connector, packaged)) continue;
+      canonical.add(id);
+    }
+    const defaults = legacyVisibleConnectorsToDisable(
+      backgroundDefaultsVersion,
+      Object.fromEntries(Object.entries(connectors).map(([id, connector]) => [id, connector.enabled])),
+      canonical,
+    );
+    for (const id of defaults.disabled) {
+      const connector = connectors[id]!;
+      connectors[id] = { ...connector, enabled: false };
+    }
+    backgroundDefaultsVersion = defaults.version;
+    changed ||= defaults.changed;
+  }
   for (const migration of LEGACY_IM_CONNECTORS) {
     const legacy = connectors[migration.legacy];
     if (!legacy?.enabled || !connectors[migration.preferred]?.enabled) continue;
@@ -609,7 +632,7 @@ async function mergeTemplateActions(
       actions: { ...Object.fromEntries(missing), ...connector.actions },
     };
   }
-  return { config: { connectors }, updatedActions, changed };
+  return { config: { backgroundDefaultsVersion, connectors }, updatedActions, changed };
 }
 
 export async function initializeMimi(
@@ -781,16 +804,33 @@ export async function doctorMimi(config: AppConfig): Promise<MimiDoctorReport> {
     && connector.readiness.inbound === 'unavailable'
     && connector.readiness.outbound === 'unavailable'
   )) ?? [];
-  if (offlineConnectors.length) {
-    issues.push(`${offlineConnectors.length} 个已启用 Connector 离线：${offlineConnectors.map((connector) => connector.id).join(', ')}`);
-  }
-  if (unavailableConnectors.length) {
-    issues.push(`${unavailableConnectors.length} 个 Connector 进程在线但渠道不可用：${unavailableConnectors.map((connector) => connector.id).join(', ')}`);
-  }
   const taskDeadLetters = activity?.tasks.dead_letter ?? 0;
   const outboxDeadLetters = activity?.outbox.dead_letter ?? 0;
-  if (taskDeadLetters) issues.push(`${taskDeadLetters} 个任务进入 dead letter`);
-  if (outboxDeadLetters) issues.push(`${outboxDeadLetters} 个消息投递进入 dead letter`);
+  const health = daemonStatus
+    ? daemonStatus.health ?? buildDaemonHealth({
+        tasks: activity?.tasks ?? daemonStatus.tasks,
+        outbox: activity?.outbox ?? daemonStatus.outbox,
+        pendingDigest: activity?.pendingDigest,
+        connectors: runtimeConnectors,
+        checkedAt: activity?.generatedAt,
+      })
+    : undefined;
+  if (health) issues.push(...health.risks.map((risk) => risk.message));
+  let storage: DiagnosticStorageSnapshot | undefined;
+  try {
+    storage = await inspectDiagnosticStorage(config);
+    if (storage.capacity.database !== 'ok') {
+      issues.push(`SQLite 容量达到 ${storage.capacity.database} 阈值`);
+    }
+    if (storage.capacity.logs !== 'ok') {
+      issues.push(`Daemon 日志容量达到 ${storage.capacity.logs} 阈值`);
+    }
+    if (storage.capacity.memory !== 'ok') {
+      issues.push(`Memory 容量达到 ${storage.capacity.memory} 阈值`);
+    }
+  } catch (error) {
+    issues.push(`无法读取本地容量指标：${error instanceof Error ? error.message : String(error)}`);
+  }
   const nextActions: string[] = [];
   if (!connectorConfig) nextActions.push('运行 mimi 完成自动初始化');
   if (!configured) nextActions.push(`在 ~/.mimi-agent/.env（或旧目录）配置 ${config.provider === 'deepseek' ? 'DEEPSEEK_API_KEY' : 'OPENAI_API_KEY'}`);
@@ -800,10 +840,20 @@ export async function doctorMimi(config: AppConfig): Promise<MimiDoctorReport> {
   if (missingScripts.length) nextActions.push('重新运行 npm install 或修复 Connector 脚本路径');
   if (missingBinaries.length) nextActions.push('安装或恢复缺失的 macOS 系统命令');
   if (!daemonStatus && configured && connectorConfig) nextActions.push('运行 mimi，后台服务会自动启动');
-  if (offlineConnectors.length) nextActions.push('mimi daemon connectors reload');
-  if (unavailableConnectors.length) nextActions.push('mimi daemon connectors');
-  if (taskDeadLetters) nextActions.push('mimi daemon tasks');
-  if (outboxDeadLetters) nextActions.push('mimi daemon outbox');
+  if (health) {
+    for (const action of health.risks.map((risk) => risk.nextAction)) {
+      if (!nextActions.includes(action)) nextActions.push(action);
+    }
+  }
+  if (storage?.capacity.database !== undefined && storage.capacity.database !== 'ok') {
+    nextActions.push('运行 mimi daemon activity 检查保留策略和积压，再安排数据库备份与维护');
+  }
+  if (storage?.capacity.logs !== undefined && storage.capacity.logs !== 'ok') {
+    nextActions.push('安全重启 MimiAgent 以轮转超限日志，并检查重复错误');
+  }
+  if (storage?.capacity.memory !== undefined && storage.capacity.memory !== 'ok') {
+    nextActions.push('检查 MemoryHub 页面、索引和备份增长');
+  }
   return {
     ready: issues.length === 0,
     platform,
@@ -829,6 +879,7 @@ export async function doctorMimi(config: AppConfig): Promise<MimiDoctorReport> {
     daemon: {
       running: Boolean(daemonStatus),
       ...(daemonStatus ? { status: daemonStatus } : {}),
+      ...(health ? { health } : {}),
       ...(activity ? {
         activity: {
           needsAttention: activity.needsAttention,
@@ -844,6 +895,7 @@ export async function doctorMimi(config: AppConfig): Promise<MimiDoctorReport> {
       ...(config.computer ? { backend: config.computer.backend, ready: computerReady } : {}),
       ...(computerDiagnostics ? { diagnostics: computerDiagnostics } : {}),
     },
+    ...(storage ? { storage } : {}),
     issues,
     nextActions,
   };
@@ -854,7 +906,7 @@ export function daemonLaunchEnvironment(config: AppConfig): Record<string, strin
   const session = preferredEnvironmentValue('MIMI_SESSION', 'AGENT_SESSION') ?? 'mimi-system';
   const environment: Record<string, string> = {
     MIMI_MODEL_PROVIDER: config.provider,
-    MIMI_CONFIG_VERSION: '3',
+    MIMI_CONFIG_VERSION: '4',
     MIMI_WORKSPACE: config.workspaceRoot,
     AGENT_WORKSPACE: config.workspaceRoot,
     MIMI_DATA_DIR: config.dataRoot,
@@ -865,6 +917,7 @@ export function daemonLaunchEnvironment(config: AppConfig): Record<string, strin
     MIMI_HISTORY_LIMIT: String(config.historyLimit),
     MIMI_TEAM_MAX_CONCURRENCY: String(config.teamMaxConcurrency ?? 4),
     MIMI_PERMISSION_MODE: config.permissionMode ?? 'trusted',
+    MIMI_SECURITY_PROFILE: securityProfileSummary(config).id,
     MIMI_SESSION: session,
     AGENT_SESSION: session,
     MIMI_CONNECTORS_CONFIG: paths.connectorsConfig,
@@ -953,6 +1006,7 @@ export async function installMimiLaunchAgent(config: AppConfig): Promise<string>
   await chmod(file, 0o600);
   const domain = `gui/${process.getuid?.() ?? 0}`;
   await launchctl(['bootout', domain, file], true);
+  await rotateDaemonLogs(paths);
   await launchctl(['bootstrap', domain, file]);
   return file;
 }
@@ -1043,11 +1097,22 @@ export async function runMimiDaemon(config: AppConfig): Promise<void> {
     const activeAttention = attention;
     const activeStatus = () => {
       const taskWorkers = activeTaskSupervisor.status();
-      return {
+      const status = {
         ...activeDispatcher.status(),
         activeTaskCount: taskWorkers.length,
         taskWorkers,
         activeHostMutations: mutationGate.active,
+      };
+      const activity = store.activitySnapshot(1);
+      return {
+        ...status,
+        health: buildDaemonHealth({
+          tasks: status.tasks,
+          outbox: status.outbox,
+          pendingDigest: activity.pendingDigest,
+          connectors: activeConnectors.listCapabilities(),
+          checkedAt: activity.generatedAt,
+        }),
       };
     };
     const taskSummaryWithRuntime = (task: ReturnType<MimiStore['getTask']>) => {
@@ -1098,6 +1163,7 @@ export async function runMimiDaemon(config: AppConfig): Promise<void> {
         protocolVersion: DAEMON_PROTOCOL_VERSION,
         buildVersion: MIMI_BUILD_VERSION,
         permissionMode: config.permissionMode ?? 'trusted',
+        securityProfile: securityProfileSummary(config),
         ...activeStatus(), connectorCount: activeConnectors.size, webhookAddress: activeWebhook?.address,
         attention: activeAttention.status(), workspaceRoot: config.workspaceRoot,
       };
@@ -1464,6 +1530,7 @@ export async function startMimiDaemon(config: AppConfig): Promise<DaemonStatus> 
     if (!entry) throw new Error('无法确定 MimiAgent 启动入口');
     mkdirSync(paths.root, { recursive: true, mode: 0o700 });
     chmodSync(paths.root, 0o700);
+    await rotateDaemonLogs(paths);
     const stdout = openSync(paths.stdoutLog, 'a', 0o600);
     const stderr = openSync(paths.stderrLog, 'a', 0o600);
     try {

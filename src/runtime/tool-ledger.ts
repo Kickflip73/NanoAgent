@@ -1,9 +1,10 @@
 import type { Tool } from '@openai/agents';
 import { createHash } from 'node:crypto';
 import type { ExecutionLedger } from '../core/execution-ledger.js';
+import { TOOL_LEDGER_ARGUMENTS } from '../core/tool-metadata.js';
 import { isSideEffectTool } from './tool-policy.js';
 
-export const TOOL_LEDGER_ARGUMENTS = Symbol('mimi.toolLedgerArguments');
+export { TOOL_LEDGER_ARGUMENTS } from '../core/tool-metadata.js';
 
 interface RunIdentity {
   sessionId: string;

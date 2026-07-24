@@ -1,8 +1,9 @@
-import { OpenAIChatCompletionsModel, type AgentInputItem, type Model } from '@openai/agents';
+import { OpenAIChatCompletionsModel, type AgentInputItem } from '@openai/agents';
 import OpenAI from 'openai';
 import type { AppConfig } from '../config.js';
+import type { AgentModel } from '../extensions/model-port.js';
 
-export type AgentModel = string | Model;
+export type { AgentModel } from '../extensions/model-port.js';
 
 export interface ModelRuntime {
   model: AgentModel;

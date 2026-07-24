@@ -54,6 +54,12 @@ export const AGENT_MODES = [
       '子 Agent 是隔离上下文的执行者，不应继续委派。不要创建无意义角色或让多人重复同一工作。',
     ].join('\n'),
   },
-] as const;
+] as const satisfies readonly {
+  id: AgentMode;
+  label: string;
+  description: string;
+  instruction: string;
+}[];
+import type { AgentMode } from '../core/agent-mode.js';
 
-export type AgentMode = typeof AGENT_MODES[number]['id'];
+export type { AgentMode } from '../core/agent-mode.js';

@@ -16,6 +16,7 @@ export interface ConnectorCapabilitySnapshot {
   online: number;
   inboundReady: number;
   outboundReady: number;
+  stale: number;
   actions: number;
   truncated: boolean;
   connectors: Array<{
@@ -26,6 +27,9 @@ export interface ConnectorCapabilitySnapshot {
       inbound: 'ready' | 'unavailable' | 'unknown';
       outbound: 'ready' | 'unavailable' | 'unknown';
       deliveryConfirmed?: boolean;
+      reportedAt?: string;
+      freshUntil?: string;
+      stale?: boolean;
     };
     source: string;
     actions: Array<{ name: string; description: string }>;
@@ -111,8 +115,11 @@ export function connectorCapabilitySnapshot(
     total: all.length,
     enabled: all.filter((connector) => connector.enabled).length,
     online: all.filter((connector) => connector.online).length,
-    inboundReady: all.filter((connector) => connector.online && connector.readiness.inbound === 'ready').length,
-    outboundReady: all.filter((connector) => connector.online && connector.readiness.outbound === 'ready').length,
+    inboundReady: all.filter((connector) => connector.online
+      && connector.readiness.stale !== true && connector.readiness.inbound === 'ready').length,
+    outboundReady: all.filter((connector) => connector.online
+      && connector.readiness.stale !== true && connector.readiness.outbound === 'ready').length,
+    stale: all.filter((connector) => connector.online && connector.readiness.stale === true).length,
     actions: actionCount,
     truncated: all.length > visible.length || actionCount > visibleActions || truncatedDescription,
     connectors: visible,

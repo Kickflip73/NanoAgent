@@ -19,6 +19,7 @@ import { FileSession, registerSessionRunOwner } from '../src/core/session.js';
 import { TeamTaskStore } from '../src/core/team.js';
 import { TraceStore } from '../src/core/trace.js';
 import { HookBus } from '../src/runtime/hooks.js';
+import { createPlanTools } from '../src/runtime/plan-tools.js';
 import { decideEvent } from '../src/daemon/policy.js';
 import {
   collectTrustedMcpEnvironment,
@@ -1116,7 +1117,7 @@ test('set_goal preserves the prepared Completion Contract and runs state isolati
     }],
   };
   let isolated = false;
-  const setGoal = plans.createTools({
+  const setGoal = createPlanTools(plans, {
     beforeGoalSet: () => { isolated = true; },
     completionContract: () => contract,
   }).find((candidate) => candidate.name === 'set_goal');

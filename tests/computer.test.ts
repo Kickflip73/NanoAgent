@@ -163,6 +163,7 @@ test('enforces image capability and application allowlist', async () => {
 test('computer tools respect mode and deployment permission boundaries', async () => {
   const { manager, authority } = await fixture();
   const tools = createComputerTools(manager, () => authority);
+  assert.ok(tools.every((item) => item.type === 'function' && item.strict === false));
   assert.deepEqual(toolsForMode('plan', tools).map((item) => item.name), ['computer_observe']);
   assert.deepEqual(toolsForPermission('workspace', tools).map((item) => item.name), []);
   assert.deepEqual(toolsForPermission('read-only', tools).map((item) => item.name), []);

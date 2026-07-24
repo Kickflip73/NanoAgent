@@ -1,3 +1,4 @@
+import path from 'node:path';
 import type { AppConfig } from '../config.js';
 import type { MimiSchedulePage } from './types.js';
 
@@ -5,6 +6,10 @@ export function daemonHelp(): string {
   return `MimiAgent 后台维护（正常使用只需运行 mimi）：
   mimi daemon status                      查看状态
   mimi daemon doctor                      检查本机就绪度与下一步
+  mimi daemon diagnostics [输出文件]       生成不含正文、目标、Token 和私人 Memory 的脱敏诊断包
+  mimi daemon backup [输出目录]            创建带哈希清单和 SQLite 完整性检查的恢复备份
+  mimi daemon backup verify <备份目录>     校验备份文件、摘要与数据库完整性
+  mimi daemon restore <备份目录>           仅向离线且不存在的空白数据目录恢复
   mimi daemon activity [数量]              查看积压、失败与近期活动
   mimi daemon events [数量]                查看不可变事件时间线
   mimi daemon tasks [数量]                 查看任务队列与执行状态
@@ -62,6 +67,45 @@ export async function runDaemonCommand(config: AppConfig, args: string[]): Promi
   if (command === 'doctor') {
     const { doctorMimi } = await import('./service.js');
     output(await doctorMimi(config));
+    return;
+  }
+  if (command === 'diagnostics') {
+    const [{ doctorMimi }, { buildRedactedDiagnosticBundle, writeRedactedDiagnosticBundle }] = await Promise.all([
+      import('./service.js'),
+      import('./diagnostics.js'),
+    ]);
+    const doctor = await doctorMimi(config);
+    const bundle = await buildRedactedDiagnosticBundle(config, doctor);
+    const destination = args[1] ?? path.resolve(`mimi-diagnostics-${new Date().toISOString().replaceAll(':', '-')}.json`);
+    output({ file: await writeRedactedDiagnosticBundle(destination, bundle), bundle });
+    return;
+  }
+  if (command === 'backup') {
+    const { createMimiBackup, verifyMimiBackup } = await import('./backup.js');
+    if (args[1] === 'verify') {
+      const source = args[2]?.trim();
+      if (!source) throw new Error('请提供要校验的备份目录');
+      output(await verifyMimiBackup(source));
+      return;
+    }
+    const destination = args[1]
+      ?? path.resolve(`mimi-backup-${new Date().toISOString().replaceAll(':', '-')}`);
+    output(await createMimiBackup(config, destination));
+    return;
+  }
+  if (command === 'restore') {
+    const source = args[1]?.trim();
+    if (!source) throw new Error('请提供要恢复的备份目录');
+    let daemonRunning = false;
+    try {
+      await mimiRpc(socket, 'status', undefined, 300);
+      daemonRunning = true;
+    } catch {
+      // Restore is permitted only after the control endpoint is offline.
+    }
+    if (daemonRunning) throw new Error('恢复前必须先停止 MimiAgent 后台服务');
+    const { restoreMimiBackup } = await import('./backup.js');
+    output(await restoreMimiBackup(config, source));
     return;
   }
   if (command === 'start') {

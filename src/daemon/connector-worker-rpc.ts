@@ -45,6 +45,9 @@ const readinessSchema = z.object({
   inbound: z.enum(['ready', 'unavailable', 'unknown']),
   outbound: z.enum(['ready', 'unavailable', 'unknown']),
   deliveryConfirmed: z.boolean().optional(),
+  reportedAt: z.string().datetime().optional(),
+  freshUntil: z.string().datetime().optional(),
+  stale: z.boolean().optional(),
 }).strict();
 
 export const connectorCapabilitySnapshotSchema = z.object({
@@ -54,6 +57,7 @@ export const connectorCapabilitySnapshotSchema = z.object({
   online: z.number().int().nonnegative(),
   inboundReady: z.number().int().nonnegative(),
   outboundReady: z.number().int().nonnegative(),
+  stale: z.number().int().nonnegative(),
   actions: z.number().int().nonnegative(),
   truncated: z.boolean(),
   connectors: z.array(z.object({

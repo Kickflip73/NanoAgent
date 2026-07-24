@@ -279,6 +279,7 @@ function run(argv) {
   var limit = Number(argv[2]);
   var bodyLimit = Number(argv[3]);
   var app = Application('Mail');
+  if (!app.running()) return JSON.stringify({ messages: [] });
   var messages = app.inbox().messages().filter(function(message) {
     return !message.readStatus() && (account === '*' || accountName(message) === account);
   });

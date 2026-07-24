@@ -16,6 +16,9 @@ const config: AppConfig = {
 test('daemon maintenance help exposes diagnostics without advertising alternate startup paths', async () => {
   assert.match(daemonHelp(), /mimi daemon attention/);
   assert.match(daemonHelp(), /mimi daemon doctor/);
+  assert.match(daemonHelp(), /mimi daemon diagnostics/);
+  assert.match(daemonHelp(), /mimi daemon backup/);
+  assert.match(daemonHelp(), /mimi daemon restore/);
   assert.doesNotMatch(daemonHelp(), /daemon (?:init|run|start|install)(?:\s|$)/);
   let output = '';
   const write = process.stdout.write;

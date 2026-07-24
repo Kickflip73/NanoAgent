@@ -1,10 +1,14 @@
 import assert from 'node:assert/strict';
+import { readdirSync, readFileSync } from 'node:fs';
+import path from 'node:path';
 import test from 'node:test';
 import type { Tool } from '@openai/agents';
 import {
   isSideEffectTool,
   subAgentToolNames,
   teamRoleToolNames,
+  toolDescriptor,
+  TOOL_DESCRIPTORS,
   toolNamesForMode,
   toolsForMode,
   toolsForPermission,
@@ -12,6 +16,25 @@ import {
 } from '../src/runtime/tool-policy.js';
 
 const fakeTool = (name: string) => ({ name }) as Tool;
+
+function sourceFiles(root: string): string[] {
+  return readdirSync(root, { withFileTypes: true }).flatMap((entry) => {
+    const file = path.join(root, entry.name);
+    return entry.isDirectory() ? sourceFiles(file) : entry.name.endsWith('.ts') ? [file] : [];
+  });
+}
+
+test('registers every statically declared SDK tool in the single descriptor catalog', () => {
+  const names = new Set<string>();
+  const declaration = /\btool\(\{\s*name:\s*'([a-z][a-z0-9_]*)'|\.asTool\(\{\s*toolName:\s*'([a-z][a-z0-9_]*)'/g;
+  for (const file of sourceFiles(path.resolve('src'))) {
+    const source = readFileSync(file, 'utf8');
+    for (const match of source.matchAll(declaration)) names.add(match[1] ?? match[2]!);
+  }
+  const missing = [...names].filter((name) => !toolDescriptor(name)).sort();
+  assert.deepEqual(missing, []);
+  assert.equal(new Set(TOOL_DESCRIPTORS.map((descriptor) => descriptor.name)).size, TOOL_DESCRIPTORS.length);
+});
 
 test('preserves mode and permission tool policy semantics', () => {
   const tools = [
@@ -68,6 +91,16 @@ test('read-only local deployment still exposes configured connector transactions
   assert.deepEqual(
     toolsForPermission('read-only', tools).map((tool) => tool.name),
     ['read_file', 'connector_action'],
+  );
+});
+
+test('Safe profile removes external transactions that legacy read-only mode retained', () => {
+  const tools = [
+    'read_file', 'http_get', 'connector_action', 'finish_mimi_silently', 'runtime_status',
+  ].map(fakeTool);
+  assert.deepEqual(
+    toolsForPermission('read-only', tools, {}, 'safe').map((tool) => tool.name),
+    ['read_file', 'http_get', 'finish_mimi_silently', 'runtime_status'],
   );
 });
 

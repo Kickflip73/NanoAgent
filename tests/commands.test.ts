@@ -93,6 +93,7 @@ test('handles status and high-frequency inspection commands', async () => {
 
   try {
     assert.equal(await handler.execute('/status'), 'handled');
+    assert.equal(await handler.execute('/security'), 'handled');
     assert.equal(await handler.execute('/skills'), 'handled');
     assert.equal(await handler.execute('/memory list'), 'handled');
     assert.equal(await handler.execute('/memory capture'), 'handled');
@@ -103,6 +104,8 @@ test('handles status and high-frequency inspection commands', async () => {
     assert.equal(await handler.execute('/instructions'), 'handled');
     assert.match(output.join('\n'), /deepseek-chat/);
     assert.match(output.join('\n'), /Shell 可用/);
+    assert.match(output.join('\n'), /Full Owner \(full-owner\/trusted\)/);
+    assert.match(output.join('\n'), /MIMI_SECURITY_PROFILE/);
     assert.match(output.join('\n'), /Review code/);
     assert.match(output.join('\n'), /uses TS/);
     assert.match(output.join('\n'), /running/);

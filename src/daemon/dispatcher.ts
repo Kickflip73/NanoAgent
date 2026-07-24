@@ -3,27 +3,25 @@ import type { RunStreamEvent } from '@openai/agents';
 import type { MimiAgent } from '../runtime/mimi-agent.js';
 import { MimiHost } from '../runtime/mimi-host.js';
 import type { RuntimeEvent } from '../runtime/hooks.js';
-import { isTerminalRunInterruption, TerminalRunInterruptedError } from '../runtime/run-outcome.js';
+import { TerminalRunInterruptedError } from '../runtime/run-outcome.js';
 import { CompletionGateError } from '../core/completion.js';
 import { capabilityDisclosureForInput } from '../core/user-intent.js';
-import {
-  isPermanentDeliveryError,
-  isUncertainDeliveryError,
-  NotifierRegistry,
-} from './notifier.js';
+import { NotifierRegistry } from './notifier.js';
 import type { ConnectorTaskRuntime } from './connector-action-tool.js';
 import type { ConnectorManager } from './connectors.js';
 import type { MimiDeliveryControl } from './delivery-tools.js';
+import { OutboxDeliveryCoordinator } from './dispatcher-delivery.js';
 import { AttentionEngine } from './attention.js';
 import { createMimiHostTools } from './host-tools.js';
 import { buildOwnerStatusAnswer } from './status-context.js';
+import { buildDaemonHealth } from './health-model.js';
 import type { MemoryMaintenanceRuntime } from './memory-maintenance-tools.js';
 import { MimiStore } from './store.js';
+import { eventFailureAttemptLimit } from './dispatcher-retry-policy.js';
 import type { BackgroundTaskBlockRequest, BackgroundTaskPauseResult } from './task-tools.js';
 import type {
   DaemonWorkerStatus,
   ImmutableEvent,
-  OutboxMessage,
   ReplyRoute,
   TaskRecord,
   TaskType,
@@ -66,32 +64,7 @@ export type EventCancelResult =
   | { state: 'already_terminal' }
   | { state: 'not_found' };
 
-export function eventFailureAttemptLimit(
-  error: unknown,
-  claimedAttempts: number,
-  configuredMaxAttempts: number,
-): number {
-  const value = error && typeof error === 'object' ? error as Record<string, unknown> : {};
-  const message = error instanceof Error ? error.message : String(error);
-  const messageStatus = /^(\d{3})(?:\s|$)/.exec(message)?.[1];
-  const status = typeof value.status === 'number'
-    ? value.status
-    : messageStatus ? Number(messageStatus) : undefined;
-  if (isTerminalRunInterruption(error)
-    || value.name === 'ContextProtocolBudgetError'
-    || value.name === 'MaxTurnsExceededError'
-    || /^Max turns \(\d+\) exceeded$/i.test(message)) {
-    return Math.max(1, claimedAttempts);
-  }
-  // Background conversation retries happen within seconds. Retrying a rejected
-  // request, exhausted quota, or rate limit only burns attempts/credits and can
-  // produce a stale IM reply later; dead-letter once and require an explicit retry.
-  if (status !== undefined && status >= 400 && status < 500
-    && status !== 408 && status !== 409 && status !== 425) {
-    return Math.max(1, claimedAttempts);
-  }
-  return configuredMaxAttempts;
-}
+export { eventFailureAttemptLimit } from './dispatcher-retry-policy.js';
 
 const TERMINAL_TASK_STATUSES = new Set<TaskRecord['status']>([
   'completed', 'failed', 'cancelled', 'dead_letter',
@@ -121,7 +94,7 @@ export class MimiDispatcher {
   private stopRequested = false;
   private forceStopReason?: Error;
   private preferOutbox = true;
-  private readonly deliveryPromises = new Map<string, { route: ReplyRoute; promise: Promise<void> }>();
+  private readonly delivery: OutboxDeliveryCoordinator;
   private nextMaintenanceAt = 0;
 
   constructor(
@@ -133,6 +106,7 @@ export class MimiDispatcher {
     private readonly options: DispatcherOptions = {},
   ) {
     this.host = agentOrHost instanceof MimiHost ? agentOrHost : new MimiHost(agentOrHost);
+    this.delivery = new OutboxDeliveryCoordinator(this.store, this.notifier, this.workerId);
   }
 
   start(): void {
@@ -146,7 +120,7 @@ export class MimiDispatcher {
     for (const execution of this.active.values()) this.abortForStopWhenSafe(execution);
     await this.loopPromise;
     await Promise.all([...this.active.values()].map((execution) => execution.promise).filter(Boolean));
-    await Promise.all([...this.deliveryPromises.values()].map((delivery) => delivery.promise));
+    await this.delivery.waitForAll();
   }
 
   forceStop(reason = 'MimiAgent Dispatcher 被强制停止'): void {
@@ -219,7 +193,7 @@ export class MimiDispatcher {
     this.attention.emitDueRoutines();
     this.attention.emitDueBriefings();
     this.store.emitDueSchedules();
-    if (this.preferOutbox && await this.deliverOne()) {
+    if (this.preferOutbox && await this.delivery.deliverOne()) {
       this.preferOutbox = false;
       return true;
     }
@@ -234,7 +208,7 @@ export class MimiDispatcher {
       this.preferOutbox = true;
       return true;
     }
-    if (!this.preferOutbox && await this.deliverOne()) {
+    if (!this.preferOutbox && await this.delivery.deliverOne()) {
       this.preferOutbox = false;
       return true;
     }
@@ -253,76 +227,12 @@ export class MimiDispatcher {
     return true;
   }
 
-  private async deliverOne(): Promise<boolean> {
-    const delivery = this.startDelivery();
-    if (delivery) {
-      await delivery;
-      return true;
-    }
-    const inFlight = this.deliveryPromises.values().next().value as
-      | { route: ReplyRoute; promise: Promise<void> }
-      | undefined;
-    if (!inFlight) return false;
-    await inFlight.promise;
-    return true;
-  }
-
-  private startDelivery(): Promise<void> | undefined {
-    if (this.deliveryPromises.size >= 4) return undefined;
-    const outgoing = this.store.claimOutbox(
-      this.workerId,
-      undefined,
-      undefined,
-      [...this.deliveryPromises.values()].map((delivery) => delivery.route),
-    );
-    if (!outgoing) return undefined;
-    let tracked!: Promise<void>;
-    tracked = this.deliverClaimed(outgoing)
-      .catch((error) => {
-        process.stderr.write(
-          `[MimiAgent] outbox ${outgoing.id} error: ${error instanceof Error ? error.message : String(error)}\n`,
-        );
-      })
-      .finally(() => {
-        const routeKey = JSON.stringify([outgoing.channel, outgoing.target ?? '']);
-        if (this.deliveryPromises.get(routeKey)?.promise === tracked) {
-          this.deliveryPromises.delete(routeKey);
-        }
-      });
-    const route = { channel: outgoing.channel, ...(outgoing.target ? { target: outgoing.target } : {}) };
-    this.deliveryPromises.set(JSON.stringify([outgoing.channel, outgoing.target ?? '']), { route, promise: tracked });
-    return tracked;
-  }
-
-  private async deliverClaimed(outgoing: OutboxMessage): Promise<void> {
-    try {
-      await this.notifier.deliver(outgoing);
-    } catch (error) {
-      this.store.failOutbox(
-        outgoing.id,
-        this.workerId,
-        error,
-        isUncertainDeliveryError(error) || isPermanentDeliveryError(error) ? 1 : 8,
-      );
-      return;
-    }
-    try {
-      this.store.completeOutbox(outgoing.id, this.workerId);
-    } catch (error) {
-      // The external sink already confirmed success. Leaving the message in its
-      // sending lease makes recovery dead-letter it instead of redelivering it.
-      process.stderr.write(
-        `[MimiAgent] outbox ${outgoing.id} 已送达但本地确认失败，将停止自动重发：${error instanceof Error ? error.message : String(error)}\n`,
-      );
-    }
-  }
-
   private async loop(): Promise<void> {
     const signal = this.loopController.signal;
     while (!signal.aborted) {
       try {
         const worked = await this.scheduleAvailable();
-        if (!worked) await delay(this.options.pollMs ?? 250, signal);
+    if (!worked) await delay(this.options.pollMs ?? 1_000, signal);
       } catch (error) {
         process.stderr.write(`[MimiAgent] dispatcher error: ${error instanceof Error ? error.message : String(error)}\n`);
         await delay(1_000, signal);
@@ -336,7 +246,7 @@ export class MimiDispatcher {
     this.attention.emitDueBriefings();
     this.store.emitDueSchedules();
     let worked = false;
-    if (this.preferOutbox && this.startDelivery()) {
+    if (this.preferOutbox && this.delivery.start()) {
       this.preferOutbox = false;
       worked = true;
     }
@@ -360,7 +270,7 @@ export class MimiDispatcher {
         process.stderr.write(`[MimiAgent] task ${task.id} error: ${error instanceof Error ? error.message : String(error)}\n`);
       });
     }
-    if (!worked && !this.preferOutbox && this.startDelivery()) {
+    if (!worked && !this.preferOutbox && this.delivery.start()) {
       this.preferOutbox = false;
       worked = true;
     }
@@ -513,7 +423,18 @@ export class MimiDispatcher {
       const focusedStatusAnswer = focusedStatus
         ? await this.host.mutate(decision.sessionId!, async (agent) => {
             const [plan, goal] = await Promise.all([agent.currentPlan(), agent.currentGoal()]);
-            return buildOwnerStatusAnswer(this.store, decision.sessionId!, task.id, { plan, goal });
+            const activity = this.store.activitySnapshot(1);
+            return buildOwnerStatusAnswer(this.store, decision.sessionId!, task.id, {
+              plan,
+              goal,
+              health: buildDaemonHealth({
+                tasks: activity.tasks,
+                outbox: activity.outbox,
+                pendingDigest: activity.pendingDigest,
+                connectors: this.connectors?.listCapabilities(),
+                checkedAt: activity.generatedAt,
+              }),
+            });
           }, runSignal)
         : undefined;
       const hostedRun = this.host.execute({

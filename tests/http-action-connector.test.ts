@@ -38,6 +38,17 @@ function outputReader(child: ChildProcessWithoutNullStreams): () => Promise<Reco
   };
 }
 
+async function nextOfType(
+  next: () => Promise<Record<string, unknown>>,
+  type: string,
+): Promise<Record<string, unknown>> {
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    const value = await next();
+    if (value.type === type) return value;
+  }
+  throw new Error(`connector did not emit ${type}`);
+}
+
 async function bodyOf(request: IncomingMessage): Promise<string> {
   const chunks: Buffer[] = [];
   for await (const chunk of request) chunks.push(Buffer.from(chunk));
@@ -107,7 +118,7 @@ test('generic HTTP action connector pulls cursor events and forwards deliveries 
   try {
     assert.deepEqual(await next(), {
       type: 'status', inbound: 'ready', outbound: 'ready',
-      deliveryConfirmed: true, eventAcknowledgement: true,
+      deliveryConfirmed: true, eventAcknowledgement: true, freshForMs: 5_000,
     });
     assert.deepEqual(await next(), {
       type: 'event', externalId: 'wechat-message-1', kind: 'command', payload: { text: '帮我处理' },
@@ -127,7 +138,7 @@ test('generic HTTP action connector pulls cursor events and forwards deliveries 
     child.stdin.write(`${JSON.stringify({
       type: 'deliver', id: 'outbox-1', target: 'wechat:conversation-7', payload: { text: 'done' },
     })}\n`);
-    assert.deepEqual(await next(), { type: 'delivery_ack', id: 'outbox-1', ok: true });
+    assert.deepEqual(await nextOfType(next, 'delivery_ack'), { type: 'delivery_ack', id: 'outbox-1', ok: true });
     assert.equal(requests[0]?.headers.authorization, 'Bearer relay-secret');
     assert.equal(requests[0]?.headers['idempotency-key'], 'outbox-1');
     assert.equal(requests[0]?.headers['x-mimi-message-type'], 'deliver');
@@ -138,7 +149,7 @@ test('generic HTTP action connector pulls cursor events and forwards deliveries 
     child.stdin.write(`${JSON.stringify({
       type: 'action', id: 'action-1', action: 'create_ticket', target: 'project-9', payload: { title: 'Fix it' },
     })}\n`);
-    assert.deepEqual(await next(), {
+    assert.deepEqual(await nextOfType(next, 'action_result'), {
       type: 'action_result', id: 'action-1', ok: true,
       result: { accepted: true, target: 'project-9' },
     });
@@ -151,14 +162,14 @@ test('generic HTTP action connector pulls cursor events and forwards deliveries 
     child.stdin.write(`${JSON.stringify({
       type: 'action', id: 'action-2', action: 'request', target: 'failure', payload: {},
     })}\n`);
-    assert.deepEqual(await next(), {
+    assert.deepEqual(await nextOfType(next, 'action_result'), {
       type: 'action_result', id: 'action-2', ok: false, error: 'HTTP 503: remote unavailable',
     });
 
     child.stdin.write(`${JSON.stringify({
       type: 'action', id: 'action-3', action: 'request', target: 'oversized', payload: {},
     })}\n`);
-    assert.deepEqual(await next(), {
+    assert.deepEqual(await nextOfType(next, 'action_result'), {
       type: 'action_result', id: 'action-3', ok: false, error: 'HTTP response exceeds 1024 bytes',
     });
   } finally {

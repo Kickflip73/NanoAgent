@@ -1,6 +1,19 @@
 # Changelog
 
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+---
+
 ## Unreleased
+
+- macOS 日历与提醒事项 Connector 改用 EventKit 原生后台访问，轮询和操作不再启动或激活 Calendar/Reminders App。
+
+## [0.12.0] - 2026-07-24
+
+### Added
 
 - add opt-in macOS Computer Use through Cua Driver with bounded observations and actions, permission-aware policy, protected artifacts, background-first execution, and verified visible handoff
 - progressively disclose bounded owner tools for status, Session, web, and lightweight questions; answer high-confidence status queries directly from bounded Host state without a model round, omit undisclosed Skill catalogs, cap focused history and output reservation, skip automatic memory work for focused requests, and make automatic embedding recall fail fast without retries
@@ -12,17 +25,57 @@
 - register terminal Task observations transactionally and consolidate them through low-priority profile-scoped maintenance Tasks with strict tool, evidence, trust, page, retry, and fairness limits
 - back up Mimi SQLite/WAL/SHM and legacy user Soul before cutover, move identifiable owner facts into private Wiki, and auto-create minimal AGENTS guidance only for writable development tasks
 
-All notable changes to this project will be documented in this file.
-
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-
----
-
-## [Unreleased]
-
 ### Changed
 
+- begin the Phase 2 hotspot split by moving the current Daemon schema and v13/v14 migrations behind the `MimiStore` transaction facade, and isolate Dispatcher retry policy with delivery recovery tests
+- add an automated dependency-direction guard, remove every known `extensions -> runtime` reverse dependency, and move terminal interaction out of the Daemon RPC client
+- extract role-scoped tool policy and run-context construction into focused core/runtime collaborators while preserving the public orchestration surface
+- move the legacy Event/Task v12 cutover into a versioned migration with direct pre-check,
+  post-check, foreign-key, and injected-failure rollback coverage
+- move the v2-v11 Event schema preparation out of `MimiStore`, with direct idempotency
+  and schema-evolution coverage before the v12 cutover
+- extract Completion Gate evidence recovery, Plan/Team ownership checks, and progress
+  fingerprinting from `MimiAgent` into a dedicated coordinator
+- extract Runtime Action recovery, conflict detection, ordering, and at-most-once
+  application from `MimiAgent` into a dedicated coordinator
+- move Plan and Team SDK Tool construction out of core stores into runtime/extension
+  adapters, and derive policy lookups from a single `ToolDescriptor` catalog
+- add a source-level Tool catalog contract so every statically declared SDK Tool
+  must register capability, mode, and side-effect metadata
+- add a shared Daemon health model for `status`, `doctor`, and direct owner status
+  answers, distinguishing ready, degraded, and unhealthy runtime states from
+  process liveness while surfacing bounded backlog, dead-letter, and Connector risks
+- add explicit Safe, Workstation, and Full Owner security profiles, default fresh
+  configuration to Safe, expose the effective capability summary in `/status`,
+  and prevent Safe from retaining legacy read-only Connector transactions
+- add a no-clobber `daemon diagnostics` export with an explicit redaction
+  allowlist, Doctor capacity thresholds for SQLite/logs/Memory, and bounded
+  pre-restart rotation for daemon stdout/stderr logs
+- add manifest-verified recovery backups using SQLite online snapshots, protected
+  allowlisted state copies, SHA-256 verification, and no-clobber blank-root restore
+- add Connector readiness freshness heartbeats and surface stale online pollers
+  through capability inspection, unified health, Doctor, and redacted diagnostics
+- add non-blocking capability onboarding through the interactive security-profile
+  banner and `/security` comparison backed by the authoritative profile catalog
+- add an isolated, parameterized Event/Task/Session/Memory capacity benchmark
+  with versioned JSON throughput, environment, and storage-growth output
+- add a checked-in offline Provider contract fixture and test for OpenAI/DeepSeek
+  defaults, profiles, input portability, API-key boundaries, and Tool schemas
+- add a small opt-in real Provider canary with fixed Safe-profile Tool tasks,
+  isolated state, bounded turns, and redacted no-clobber reports
+- add a checked-in Prompt Injection and permission eval matrix that intersects
+  real event policy, security profiles, and the authoritative Tool catalog
+- add a versioned public API contract with source, type, and packed-package
+  compatibility checks for the two supported entrypoints
+- classify every checked-in Skill as product or experimental and add a repository
+  gate that keeps user projects, personal knowledge, and incubation assets out of npm
+- make Daemon startup UI-silent by enabling only the non-GUI macOS System
+  Connector by default, one-time disabling legacy canonical GUI defaults, refusing
+  to launch closed Calendar/Reminders/Mail apps during polling, and reducing idle
+  queue and system-health polling frequency
+- serialize test files so macOS Connector contract fixtures do not starve each
+  other's child processes, and degrade unavailable OS uptime/load metrics instead
+  of making the system-health Connector entirely unavailable
 - add a detached `codex` background executor that records process/thread artifacts and commits its own terminal result without Mimi fallback or validation
 - split immutable daemon Events from executable Tasks, with atomic schema v12 cutover and no dual-write compatibility path
 - move lease, retry, control, attempt, lifecycle, schedule occurrence, and Outbox ownership to Task IDs
@@ -31,6 +84,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- invalidate in-flight clipboard polling before a MimiAgent self-write so a late
+  pre-write read cannot be misreported as a second external clipboard change
+- remove tracked authentication material, device identity, private QQ data, and browser snapshots; reject equivalent runtime artifacts in CI
+- pin the supported npm and critical SDK dependency graph, keep Computer Tool schemas portable across SDK patch versions, and add Linux/macOS release-contract checks
+- align package, lockfile, and Changelog identity on `0.12.0`
+- restore current Event/Task v12 invariant coverage for authority revocation, Attention routing, leases, controls, attempts, Outbox delivery, schedules, retention, and dead-letter recovery
 - keep Computer Use configuration out of isolated Task IPC so Codex workers can start, preserve worker initialization errors instead of replacing them with a generic exit, and require task inspection evidence for failure attribution
 - keep explicitly requested visible app handoffs on the user's current desktop and require frontmost observation before reporting success
 - let the CLI connect from any directory, re-adopt a replaced Host's workspace, and recover ordinary commands when the daemon socket is briefly unavailable
@@ -88,8 +147,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - preserve completion evidence across resumed runs (@Kickflip73)
-
-## [Unreleased]
 
 ### Changed
 

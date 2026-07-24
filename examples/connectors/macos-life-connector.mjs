@@ -3,18 +3,28 @@
 /**
  * MimiAgent ↔ macOS Calendar / Reminders / Notifications connector.
  *
- * It deliberately has no npm dependencies. Platform operations are delegated to
- * JXA through osascript using argv (never a shell), while stdin/stdout remain an
- * NDJSON connector channel.
+ * It deliberately has no npm dependencies. Calendar and reminder operations use
+ * EventKit through a bundled Swift helper, so polling never launches or controls
+ * the Calendar or Reminders GUI applications. Notification delivery alone uses
+ * osascript and Notification Center.
  */
 
 import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { chmod, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { access, chmod, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const osascript = process.env.MACOS_OSASCRIPT || '/usr/bin/osascript';
+const swiftc = process.env.MACOS_SWIFTC_BIN || '/usr/bin/swiftc';
+const eventKitCommand = process.env.MACOS_LIFE_EVENTKIT_COMMAND;
+const eventKitHelper = absolutePath(
+  process.env.MACOS_LIFE_EVENTKIT_HELPER
+    || fileURLToPath(new URL('./macos-life-eventkit.swift', import.meta.url)),
+  'MACOS_LIFE_EVENTKIT_HELPER',
+);
 const pollIntervalMs = numberEnv('MACOS_POLL_INTERVAL_MS', 300_000, 0, 86_400_000);
 const lookaheadMinutes = numberEnv('MACOS_LOOKAHEAD_MINUTES', 30, 1, 10_080);
 const maxPollItems = numberEnv('MACOS_LIFE_MAX_ITEMS', 200, 1, 200);
@@ -311,36 +321,40 @@ function run(argv) {
   var result = { calendar: [], reminders: [], knownCalendar: [], knownReminders: [] };
   var calendarTracked = 0;
   var calendarApp = Application('Calendar');
-  selected(calendarApp.calendars, calendarName).forEach(function(calendar) {
-    var name = String(calendar.name());
-    calendar.events().forEach(function(event) {
-      var start = event.startDate();
-      var item = calendarItem(event, name);
-      if (start >= now && start <= until && calendarTracked < limit) {
-        result.calendar.push(item);
-        calendarTracked += 1;
-      } else if (previousCalendar[item.id] && calendarTracked < limit) {
-        result.knownCalendar.push(item);
-        calendarTracked += 1;
-      }
+  if (calendarApp.running()) {
+    selected(calendarApp.calendars, calendarName).forEach(function(calendar) {
+      var name = String(calendar.name());
+      calendar.events().forEach(function(event) {
+        var start = event.startDate();
+        var item = calendarItem(event, name);
+        if (start >= now && start <= until && calendarTracked < limit) {
+          result.calendar.push(item);
+          calendarTracked += 1;
+        } else if (previousCalendar[item.id] && calendarTracked < limit) {
+          result.knownCalendar.push(item);
+          calendarTracked += 1;
+        }
+      });
     });
-  });
+  }
   var reminderApp = Application('Reminders');
   var remindersTracked = 0;
-  selected(reminderApp.lists, reminderListName).forEach(function(list) {
-    var name = String(list.name());
-    list.reminders().forEach(function(reminder) {
-      var due = reminder.dueDate();
-      var item = reminderItem(reminder, name);
-      if (!item.completed && due && due <= until && remindersTracked < limit) {
-        result.reminders.push(item);
-        remindersTracked += 1;
-      } else if (previousReminders[item.id] && remindersTracked < limit) {
-        result.knownReminders.push(item);
-        remindersTracked += 1;
-      }
+  if (reminderApp.running()) {
+    selected(reminderApp.lists, reminderListName).forEach(function(list) {
+      var name = String(list.name());
+      list.reminders().forEach(function(reminder) {
+        var due = reminder.dueDate();
+        var item = reminderItem(reminder, name);
+        if (!item.completed && due && due <= until && remindersTracked < limit) {
+          result.reminders.push(item);
+          remindersTracked += 1;
+        } else if (previousReminders[item.id] && remindersTracked < limit) {
+          result.knownReminders.push(item);
+          remindersTracked += 1;
+        }
+      });
     });
-  });
+  }
   return JSON.stringify(result);
 }`;
 
@@ -520,6 +534,106 @@ async function runJxa(script, args) {
   });
 }
 
+let eventKitExecutablePromise;
+
+async function ensureEventKitExecutable() {
+  if (eventKitCommand) return absolutePath(eventKitCommand, 'MACOS_LIFE_EVENTKIT_COMMAND');
+  if (!eventKitExecutablePromise) {
+    eventKitExecutablePromise = (async () => {
+      const source = await readFile(eventKitHelper);
+      const digest = createHash('sha256').update(source).digest('hex').slice(0, 16);
+      const directory = path.dirname(stateFile);
+      const executable = path.join(directory, `macos-life-eventkit-${digest}`);
+      try {
+        await access(executable, fsConstants.X_OK);
+        return executable;
+      } catch {
+        // Compile once per helper revision; polling reuses the small native executable.
+      }
+      await mkdir(directory, { recursive: true, mode: 0o700 });
+      await chmod(directory, 0o700);
+      const temporary = `${executable}.${process.pid}.${randomUUID()}.tmp`;
+      try {
+        await new Promise((resolve, reject) => {
+          const child = spawn(swiftc, [eventKitHelper, '-O', '-o', temporary], {
+            env: { PATH: process.env.PATH, HOME: process.env.HOME, LANG: process.env.LANG },
+            stdio: ['ignore', 'ignore', 'pipe'],
+          });
+          let stderr = '';
+          child.stderr.setEncoding('utf8');
+          child.stderr.on('data', (chunk) => { stderr = (stderr + chunk).slice(-8_000); });
+          child.once('error', reject);
+          child.once('exit', (code, signal) => {
+            if (code === 0) resolve();
+            else reject(new Error((stderr || `swiftc exited code=${code} signal=${signal || 'none'}`).trim()));
+          });
+        });
+        await chmod(temporary, 0o700);
+        await rename(temporary, executable);
+        return executable;
+      } finally {
+        await rm(temporary, { force: true });
+      }
+    })();
+  }
+  return eventKitExecutablePromise;
+}
+
+async function runEventKit(action, target, payload) {
+  const executable = await ensureEventKitExecutable();
+  return new Promise((resolve, reject) => {
+    const child = spawn(executable, [action, target, JSON.stringify(payload)], {
+      env: { PATH: process.env.PATH, HOME: process.env.HOME, LANG: process.env.LANG },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stdoutBytes = 0;
+    let stderr = '';
+    let timedOut = false;
+    let overflow = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill('SIGKILL');
+    }, 35_000);
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => {
+      stdoutBytes += Buffer.byteLength(chunk);
+      if (stdoutBytes > 1_000_000) {
+        overflow = true;
+        child.kill('SIGKILL');
+        return;
+      }
+      stdout += chunk;
+    });
+    child.stderr.on('data', (chunk) => { stderr = (stderr + chunk).slice(-8_000); });
+    child.once('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.once('exit', (code, signal) => {
+      clearTimeout(timer);
+      if (timedOut) {
+        reject(new Error('EventKit helper timed out after 35000ms'));
+        return;
+      }
+      if (overflow) {
+        reject(new Error('EventKit helper output exceeds 1000000 bytes'));
+        return;
+      }
+      if (code !== 0) {
+        reject(new Error((stderr || `EventKit helper exited code=${code} signal=${signal || 'none'}`).trim()));
+        return;
+      }
+      try {
+        resolve(stdout.trim() ? JSON.parse(stdout.trim()) : null);
+      } catch {
+        reject(new Error(`EventKit helper returned invalid JSON: ${stdout.slice(0, 500)}`));
+      }
+    });
+  });
+}
+
 async function execute(message) {
   if (!message || typeof message !== 'object') throw new Error('message must be an object');
   if (typeof message.id !== 'string' || !message.id) throw new Error('message.id is required');
@@ -534,7 +648,7 @@ async function execute(message) {
   const payload = message.payload && typeof message.payload === 'object' && !Array.isArray(message.payload)
     ? message.payload
     : {};
-  const result = await runJxa(ACTION_SCRIPT, [message.action, message.target, JSON.stringify(payload)]);
+  const result = await runEventKit(message.action, message.target, payload);
   return { type: 'action_result', id: message.id, ok: true, result };
 }
 
@@ -562,15 +676,15 @@ async function poll() {
     const now = new Date();
     const until = new Date(now.getTime() + lookaheadMinutes * 60_000);
     const previous = pollState ?? emptyState();
-    const result = await runJxa(POLL_SCRIPT, [
-      now.toISOString(),
-      until.toISOString(),
-      pollCalendar,
-      pollReminderList,
-      JSON.stringify(previous.calendar.map((item) => item.id)),
-      JSON.stringify(previous.reminders.map((item) => item.id)),
-      String(maxPollItems),
-    ]);
+    const result = await runEventKit('poll', '*', {
+      now: now.toISOString(),
+      until: until.toISOString(),
+      calendar: pollCalendar,
+      list: pollReminderList,
+      previousCalendarIds: previous.calendar.map((item) => item.id),
+      previousReminderIds: previous.reminders.map((item) => item.id),
+      limit: maxPollItems,
+    });
     const calendar = normalizeItems(result?.calendar, calendarItem);
     const reminders = normalizeItems(result?.reminders, reminderItem);
     const knownCalendar = byId(normalizeItems(result?.knownCalendar, calendarItem));

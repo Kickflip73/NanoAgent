@@ -155,7 +155,7 @@ test('parses valid runtime limits once at startup', () => {
     process.env.OUTPUT_TOKEN_RESERVE = '16000';
     process.env.MAX_TURNS = '120';
     process.env.TEAM_MAX_CONCURRENCY = '3';
-    process.env.AGENT_PERMISSION_MODE = 'read-only';
+    process.env.AGENT_PERMISSION_MODE = 'trusted';
     process.env.TRUST_WORKSPACE_MCP = process.cwd();
     const config = loadConfig(ISOLATED_HOME);
     assert.deepEqual(
@@ -163,7 +163,7 @@ test('parses valid runtime limits once at startup', () => {
         config.historyLimit, config.contextWindow, config.outputReserve, config.maxTurns,
         config.teamMaxConcurrency, config.permissionMode, config.trustedWorkspaceMcp,
       ],
-      [60, 128_000, 16_000, 120, 3, 'read-only', process.cwd()],
+      [60, 128_000, 16_000, 120, 3, 'trusted', process.cwd()],
     );
   } finally {
     for (const key of keys) {
@@ -180,11 +180,13 @@ test('keeps Computer Use disabled by default and validates explicit opt-in', () 
     'MIMI_COMPUTER_MAX_ACTIONS_PER_RUN', 'MIMI_COMPUTER_MAX_SCREENSHOTS_PER_RUN',
     'MIMI_COMPUTER_PAUSE_WHEN_TARGET_FRONTMOST', 'MIMI_COMPUTER_DEFAULT_ACCESS',
     'MIMI_COMPUTER_FOREGROUND_LEASE_SECONDS', 'MIMI_COMPUTER_ARTIFACT_MAX_MIB',
+    'MIMI_SECURITY_PROFILE',
   ] as const;
   const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
   try {
     for (const key of keys) delete process.env[key];
     assert.equal(loadConfig(ISOLATED_HOME).computer, undefined);
+    process.env.MIMI_SECURITY_PROFILE = 'full-owner';
     process.env.MIMI_COMPUTER_BACKEND = 'cua';
     assert.throws(() => loadConfig(ISOLATED_HOME), /MIMI_CUA_DRIVER_COMMAND/);
     process.env.MIMI_CUA_DRIVER_COMMAND = '/bin/echo';
@@ -210,18 +212,53 @@ test('keeps Computer Use disabled by default and validates explicit opt-in', () 
   }
 });
 
-test('gives the local owner full execution capability by default', () => {
+test('starts a fresh local owner in the Safe profile by default', () => {
   const previousModern = process.env.MIMI_PERMISSION_MODE;
   const previousLegacy = process.env.AGENT_PERMISSION_MODE;
+  const previousProfile = process.env.MIMI_SECURITY_PROFILE;
   delete process.env.MIMI_PERMISSION_MODE;
   delete process.env.AGENT_PERMISSION_MODE;
+  delete process.env.MIMI_SECURITY_PROFILE;
   try {
-    assert.equal(loadConfig(ISOLATED_HOME).permissionMode, 'trusted');
+    const config = loadConfig(ISOLATED_HOME);
+    assert.equal(config.permissionMode, 'read-only');
+    assert.equal(config.securityProfile, 'safe');
   } finally {
     if (previousModern === undefined) delete process.env.MIMI_PERMISSION_MODE;
     else process.env.MIMI_PERMISSION_MODE = previousModern;
     if (previousLegacy === undefined) delete process.env.AGENT_PERMISSION_MODE;
     else process.env.AGENT_PERMISSION_MODE = previousLegacy;
+    if (previousProfile === undefined) delete process.env.MIMI_SECURITY_PROFILE;
+    else process.env.MIMI_SECURITY_PROFILE = previousProfile;
+  }
+});
+
+test('maps explicit security profiles to non-ambiguous permission modes', () => {
+  const previousProfile = process.env.MIMI_SECURITY_PROFILE;
+  const previousPermission = process.env.MIMI_PERMISSION_MODE;
+  try {
+    delete process.env.MIMI_PERMISSION_MODE;
+    for (const [profile, permission] of [
+      ['safe', 'read-only'],
+      ['workstation', 'workspace'],
+      ['full-owner', 'trusted'],
+    ] as const) {
+      process.env.MIMI_SECURITY_PROFILE = profile;
+      const config = loadConfig(ISOLATED_HOME);
+      assert.equal(config.securityProfile, profile);
+      assert.equal(config.permissionMode, permission);
+    }
+    process.env.MIMI_SECURITY_PROFILE = 'safe';
+    process.env.MIMI_PERMISSION_MODE = 'trusted';
+    assert.throws(() => loadConfig(ISOLATED_HOME), /要求 MIMI_PERMISSION_MODE=read-only/);
+    process.env.MIMI_SECURITY_PROFILE = 'invalid';
+    delete process.env.MIMI_PERMISSION_MODE;
+    assert.throws(() => loadConfig(ISOLATED_HOME), /只能是 safe、workstation 或 full-owner/);
+  } finally {
+    if (previousProfile === undefined) delete process.env.MIMI_SECURITY_PROFILE;
+    else process.env.MIMI_SECURITY_PROFILE = previousProfile;
+    if (previousPermission === undefined) delete process.env.MIMI_PERMISSION_MODE;
+    else process.env.MIMI_PERMISSION_MODE = previousPermission;
   }
 });
 
@@ -326,7 +363,7 @@ test('prefers MIMI environment names, keeps legacy aliases, and expands home pat
     'MIMI_HISTORY_LIMIT', 'HISTORY_LIMIT',
     'MIMI_MAX_TURNS', 'MAX_TURNS',
     'MIMI_TEAM_MAX_CONCURRENCY', 'TEAM_MAX_CONCURRENCY',
-    'MIMI_PERMISSION_MODE', 'AGENT_PERMISSION_MODE',
+    'MIMI_PERMISSION_MODE', 'AGENT_PERMISSION_MODE', 'MIMI_SECURITY_PROFILE',
     'MIMI_TRUST_WORKSPACE_MCP', 'TRUST_WORKSPACE_MCP',
   ] as const;
   const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
@@ -349,7 +386,7 @@ test('prefers MIMI environment names, keeps legacy aliases, and expands home pat
     process.env.MAX_TURNS = '99';
     process.env.MIMI_TEAM_MAX_CONCURRENCY = '2';
     process.env.TEAM_MAX_CONCURRENCY = '4';
-    process.env.MIMI_PERMISSION_MODE = 'read-only';
+    process.env.MIMI_PERMISSION_MODE = 'trusted';
     process.env.AGENT_PERMISSION_MODE = 'trusted';
     process.env.MIMI_TRUST_WORKSPACE_MCP = '~/mimi-modern-workspace';
     process.env.TRUST_WORKSPACE_MCP = '/legacy/workspace';
@@ -364,7 +401,8 @@ test('prefers MIMI environment names, keeps legacy aliases, and expands home pat
     assert.equal(config.historyLimit, 17);
     assert.equal(config.maxTurns, 23);
     assert.equal(config.teamMaxConcurrency, 2);
-    assert.equal(config.permissionMode, 'read-only');
+    assert.equal(config.permissionMode, 'trusted');
+    assert.equal(config.securityProfile, 'full-owner');
     assert.equal(config.trustedWorkspaceMcp, path.join(os.homedir(), 'mimi-modern-workspace'));
   } finally {
     for (const key of keys) {

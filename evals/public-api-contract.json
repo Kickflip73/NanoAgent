@@ -1,0 +1,89 @@
+{
+  "contractVersion": 1,
+  "packageVersion": "0.12.0",
+  "entrypoints": {
+    ".": {
+      "runtimeExports": [
+        "AGENT_MODES",
+        "AgentRunService",
+        "HookBus",
+        "MimiAgent",
+        "MimiHost",
+        "TeamTaskStore",
+        "assertParallelSafe",
+        "createSubAgentTools",
+        "createTeamTools",
+        "loadConfig",
+        "loadEnvironment",
+        "runTeamWave",
+        "subAgentToolNames",
+        "teamRoleToolNames",
+        "toolsForMode",
+        "toolsForPermission"
+      ],
+      "typeExports": [
+        "AgentMode",
+        "AgentModel",
+        "AgentPermissionMode",
+        "AgentRunObserver",
+        "AgentRunRequest",
+        "AgentRunResult",
+        "AgentSessionSnapshot",
+        "AppConfig",
+        "CompletedExecutionReceipt",
+        "ContextUsageSnapshot",
+        "HookDiagnostic",
+        "HostCancelResult",
+        "HostedAgentRunRequest",
+        "MimiRunOptions",
+        "ModelProfile",
+        "ModelRuntime",
+        "RunCause",
+        "RunPolicy",
+        "RunTrust",
+        "RuntimeEvent",
+        "RuntimeHook",
+        "SubAgentRole",
+        "SubAgentToolsOptions",
+        "TeamRole",
+        "TeamTask",
+        "TeamTaskInput",
+        "TeamTaskStatus",
+        "TeamToolsOptions",
+        "TeamWorkerResult",
+        "ToolCapability"
+      ]
+    },
+    "./orchestration": {
+      "runtimeExports": [
+        "HookBus",
+        "TeamTaskStore",
+        "assertParallelSafe",
+        "createSubAgentTools",
+        "createTeamTools",
+        "runTeamWave",
+        "subAgentToolNames",
+        "teamRoleToolNames",
+        "toolsForMode",
+        "toolsForPermission"
+      ],
+      "typeExports": [
+        "AgentModel",
+        "HookDiagnostic",
+        "ModelProfile",
+        "ModelRuntime",
+        "RuntimeEvent",
+        "RuntimeHook",
+        "SubAgentRole",
+        "SubAgentToolsOptions",
+        "TeamRole",
+        "TeamTask",
+        "TeamTaskInput",
+        "TeamTaskStatus",
+        "TeamToolsOptions",
+        "TeamWorkerResult",
+        "ToolCapability"
+      ]
+    }
+  }
+}

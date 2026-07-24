@@ -4,7 +4,50 @@ import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
+import {
+  cutoverEventTaskV12,
+  hasFinalEventTaskV12Schema,
+  hasLegacyEventTaskSchema,
+} from '../src/daemon/persistence/schema/migrations/v12-event-task-cutover.js';
+import {
+  prepareLegacyEventSchemaForV12,
+} from '../src/daemon/persistence/schema/migrations/v3-v11-legacy-event-preparation.js';
 import { MimiStore } from '../src/daemon/store.js';
+
+function createLegacyV2(file: string): void {
+  const database = new DatabaseSync(file);
+  database.exec(`
+    CREATE TABLE events (
+      id TEXT PRIMARY KEY,
+      status TEXT NOT NULL,
+      not_before TEXT NOT NULL,
+      priority INTEGER NOT NULL,
+      received_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    ) STRICT;
+    CREATE TABLE runs (
+      id TEXT PRIMARY KEY,
+      event_id TEXT NOT NULL REFERENCES events(id),
+      status TEXT NOT NULL
+    ) STRICT;
+    CREATE TABLE outbox (
+      id TEXT PRIMARY KEY,
+      status TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    ) STRICT;
+    CREATE TABLE audit_events (
+      id TEXT PRIMARY KEY,
+      created_at TEXT NOT NULL
+    ) STRICT;
+    CREATE TABLE schedules (
+      id TEXT PRIMARY KEY,
+      enabled INTEGER NOT NULL,
+      updated_at TEXT NOT NULL
+    ) STRICT;
+    PRAGMA user_version = 2;
+  `);
+  database.close();
+}
 
 function createLegacyV11(file: string): void {
   const database = new DatabaseSync(file);
@@ -195,6 +238,89 @@ function addV13ProtectedDigestedTask(file: string): void {
   database.close();
 }
 
+test('legacy v2 schema preparation is idempotent and produces the complete v11 cutover shape', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-event-task-v2-preparation-'));
+  const file = path.join(root, 'mimi.db');
+  createLegacyV2(file);
+  const database = new DatabaseSync(file);
+  try {
+    prepareLegacyEventSchemaForV12(database, 2);
+    const indexesAfterFirstRun = database.prepare(`
+      SELECT name FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_%' ORDER BY name
+    `).all();
+    prepareLegacyEventSchemaForV12(database, 2);
+
+    const eventColumns = new Set(
+      (database.prepare('PRAGMA table_info(events)').all() as Array<{ name: string }>)
+        .map((column) => column.name),
+    );
+    assert.deepEqual(
+      [
+        'execution_lane',
+        'origin_session_key',
+        'parent_event_id',
+        'root_event_id',
+        'task_depth',
+        'task_control',
+        'task_control_reason',
+        'completion_deferrals',
+        'completion_no_progress_deferrals',
+        'completion_progress_fingerprint',
+        'max_attempts',
+      ].filter((column) => !eventColumns.has(column)),
+      [],
+    );
+    const scheduleColumns = new Set(
+      (database.prepare('PRAGMA table_info(schedules)').all() as Array<{ name: string }>)
+        .map((column) => column.name),
+    );
+    assert.equal(scheduleColumns.has('authority_event_id'), true);
+    assert.ok(database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='digest_items'").get());
+    assert.ok(database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='attention_state'").get());
+    assert.deepEqual(database.prepare(`
+      SELECT name FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_%' ORDER BY name
+    `).all(), indexesAfterFirstRun);
+    assert.equal((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 2);
+  } finally {
+    database.close();
+  }
+});
+
+test('v12 migration pre/post checks and rollback preserve the legacy database atomically', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-event-task-v12-direct-'));
+  const file = path.join(root, 'mimi.db');
+  createLegacyV11(file);
+  const database = new DatabaseSync(file);
+  try {
+    assert.equal(hasLegacyEventTaskSchema(database), true);
+    assert.equal(hasFinalEventTaskV12Schema(database), false);
+    assert.throws(
+      () => cutoverEventTaskV12(database, {
+        backfillScheduleAuthorities: () => {
+          throw new Error('injected backfill failure');
+        },
+      }),
+      /injected backfill failure/,
+    );
+    assert.equal(hasLegacyEventTaskSchema(database), true);
+    assert.equal(hasFinalEventTaskV12Schema(database), false);
+    assert.equal(database.prepare("SELECT name FROM sqlite_master WHERE name = 'tasks'").get(), undefined);
+    assert.equal((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 11);
+    assert.equal((database.prepare('PRAGMA foreign_keys').get() as { foreign_keys: number }).foreign_keys, 1);
+
+    cutoverEventTaskV12(database, { backfillScheduleAuthorities: () => undefined });
+    assert.equal(hasLegacyEventTaskSchema(database), false);
+    assert.equal(hasFinalEventTaskV12Schema(database), true);
+    assert.equal((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 12);
+    assert.equal((database.prepare('SELECT COUNT(*) AS count FROM tasks').get() as { count: number }).count, 2);
+    assert.equal((database.prepare('SELECT COUNT(*) AS count FROM runs').get() as { count: number }).count, 1);
+    assert.equal((database.prepare('SELECT COUNT(*) AS count FROM outbox').get() as { count: number }).count, 1);
+    assert.deepEqual(database.prepare('PRAGMA foreign_key_check').all(), []);
+  } finally {
+    database.close();
+  }
+});
+
 test('ingress records an immutable Event and routes one executable Task', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-event-task-ingress-'));
   const file = path.join(root, 'mimi.db');
@@ -245,9 +371,30 @@ test('retention removes routed observe-only Events with their receipts', async (
     store.routeEvent(appended.event.id, {
       routerVersion: 'test', decision: 'observe_only', reasonCode: 'test_observation',
     });
-    assert.equal(store.pruneHistory(new Date('2026-07-21T00:00:00.000Z')).events, 1);
+    const cutoff = new Date(Date.parse(appended.event.createdAt) + 1);
+    assert.equal(store.pruneHistory(cutoff).events, 1);
     assert.equal(store.getImmutableEvent(appended.event.id), undefined);
     assert.equal(store.getEventRouteReceipt(appended.event.id), undefined);
+  } finally {
+    store.close();
+  }
+});
+
+test('retention preserves Events referenced by active Tasks', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-event-task-prune-active-'));
+  const store = new MimiStore(path.join(root, 'mimi.db'));
+  try {
+    const accepted = store.ingestEvent({
+      id: 'active-event', externalId: 'active-event', source: 'test', kind: 'command',
+      trust: 'owner', payload: { prompt: 'still active' }, profileId: 'owner',
+      occurredAt: '2026-07-20T00:00:00.000Z', receivedAt: '2026-07-20T00:00:00.000Z',
+      priority: 100,
+    });
+    const cutoff = new Date(Date.parse(accepted.event.createdAt) + 1);
+    assert.ok(accepted.task);
+    assert.equal(store.pruneHistory(cutoff).tasks, 0);
+    assert.equal(store.getImmutableEvent(accepted.event.id)?.id, accepted.event.id);
+    assert.deepEqual(store.getEventRouteReceipt(accepted.event.id)?.taskIds, [accepted.task.id]);
   } finally {
     store.close();
   }

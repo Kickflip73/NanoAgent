@@ -197,10 +197,17 @@ let pollCursor;
 let pollFailures = 0;
 let pollOutageId;
 const pendingEventAcks = new Map();
-emit({
-  type: 'status', inbound: eventUrl ? 'ready' : 'unavailable', outbound: 'ready',
-  deliveryConfirmed: true, eventAcknowledgement: true,
-});
+const pollFreshForMs = eventUrl && pollIntervalMs > 0
+  ? Math.min(7 * 24 * 60 * 60_000, Math.max(5_000, pollIntervalMs * 3))
+  : undefined;
+function emitReadiness() {
+  emit({
+    type: 'status', inbound: eventUrl ? 'ready' : 'unavailable', outbound: 'ready',
+    deliveryConfirmed: true, eventAcknowledgement: true,
+    ...(pollFreshForMs ? { freshForMs: pollFreshForMs } : {}),
+  });
+}
+emitReadiness();
 
 function emitWithAck(event) {
   return new Promise((resolve, reject) => {
@@ -254,6 +261,7 @@ async function pollEvents() {
     if (payload.cursor) pollCursor = payload.cursor;
     if (pollFailures > 0) pollHealth('recovered');
     pollFailures = 0;
+    emitReadiness();
   } catch (error) {
     pollFailures += 1;
     if (pollFailures === 1) pollHealth('offline', error);

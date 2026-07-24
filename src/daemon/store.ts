@@ -5,6 +5,20 @@ import { DatabaseSync } from 'node:sqlite';
 import { assertSessionId } from '../core/session-id.js';
 import { EventStore } from './event-store.js';
 import { EventRouter } from './event-router.js';
+import { createFreshV12Schema } from './persistence/schema/current.js';
+import {
+  ensureMemoryLintSchemaV13,
+  hasMemoryObservationSourceKey,
+  upgradeMemoryObservationsV13,
+} from './persistence/schema/migrations/v13-memory-observations.js';
+import { repairDigestedTaskRoutesV14 } from './persistence/schema/migrations/v14-task-route-repair.js';
+import { prepareLegacyEventSchemaForV12 } from './persistence/schema/migrations/v3-v11-legacy-event-preparation.js';
+import {
+  assertEmptyPartialEventTaskV12Tables,
+  cutoverEventTaskV12,
+  hasFinalEventTaskV12Schema,
+  hasLegacyEventTaskSchema,
+} from './persistence/schema/migrations/v12-event-task-cutover.js';
 import { TaskStore } from './task-store.js';
 import type {
   EventEnvelope,
@@ -2343,80 +2357,55 @@ export class MimiStore {
     const version = Number((this.database.prepare('PRAGMA user_version').get() as Row).user_version);
     if (version > 14) throw new Error(`不支持的 MimiAgent 数据库版本：${version}`);
     if (version === 14) {
-      if (!this.hasFinalV12Schema() || !this.tableColumns('memory_observations').has('source_key')) {
+      if (!hasFinalEventTaskV12Schema(this.database) || !hasMemoryObservationSourceKey(this.database)) {
         throw new Error('MimiAgent 数据库标记为 v14，但缺少最终 Event/Task 或 Memory observation schema');
       }
-      this.ensureMemoryLintSchemaV13();
+      ensureMemoryLintSchemaV13(this.database);
       return;
     }
     if (version === 13) {
-      if (!this.hasFinalV12Schema() || !this.tableColumns('memory_observations').has('source_key')) {
+      if (!hasFinalEventTaskV12Schema(this.database) || !hasMemoryObservationSourceKey(this.database)) {
         throw new Error('MimiAgent 数据库标记为 v13，但缺少最终 Event/Task 或 Memory observation schema');
       }
-      this.ensureMemoryLintSchemaV13();
-      this.repairDigestedTaskRoutesV14();
+      ensureMemoryLintSchemaV13(this.database);
+      repairDigestedTaskRoutesV14(this.database);
       return;
     }
     if (version === 12) {
-      if (this.hasFinalV12Schema()) {
-        this.upgradeMemoryObservationsV13();
-        this.repairDigestedTaskRoutesV14();
+      if (hasFinalEventTaskV12Schema(this.database)) {
+        upgradeMemoryObservationsV13(this.database);
+        repairDigestedTaskRoutesV14(this.database);
         return;
       }
-      if (!this.hasLegacyEventSchema()) {
+      if (!hasLegacyEventTaskSchema(this.database)) {
         throw new Error('MimiAgent 数据库标记为 v12，但表结构既不是最终 v12 也不是可恢复的旧 Event schema');
       }
-      this.assertEmptyPartialV12Tables();
-      this.cutoverEventTaskV12(true);
-      this.upgradeMemoryObservationsV13();
-      this.repairDigestedTaskRoutesV14();
+      assertEmptyPartialEventTaskV12Tables(this.database);
+      cutoverEventTaskV12(this.database, {
+        removePartialV12: true,
+        backfillScheduleAuthorities: () => this.backfillScheduleAuthorities(),
+      });
+      upgradeMemoryObservationsV13(this.database);
+      repairDigestedTaskRoutesV14(this.database);
       return;
     }
     if (version === 0) {
-      this.createFreshV12Schema();
-      this.upgradeMemoryObservationsV13();
-      this.repairDigestedTaskRoutesV14();
+      createFreshV12Schema(this.database);
+      upgradeMemoryObservationsV13(this.database);
+      repairDigestedTaskRoutesV14(this.database);
       return;
     }
-    if (version <= 2) {
-      this.database.exec(`
-        CREATE TABLE IF NOT EXISTS digest_items (
-          id TEXT PRIMARY KEY,
-          event_id TEXT NOT NULL UNIQUE REFERENCES events(id),
-          source TEXT NOT NULL,
-          kind TEXT NOT NULL,
-          priority INTEGER NOT NULL,
-          payload_json TEXT NOT NULL,
-          reason TEXT NOT NULL,
-          occurred_at TEXT NOT NULL,
-          created_at TEXT NOT NULL,
-          digested_at TEXT,
-          briefing_event_id TEXT REFERENCES events(id)
-        ) STRICT;
-        CREATE INDEX IF NOT EXISTS digest_pending_idx
-          ON digest_items(digested_at, briefing_event_id, priority, occurred_at);
-        CREATE TABLE IF NOT EXISTS attention_state (
-          key TEXT PRIMARY KEY,
-          value TEXT NOT NULL,
-          updated_at TEXT NOT NULL
-        ) STRICT;
-      `);
-    }
-    this.addEventTaskColumns();
-    this.addEventTaskControlColumns();
-    this.addEventCompletionColumns();
-    this.addEventAttemptColumns();
-    this.addScheduleAuthorityColumns();
-    this.createRetentionIndexes();
-    this.createEventTaskIndexes();
-    this.cutoverEventTaskV12();
-    this.upgradeMemoryObservationsV13();
-    this.repairDigestedTaskRoutesV14();
+    prepareLegacyEventSchemaForV12(this.database, version);
+    cutoverEventTaskV12(this.database, {
+      backfillScheduleAuthorities: () => this.backfillScheduleAuthorities(),
+    });
+    upgradeMemoryObservationsV13(this.database);
+    repairDigestedTaskRoutesV14(this.database);
   }
 
   private backupBeforeTaskRouteRepairV14(): void {
     const version = Number((this.database.prepare('PRAGMA user_version').get() as Row).user_version);
-    if (version !== 13 || !this.hasFinalV12Schema()) return;
+    if (version !== 13 || !hasFinalEventTaskV12Schema(this.database)) return;
     this.database.exec('PRAGMA wal_checkpoint(FULL);');
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
     const backupRoot = path.join(path.dirname(this.file), 'backups', `task-route-v14-${stamp}-${randomUUID().slice(0, 8)}`);
@@ -2429,38 +2418,6 @@ export class MimiStore {
       copyFileSync(source, target);
       chmodSync(target, 0o600);
     }
-  }
-
-  private repairDigestedTaskRoutesV14(): void {
-    this.database.exec(`
-      BEGIN IMMEDIATE;
-      UPDATE event_route_receipts
-      SET decision = 'digest', task_ids_json = '[]', reason_code = 'legacy_digest_conversion'
-      WHERE router_version = 'migration-v12'
-        AND EXISTS (
-          SELECT 1 FROM events lifecycle
-          WHERE lifecycle.id = 'migration-task-' || event_route_receipts.event_id
-            AND lifecycle.source = 'mimi:migration'
-            AND lifecycle.type = 'task.digested'
-            AND lifecycle.causation_event_id = event_route_receipts.event_id
-        )
-        AND NOT EXISTS (SELECT 1 FROM runs WHERE task_id = event_route_receipts.event_id)
-        AND NOT EXISTS (SELECT 1 FROM outbox WHERE task_id = event_route_receipts.event_id);
-      DELETE FROM tasks
-      WHERE idempotency_key = 'migration:event:' || id
-        AND EXISTS (
-          SELECT 1 FROM events lifecycle
-          WHERE lifecycle.id = 'migration-task-' || tasks.id
-            AND lifecycle.source = 'mimi:migration'
-            AND lifecycle.type = 'task.digested'
-            AND lifecycle.causation_event_id = tasks.id
-        )
-        AND NOT EXISTS (SELECT 1 FROM runs WHERE task_id = tasks.id)
-        AND NOT EXISTS (SELECT 1 FROM outbox WHERE task_id = tasks.id)
-        AND NOT EXISTS (SELECT 1 FROM tasks child WHERE child.parent_task_id = tasks.id);
-      PRAGMA user_version = 14;
-      COMMIT;
-    `);
   }
 
   private backupBeforeMemoryHubCutover(): void {
@@ -2480,503 +2437,6 @@ export class MimiStore {
       const target = path.join(backupRoot, `${path.basename(this.file)}${suffix}`);
       copyFileSync(source, target);
       chmodSync(target, 0o600);
-    }
-  }
-
-  private upgradeMemoryObservationsV13(): void {
-    this.database.exec(`
-      BEGIN IMMEDIATE;
-      CREATE TABLE IF NOT EXISTS memory_observations (
-        source_key TEXT PRIMARY KEY,
-        event_id TEXT NOT NULL REFERENCES events(id),
-        task_id TEXT NOT NULL REFERENCES tasks(id),
-        run_id TEXT NOT NULL REFERENCES runs(id),
-        session_id TEXT NOT NULL,
-        profile_id TEXT NOT NULL,
-        outcome TEXT NOT NULL CHECK(outcome IN ('completed', 'dead_letter')),
-        trust TEXT NOT NULL,
-        content_digest TEXT NOT NULL,
-        observed_at TEXT NOT NULL,
-        compiled_at TEXT,
-        receipt_id TEXT
-      ) STRICT;
-      CREATE INDEX IF NOT EXISTS memory_observations_pending_idx
-        ON memory_observations(compiled_at, profile_id, observed_at);
-      CREATE INDEX IF NOT EXISTS memory_observations_task_idx
-        ON memory_observations(task_id, run_id);
-      CREATE TABLE IF NOT EXISTS memory_lint_state (
-        profile_id TEXT PRIMARY KEY,
-        changes_since_lint INTEGER NOT NULL DEFAULT 0,
-        first_changed_at TEXT,
-        last_lint_at TEXT
-      ) STRICT;
-      CREATE TABLE IF NOT EXISTS memory_lint_receipts (
-        receipt_id TEXT PRIMARY KEY,
-        profile_id TEXT NOT NULL,
-        page_count INTEGER NOT NULL,
-        recorded_at TEXT NOT NULL
-      ) STRICT;
-      CREATE TABLE IF NOT EXISTS memory_lint_task_receipts (
-        task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
-        profile_id TEXT NOT NULL,
-        completed_at TEXT NOT NULL
-      ) STRICT;
-      PRAGMA user_version = 13;
-      COMMIT;
-    `);
-  }
-
-  private ensureMemoryLintSchemaV13(): void {
-    this.database.exec(`
-      CREATE TABLE IF NOT EXISTS memory_lint_state (
-        profile_id TEXT PRIMARY KEY,
-        changes_since_lint INTEGER NOT NULL DEFAULT 0,
-        first_changed_at TEXT,
-        last_lint_at TEXT
-      ) STRICT;
-      CREATE TABLE IF NOT EXISTS memory_lint_receipts (
-        receipt_id TEXT PRIMARY KEY,
-        profile_id TEXT NOT NULL,
-        page_count INTEGER NOT NULL,
-        recorded_at TEXT NOT NULL
-      ) STRICT;
-      CREATE TABLE IF NOT EXISTS memory_lint_task_receipts (
-        task_id TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
-        profile_id TEXT NOT NULL,
-        completed_at TEXT NOT NULL
-      ) STRICT;
-    `);
-  }
-
-  private tableColumns(table: string): Set<string> {
-    return new Set((this.database.prepare(`PRAGMA table_info(${table})`).all() as Row[])
-      .map((row) => String(row.name)));
-  }
-
-  private hasFinalV12Schema(): boolean {
-    const events = this.tableColumns('events');
-    const tasks = this.tableColumns('tasks');
-    const runs = this.tableColumns('runs');
-    const outbox = this.tableColumns('outbox');
-    return events.has('type') && !events.has('status')
-      && tasks.has('authority_event_id') && tasks.has('attempt_count')
-      && runs.has('task_id') && runs.has('attempt_no')
-      && outbox.has('task_id') && !outbox.has('event_id');
-  }
-
-  private hasLegacyEventSchema(): boolean {
-    const events = this.tableColumns('events');
-    const runs = this.tableColumns('runs');
-    const outbox = this.tableColumns('outbox');
-    return events.has('kind') && events.has('status') && events.has('execution_lane')
-      && !events.has('type') && runs.has('event_id') && outbox.has('event_id');
-  }
-
-  private assertEmptyPartialV12Tables(): void {
-    for (const table of ['events_v2', 'tasks', 'task_attempts', 'event_route_receipts']) {
-      const exists = this.database.prepare(
-        "SELECT 1 AS present FROM sqlite_master WHERE type = 'table' AND name = ?",
-      ).get(table);
-      if (!exists) continue;
-      const count = Number((this.database.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as Row).count);
-      if (count > 0) {
-        throw new Error(`MimiAgent v12 半迁移表 ${table} 含 ${count} 行，拒绝自动覆盖；请先人工核对数据`);
-      }
-    }
-  }
-
-  private createFreshV12Schema(): void {
-    this.database.exec(`
-      BEGIN IMMEDIATE;
-      CREATE TABLE events (
-        id TEXT PRIMARY KEY, external_id TEXT NOT NULL, source TEXT NOT NULL, type TEXT NOT NULL,
-        trust TEXT NOT NULL, actor_json TEXT NOT NULL, conversation_json TEXT NOT NULL,
-        payload_json TEXT NOT NULL, subject_type TEXT, subject_id TEXT, correlation_id TEXT,
-        causation_event_id TEXT REFERENCES events(id), profile_id TEXT NOT NULL,
-        reply_route_json TEXT NOT NULL, occurred_at TEXT NOT NULL, received_at TEXT NOT NULL,
-        created_at TEXT NOT NULL, UNIQUE(source, external_id)
-      ) STRICT;
-      CREATE TABLE tasks (
-        id TEXT PRIMARY KEY, type TEXT NOT NULL, idempotency_key TEXT NOT NULL UNIQUE,
-        trigger_event_id TEXT REFERENCES events(id), authority_event_id TEXT NOT NULL REFERENCES events(id),
-        parent_task_id TEXT REFERENCES tasks(id), profile_id TEXT NOT NULL, session_key TEXT,
-        objective_json TEXT NOT NULL, executor TEXT NOT NULL, workspace_access TEXT NOT NULL,
-        priority INTEGER NOT NULL, status TEXT NOT NULL, not_before TEXT NOT NULL,
-        attempt_count INTEGER NOT NULL, max_attempts INTEGER NOT NULL, lease_owner TEXT,
-        lease_until TEXT, control_intent TEXT, control_reason TEXT, result_json TEXT, error TEXT,
-        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-      ) STRICT;
-      CREATE TABLE event_route_receipts (
-        event_id TEXT PRIMARY KEY REFERENCES events(id), router_version TEXT NOT NULL,
-        decision TEXT NOT NULL, task_ids_json TEXT NOT NULL, reason_code TEXT NOT NULL,
-        routed_at TEXT NOT NULL
-      ) STRICT;
-      CREATE TABLE runs (
-        id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), attempt_no INTEGER NOT NULL,
-        session_key TEXT NOT NULL, worker_id TEXT NOT NULL, status TEXT NOT NULL,
-        started_at TEXT NOT NULL, completed_at TEXT, answer_json TEXT, error TEXT,
-        UNIQUE(task_id, attempt_no)
-      ) STRICT;
-      CREATE TABLE outbox (
-        id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(id), channel TEXT NOT NULL,
-        target TEXT, payload_json TEXT NOT NULL, status TEXT NOT NULL, attempts INTEGER NOT NULL,
-        not_before TEXT NOT NULL, lease_owner TEXT, lease_until TEXT, error TEXT,
-        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-      ) STRICT;
-      CREATE TABLE leases (
-        resource TEXT PRIMARY KEY, owner TEXT NOT NULL, fencing_token INTEGER NOT NULL,
-        lease_until TEXT NOT NULL, updated_at TEXT NOT NULL
-      ) STRICT;
-      CREATE TABLE audit_events (
-        sequence INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE,
-        event_type TEXT NOT NULL, entity_id TEXT NOT NULL, data_json TEXT NOT NULL,
-        created_at TEXT NOT NULL
-      ) STRICT;
-      CREATE TABLE schedules (
-        id TEXT PRIMARY KEY, name TEXT NOT NULL, schedule_type TEXT NOT NULL,
-        schedule_value TEXT NOT NULL, prompt TEXT NOT NULL, profile_id TEXT NOT NULL,
-        session_key TEXT, authority_event_id TEXT REFERENCES events(id), reply_route_json TEXT NOT NULL,
-        trust TEXT NOT NULL, enabled INTEGER NOT NULL, next_run_at TEXT NOT NULL,
-        last_run_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-      ) STRICT;
-      CREATE TABLE digest_items (
-        id TEXT PRIMARY KEY, event_id TEXT NOT NULL UNIQUE REFERENCES events(id),
-        source TEXT NOT NULL, kind TEXT NOT NULL, priority INTEGER NOT NULL,
-        payload_json TEXT NOT NULL, reason TEXT NOT NULL, occurred_at TEXT NOT NULL,
-        created_at TEXT NOT NULL, digested_at TEXT, briefing_event_id TEXT REFERENCES events(id)
-      ) STRICT;
-      CREATE TABLE attention_state (
-        key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL
-      ) STRICT;
-      CREATE INDEX events_timeline_idx ON events(received_at DESC, id);
-      CREATE INDEX events_subject_idx ON events(subject_type, subject_id, received_at DESC);
-      CREATE INDEX events_correlation_idx ON events(correlation_id, received_at ASC);
-      CREATE INDEX events_causation_idx ON events(causation_event_id);
-      CREATE TRIGGER events_immutable_update BEFORE UPDATE ON events
-      BEGIN SELECT RAISE(ABORT, 'immutable event cannot be updated'); END;
-      CREATE INDEX tasks_ready_idx ON tasks(status, not_before, priority DESC, created_at ASC);
-      CREATE INDEX tasks_ready_priority_idx ON tasks(priority DESC, created_at ASC, not_before)
-        WHERE status = 'queued';
-      CREATE INDEX tasks_recovery_idx ON tasks(status, lease_until);
-      CREATE INDEX tasks_session_idx ON tasks(session_key, status, updated_at DESC);
-      CREATE INDEX tasks_trigger_idx ON tasks(trigger_event_id);
-      CREATE INDEX tasks_authority_idx ON tasks(authority_event_id);
-      CREATE INDEX tasks_parent_idx ON tasks(parent_task_id);
-      CREATE INDEX tasks_retention_idx ON tasks(status, updated_at);
-      CREATE INDEX runs_task_status_idx ON runs(task_id, status);
-      CREATE INDEX outbox_ready_idx ON outbox(status, not_before, created_at);
-      CREATE INDEX outbox_task_idx ON outbox(task_id);
-      CREATE INDEX outbox_retention_idx ON outbox(status, updated_at);
-      CREATE INDEX audit_retention_idx ON audit_events(created_at);
-      CREATE INDEX schedules_due_idx ON schedules(enabled, next_run_at);
-      CREATE INDEX schedules_retention_idx ON schedules(enabled, updated_at);
-      CREATE INDEX digest_pending_idx ON digest_items(digested_at, briefing_event_id, priority, occurred_at);
-      CREATE INDEX digest_retention_idx ON digest_items(digested_at);
-      CREATE INDEX attention_retention_idx ON attention_state(updated_at);
-      PRAGMA user_version = 12;
-      COMMIT;
-    `);
-  }
-
-  private cutoverEventTaskV12(removePartialV12 = false): void {
-    const legacyCounts = {
-      events: Number((this.database.prepare('SELECT COUNT(*) AS count FROM events').get() as Row).count),
-      executableEvents: Number((this.database.prepare(`
-        SELECT COUNT(*) AS count FROM events WHERE status NOT IN ('digested', 'ignored')
-      `).get() as Row).count),
-      runs: Number((this.database.prepare('SELECT COUNT(*) AS count FROM runs').get() as Row).count),
-      outbox: Number((this.database.prepare('SELECT COUNT(*) AS count FROM outbox').get() as Row).count),
-    };
-    this.database.exec('PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE;');
-    try {
-      if (removePartialV12) {
-        this.database.exec(`
-          DROP TABLE IF EXISTS task_attempts;
-          DROP TABLE IF EXISTS event_route_receipts;
-          DROP TABLE IF EXISTS tasks;
-          DROP TABLE IF EXISTS events_v2;
-        `);
-      }
-      this.database.exec(`
-        CREATE TABLE events_v12 (
-          id TEXT PRIMARY KEY,
-          external_id TEXT NOT NULL,
-          source TEXT NOT NULL,
-          type TEXT NOT NULL,
-          trust TEXT NOT NULL,
-          actor_json TEXT NOT NULL,
-          conversation_json TEXT NOT NULL,
-          payload_json TEXT NOT NULL,
-          subject_type TEXT,
-          subject_id TEXT,
-          correlation_id TEXT,
-          causation_event_id TEXT REFERENCES events_v12(id),
-          profile_id TEXT NOT NULL,
-          reply_route_json TEXT NOT NULL,
-          occurred_at TEXT NOT NULL,
-          received_at TEXT NOT NULL,
-          created_at TEXT NOT NULL,
-          UNIQUE(source, external_id)
-        ) STRICT;
-        CREATE TABLE tasks_v12 (
-          id TEXT PRIMARY KEY,
-          type TEXT NOT NULL,
-          idempotency_key TEXT NOT NULL UNIQUE,
-          trigger_event_id TEXT REFERENCES events_v12(id),
-          authority_event_id TEXT NOT NULL REFERENCES events_v12(id),
-          parent_task_id TEXT REFERENCES tasks_v12(id),
-          profile_id TEXT NOT NULL,
-          session_key TEXT,
-          objective_json TEXT NOT NULL,
-          executor TEXT NOT NULL,
-          workspace_access TEXT NOT NULL,
-          priority INTEGER NOT NULL,
-          status TEXT NOT NULL,
-          not_before TEXT NOT NULL,
-          attempt_count INTEGER NOT NULL,
-          max_attempts INTEGER NOT NULL,
-          lease_owner TEXT,
-          lease_until TEXT,
-          control_intent TEXT,
-          control_reason TEXT,
-          result_json TEXT,
-          error TEXT,
-          created_at TEXT NOT NULL,
-          updated_at TEXT NOT NULL
-        ) STRICT;
-        CREATE TABLE event_route_receipts_v12 (
-          event_id TEXT PRIMARY KEY REFERENCES events_v12(id),
-          router_version TEXT NOT NULL,
-          decision TEXT NOT NULL,
-          task_ids_json TEXT NOT NULL,
-          reason_code TEXT NOT NULL,
-          routed_at TEXT NOT NULL
-        ) STRICT;
-        CREATE TABLE runs_v12 (
-          id TEXT PRIMARY KEY,
-          task_id TEXT NOT NULL REFERENCES tasks_v12(id),
-          attempt_no INTEGER NOT NULL,
-          session_key TEXT NOT NULL,
-          worker_id TEXT NOT NULL,
-          status TEXT NOT NULL,
-          started_at TEXT NOT NULL,
-          completed_at TEXT,
-          answer_json TEXT,
-          error TEXT,
-          UNIQUE(task_id, attempt_no)
-        ) STRICT;
-        CREATE TABLE outbox_v12 (
-          id TEXT PRIMARY KEY,
-          task_id TEXT NOT NULL REFERENCES tasks_v12(id),
-          channel TEXT NOT NULL,
-          target TEXT,
-          payload_json TEXT NOT NULL,
-          status TEXT NOT NULL,
-          attempts INTEGER NOT NULL,
-          not_before TEXT NOT NULL,
-          lease_owner TEXT,
-          lease_until TEXT,
-          error TEXT,
-          created_at TEXT NOT NULL,
-          updated_at TEXT NOT NULL
-        ) STRICT;
-
-        INSERT INTO events_v12 (
-          id, external_id, source, type, trust, actor_json, conversation_json, payload_json,
-          correlation_id, causation_event_id, profile_id, reply_route_json,
-          occurred_at, received_at, created_at
-        )
-        SELECT id, external_id, source,
-          CASE WHEN execution_lane = 'task' THEN 'task.migrated'
-            WHEN kind = 'schedule' THEN 'schedule.due' ELSE kind || '.received' END,
-          trust, actor_json, conversation_json, payload_json,
-          COALESCE(root_event_id, parent_event_id, id), parent_event_id, profile_id,
-          reply_route_json, occurred_at, received_at, created_at
-        FROM events;
-
-        INSERT INTO tasks_v12 (
-          id, type, idempotency_key, trigger_event_id, authority_event_id, parent_task_id,
-          profile_id, session_key, objective_json, executor, workspace_access, priority,
-          status, not_before, attempt_count, max_attempts, lease_owner, lease_until,
-          control_intent, control_reason, result_json, error, created_at, updated_at
-        )
-        SELECT e.id,
-          CASE WHEN e.execution_lane = 'task' AND e.kind = 'schedule' THEN 'scheduled'
-            WHEN e.execution_lane = 'task' THEN 'background' ELSE 'conversation' END,
-          'migration:event:' || e.id,
-          e.id,
-          COALESCE(e.root_event_id, e.parent_event_id, e.id),
-          e.parent_event_id,
-          e.profile_id, e.session_key, e.payload_json,
-          CASE WHEN e.execution_lane = 'task' AND json_extract(e.payload_json, '$.executor') = 'codex'
-            THEN 'codex' WHEN e.execution_lane = 'task' THEN 'isolated_worker' ELSE 'session_actor' END,
-          CASE WHEN json_extract(e.payload_json, '$.workspaceAccess') = 'read' THEN 'read' ELSE 'write' END,
-          e.priority,
-          CASE e.status WHEN 'archived' THEN 'cancelled' WHEN 'ignored' THEN 'completed'
-            WHEN 'digested' THEN 'completed' ELSE e.status END,
-          e.not_before, e.attempts, COALESCE(e.max_attempts, 5), e.lease_owner, e.lease_until,
-          e.task_control, e.task_control_reason, e.result_json, e.error, e.created_at, e.updated_at
-        FROM events e LEFT JOIN events parent ON parent.id = e.parent_event_id
-        WHERE e.status NOT IN ('digested', 'ignored');
-
-        INSERT INTO events_v12 (
-          id, external_id, source, type, trust, actor_json, conversation_json, payload_json,
-          subject_type, subject_id, correlation_id, causation_event_id, profile_id,
-          reply_route_json, occurred_at, received_at, created_at
-        )
-        SELECT 'migration-task-' || id, 'task:' || id || ':migration-v12', 'mimi:migration',
-          'task.' || CASE status WHEN 'queued' THEN 'created' WHEN 'running' THEN 'started'
-            WHEN 'dead_letter' THEN 'dead_letter' WHEN 'cancelled' THEN 'cancelled'
-            ELSE status END,
-          'system', 'null', 'null', json_object('provenance', 'migration-v12'),
-          'task', id, COALESCE(root_event_id, parent_event_id, id), id, profile_id,
-          'null', updated_at, updated_at, updated_at
-        FROM events
-        WHERE status NOT IN ('digested', 'ignored');
-
-        INSERT INTO event_route_receipts_v12 (
-          event_id, router_version, decision, task_ids_json, reason_code, routed_at
-        )
-        SELECT id, 'migration-v12',
-          CASE status WHEN 'digested' THEN 'digest' WHEN 'ignored' THEN 'rejected'
-            ELSE 'task_created' END,
-          CASE WHEN status IN ('digested', 'ignored') THEN '[]' ELSE json_array(id) END,
-          CASE status WHEN 'digested' THEN 'legacy_digest_conversion'
-            WHEN 'ignored' THEN 'legacy_ignored_conversion'
-            ELSE 'legacy_event_conversion' END,
-          updated_at
-        FROM events;
-
-        INSERT INTO event_route_receipts_v12 (
-          event_id, router_version, decision, task_ids_json, reason_code, routed_at
-        )
-        SELECT 'migration-task-' || id, 'migration-v12', 'observe_only', '[]',
-          'task_lifecycle', updated_at
-        FROM events
-        WHERE status NOT IN ('digested', 'ignored');
-
-        INSERT INTO runs_v12 (
-          id, task_id, attempt_no, session_key, worker_id, status,
-          started_at, completed_at, answer_json, error
-        )
-        SELECT r.id, r.event_id,
-          ROW_NUMBER() OVER (PARTITION BY r.event_id ORDER BY r.started_at, r.id),
-          r.session_key, COALESCE(e.lease_owner, 'migration'), r.status,
-          r.started_at, r.completed_at, r.answer_json, r.error
-        FROM runs r JOIN events e ON e.id = r.event_id;
-
-        INSERT INTO outbox_v12 (
-          id, task_id, channel, target, payload_json, status, attempts,
-          not_before, lease_owner, lease_until, error, created_at, updated_at
-        )
-        SELECT id, event_id, channel, target, payload_json, status, attempts,
-          not_before, lease_owner, lease_until, error, created_at, updated_at
-        FROM outbox;
-
-        DROP TABLE runs;
-        DROP TABLE outbox;
-        DROP TABLE events;
-        ALTER TABLE events_v12 RENAME TO events;
-        ALTER TABLE tasks_v12 RENAME TO tasks;
-        ALTER TABLE event_route_receipts_v12 RENAME TO event_route_receipts;
-        ALTER TABLE runs_v12 RENAME TO runs;
-        ALTER TABLE outbox_v12 RENAME TO outbox;
-
-        CREATE INDEX events_timeline_idx ON events(received_at DESC, id);
-        CREATE INDEX events_subject_idx ON events(subject_type, subject_id, received_at DESC);
-        CREATE INDEX events_correlation_idx ON events(correlation_id, received_at ASC);
-        CREATE TRIGGER events_immutable_update BEFORE UPDATE ON events
-        BEGIN SELECT RAISE(ABORT, 'immutable event cannot be updated'); END;
-        CREATE INDEX tasks_ready_idx ON tasks(status, not_before, priority DESC, created_at ASC);
-        CREATE INDEX tasks_ready_priority_idx ON tasks(priority DESC, created_at ASC, not_before) WHERE status = 'queued';
-        CREATE INDEX tasks_recovery_idx ON tasks(status, lease_until);
-        CREATE INDEX tasks_session_idx ON tasks(session_key, status, updated_at DESC);
-        CREATE INDEX tasks_trigger_idx ON tasks(trigger_event_id);
-        CREATE INDEX tasks_parent_idx ON tasks(parent_task_id);
-        CREATE UNIQUE INDEX runs_task_attempt_idx ON runs(task_id, attempt_no);
-        CREATE INDEX runs_task_status_idx ON runs(task_id, status);
-        CREATE INDEX outbox_ready_idx ON outbox(status, not_before, created_at);
-        CREATE INDEX outbox_retention_idx ON outbox(status, updated_at);
-      `);
-      this.backfillScheduleAuthorities();
-      const convertedCounts = {
-        tasks: Number((this.database.prepare('SELECT COUNT(*) AS count FROM tasks').get() as Row).count),
-        routes: Number((this.database.prepare('SELECT COUNT(*) AS count FROM event_route_receipts').get() as Row).count),
-        runs: Number((this.database.prepare('SELECT COUNT(*) AS count FROM runs').get() as Row).count),
-        outbox: Number((this.database.prepare('SELECT COUNT(*) AS count FROM outbox').get() as Row).count),
-      };
-      if (convertedCounts.tasks !== legacyCounts.executableEvents
-        || convertedCounts.routes !== legacyCounts.events + legacyCounts.executableEvents
-        || convertedCounts.runs !== legacyCounts.runs
-        || convertedCounts.outbox !== legacyCounts.outbox) {
-        throw new Error(`Event/Task v12 转换计数校验失败：${JSON.stringify({ legacyCounts, convertedCounts })}`);
-      }
-      const foreignKeyFailures = this.database.prepare('PRAGMA foreign_key_check').all();
-      if (foreignKeyFailures.length > 0) {
-        throw new Error(`Event/Task v12 转换引用校验失败：${JSON.stringify(foreignKeyFailures.slice(0, 20))}`);
-      }
-      this.database.exec('PRAGMA user_version = 12; COMMIT;');
-    } catch (error) {
-      this.database.exec('ROLLBACK;');
-      throw error;
-    } finally {
-      this.database.exec('PRAGMA foreign_keys=ON;');
-    }
-  }
-
-  private addEventAttemptColumns(): void {
-    const available = new Set((this.database.prepare('PRAGMA table_info(events)').all() as Row[])
-      .map((row) => String(row.name)));
-    if (!available.has('max_attempts')) {
-      this.database.exec('ALTER TABLE events ADD COLUMN max_attempts INTEGER;');
-    }
-  }
-
-  private addEventTaskColumns(): void {
-    const available = new Set((this.database.prepare('PRAGMA table_info(events)').all() as Row[])
-      .map((row) => String(row.name)));
-    const definitions = [
-      ['execution_lane', "TEXT NOT NULL DEFAULT 'conversation'"],
-      ['origin_session_key', 'TEXT'],
-      ['parent_event_id', 'TEXT'],
-      ['root_event_id', 'TEXT'],
-      ['task_depth', 'INTEGER NOT NULL DEFAULT 0'],
-    ] as const;
-    for (const [column, definition] of definitions) {
-      if (!available.has(column)) this.database.exec(`ALTER TABLE events ADD COLUMN ${column} ${definition};`);
-    }
-  }
-
-  private addEventTaskControlColumns(): void {
-    const available = new Set((this.database.prepare('PRAGMA table_info(events)').all() as Row[])
-      .map((row) => String(row.name)));
-    const definitions = [
-      ['task_control', 'TEXT'],
-      ['task_control_reason', 'TEXT'],
-    ] as const;
-    for (const [column, definition] of definitions) {
-      if (!available.has(column)) this.database.exec(`ALTER TABLE events ADD COLUMN ${column} ${definition};`);
-    }
-  }
-
-  private addEventCompletionColumns(): void {
-    const available = new Set((this.database.prepare('PRAGMA table_info(events)').all() as Row[])
-      .map((row) => String(row.name)));
-    const definitions = [
-      ['completion_deferrals', 'INTEGER NOT NULL DEFAULT 0'],
-      ['completion_no_progress_deferrals', 'INTEGER NOT NULL DEFAULT 0'],
-      ['completion_progress_fingerprint', 'TEXT'],
-    ] as const;
-    for (const [column, definition] of definitions) {
-      if (!available.has(column)) this.database.exec(`ALTER TABLE events ADD COLUMN ${column} ${definition};`);
-    }
-  }
-
-  private addScheduleAuthorityColumns(): void {
-    const available = new Set((this.database.prepare('PRAGMA table_info(schedules)').all() as Row[])
-      .map((row) => String(row.name)));
-    if (available.size > 0 && !available.has('authority_event_id')) {
-      this.database.exec('ALTER TABLE schedules ADD COLUMN authority_event_id TEXT;');
     }
   }
 
@@ -3021,34 +2481,4 @@ export class MimiStore {
     }
   }
 
-  private createEventTaskIndexes(): void {
-    const available = new Set((this.database.prepare('PRAGMA table_info(events)').all() as Row[])
-      .map((row) => String(row.name)));
-    if (['execution_lane', 'status', 'not_before', 'priority', 'received_at']
-      .every((column) => available.has(column))) {
-      this.database.exec(`
-        CREATE INDEX IF NOT EXISTS events_lane_ready_idx
-        ON events(execution_lane, status, not_before, priority, received_at);
-      `);
-    }
-  }
-
-  private createRetentionIndexes(): void {
-    const definitions = [
-      ['events', 'events_retention_idx', 'status, updated_at'],
-      ['runs', 'runs_event_status_idx', 'event_id, status'],
-      ['outbox', 'outbox_retention_idx', 'status, updated_at'],
-      ['audit_events', 'audit_retention_idx', 'created_at'],
-      ['schedules', 'schedules_retention_idx', 'enabled, updated_at'],
-      ['digest_items', 'digest_retention_idx', 'digested_at'],
-      ['attention_state', 'attention_retention_idx', 'updated_at'],
-    ] as const;
-    for (const [table, index, columns] of definitions) {
-      const available = new Set((this.database.prepare(`PRAGMA table_info(${table})`).all() as Row[])
-        .map((row) => String(row.name)));
-      if (columns.split(', ').every((column) => available.has(column))) {
-        this.database.exec(`CREATE INDEX IF NOT EXISTS ${index} ON ${table}(${columns});`);
-      }
-    }
-  }
 }

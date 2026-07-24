@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "providers": [
+    {
+      "provider": "openai",
+      "apiKeyEnvironment": "OPENAI_API_KEY",
+      "defaultModel": "gpt-5.4-mini",
+      "transport": "responses",
+      "profile": {
+        "contextWindow": 400000,
+        "outputReserve": 32768,
+        "supportsImageInput": true
+      },
+      "messageIds": {
+        "nativePrefix": "msg",
+        "preserveNative": true,
+        "preserveForeign": false
+      }
+    },
+    {
+      "provider": "deepseek",
+      "apiKeyEnvironment": "DEEPSEEK_API_KEY",
+      "defaultModel": "deepseek-v4-pro",
+      "transport": "chat_completions",
+      "profile": {
+        "contextWindow": 1048576,
+        "outputReserve": 65536,
+        "supportsImageInput": false
+      },
+      "messageIds": {
+        "nativePrefix": "msg",
+        "preserveNative": true,
+        "preserveForeign": true
+      }
+    }
+  ]
+}

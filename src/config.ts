@@ -17,6 +17,47 @@ import {
 import type { ComputerConfig } from './extensions/computer/types.js';
 
 export type AgentPermissionMode = 'workspace' | 'read-only' | 'trusted';
+export type SecurityProfile = 'safe' | 'workstation' | 'full-owner';
+
+export interface SecurityProfileSummary {
+  id: SecurityProfile;
+  label: string;
+  permissionMode: AgentPermissionMode;
+  shell: boolean;
+  externalTransactions: boolean;
+  computerUse: boolean;
+  trustedWorkspaceMcp: boolean;
+}
+
+export const SECURITY_PROFILES: Readonly<Record<SecurityProfile, SecurityProfileSummary>> = Object.freeze({
+  safe: Object.freeze({
+    id: 'safe',
+    label: 'Safe',
+    permissionMode: 'read-only',
+    shell: false,
+    externalTransactions: false,
+    computerUse: false,
+    trustedWorkspaceMcp: false,
+  }),
+  workstation: Object.freeze({
+    id: 'workstation',
+    label: 'Workstation',
+    permissionMode: 'workspace',
+    shell: false,
+    externalTransactions: true,
+    computerUse: false,
+    trustedWorkspaceMcp: false,
+  }),
+  'full-owner': Object.freeze({
+    id: 'full-owner',
+    label: 'Full Owner',
+    permissionMode: 'trusted',
+    shell: true,
+    externalTransactions: true,
+    computerUse: true,
+    trustedWorkspaceMcp: true,
+  }),
+});
 
 export interface AppConfig {
   provider: 'openai' | 'deepseek';
@@ -32,6 +73,7 @@ export interface AppConfig {
   teamMaxConcurrency?: number;
   sessionMaxConcurrency?: number;
   permissionMode?: AgentPermissionMode;
+  securityProfile?: SecurityProfile;
   trustedWorkspaceMcp?: string;
   computer?: ComputerConfig;
 }
@@ -157,7 +199,16 @@ function configurationVersion(): number | undefined {
   return configVersion ? Number(configVersion.value) : undefined;
 }
 
-function permissionMode(): AgentPermissionMode {
+function configuredSecurityProfile(): SecurityProfile | undefined {
+  const selected = environmentEntry('MIMI_SECURITY_PROFILE');
+  if (!selected) return undefined;
+  if (!['safe', 'workstation', 'full-owner'].includes(selected.value)) {
+    throw new Error('MIMI_SECURITY_PROFILE 只能是 safe、workstation 或 full-owner');
+  }
+  return selected.value as SecurityProfile;
+}
+
+function permissionMode(profile?: SecurityProfile): AgentPermissionMode {
   const modern = environmentEntry('MIMI_PERMISSION_MODE');
   const legacy = environmentEntry('AGENT_PERMISSION_MODE');
   const selected = modern ?? legacy;
@@ -165,14 +216,39 @@ function permissionMode(): AgentPermissionMode {
   // Older templates wrote workspace even when the owner made no choice. That
   // default appeared under both the legacy and modern names, so only a current
   // template marker can distinguish a deliberate workspace restriction.
-  const oldTemplateWorkspace = selected?.value === 'workspace' && (version ?? 0) < 2;
+  const oldTemplateWorkspace = !profile && selected?.value === 'workspace' && (version ?? 0) < 2;
   const value = oldTemplateWorkspace
     ? 'trusted'
-    : selected?.value ?? 'trusted';
+    : selected?.value ?? SECURITY_PROFILES[profile ?? 'safe'].permissionMode;
   if (value !== 'workspace' && value !== 'read-only' && value !== 'trusted') {
     throw new Error(`${selected?.name ?? 'MIMI_PERMISSION_MODE'} 只能是 workspace、read-only 或 trusted`);
   }
+  if (profile && value !== SECURITY_PROFILES[profile].permissionMode) {
+    throw new Error(
+      `MIMI_SECURITY_PROFILE=${profile} 要求 MIMI_PERMISSION_MODE=${SECURITY_PROFILES[profile].permissionMode}`,
+    );
+  }
   return value;
+}
+
+function inferredSecurityProfile(mode: AgentPermissionMode): SecurityProfile {
+  if (mode === 'read-only') return 'safe';
+  if (mode === 'workspace') return 'workstation';
+  return 'full-owner';
+}
+
+export function securityProfileSummary(
+  config: Pick<AppConfig, 'securityProfile' | 'permissionMode' | 'computer' | 'trustedWorkspaceMcp'>,
+): SecurityProfileSummary {
+  const mode = config.permissionMode ?? 'trusted';
+  const id = config.securityProfile ?? inferredSecurityProfile(mode);
+  const base = SECURITY_PROFILES[id];
+  return {
+    ...base,
+    permissionMode: mode,
+    computerUse: base.computerUse && config.computer !== undefined,
+    trustedWorkspaceMcp: base.trustedWorkspaceMcp && config.trustedWorkspaceMcp !== undefined,
+  };
 }
 
 function optionalAbsolutePath(names: readonly [string, ...string[]], homeDirectory: string): string | undefined {
@@ -328,6 +404,9 @@ export function loadConfig(homeDirectory = os.homedir()): AppConfig {
   const mcpConfig = preferredEnvironmentValue('MIMI_MCP_CONFIG', 'MCP_CONFIG');
   const selectedMaxTurns = environmentEntry('MIMI_MAX_TURNS', 'MAX_TURNS');
   const configVersion = configurationVersion();
+  const requestedSecurityProfile = configuredSecurityProfile();
+  const selectedPermissionMode = permissionMode(requestedSecurityProfile);
+  const selectedSecurityProfile = requestedSecurityProfile ?? inferredSecurityProfile(selectedPermissionMode);
   const generatedTurnLimit = selectedMaxTurns?.name === 'MIMI_MAX_TURNS' && (
     (selectedMaxTurns.value === '200' && configVersion === 2)
     || (selectedMaxTurns.value === '32' && (configVersion ?? 0) <= 3)
@@ -335,6 +414,17 @@ export function loadConfig(homeDirectory = os.homedir()): AppConfig {
   const maxTurns = !selectedMaxTurns || generatedTurnLimit
     ? null
     : positiveSafeInteger(['MIMI_MAX_TURNS', 'MAX_TURNS'])!;
+  const trustedWorkspaceMcp = optionalAbsolutePath(
+    ['MIMI_TRUST_WORKSPACE_MCP', 'TRUST_WORKSPACE_MCP'],
+    homeDirectory,
+  );
+  const computer = computerConfig(homeDirectory);
+  if (selectedSecurityProfile !== 'full-owner' && computer) {
+    throw new Error(`MIMI_SECURITY_PROFILE=${selectedSecurityProfile} 不允许启用 Computer Use`);
+  }
+  if (selectedSecurityProfile !== 'full-owner' && trustedWorkspaceMcp) {
+    throw new Error(`MIMI_SECURITY_PROFILE=${selectedSecurityProfile} 不允许信任工作区 MCP`);
+  }
   return {
     provider: modelProvider(),
     workspaceRoot,
@@ -348,11 +438,9 @@ export function loadConfig(homeDirectory = os.homedir()): AppConfig {
     maxTurns,
     teamMaxConcurrency,
     sessionMaxConcurrency,
-    permissionMode: permissionMode(),
-    trustedWorkspaceMcp: optionalAbsolutePath(
-      ['MIMI_TRUST_WORKSPACE_MCP', 'TRUST_WORKSPACE_MCP'],
-      homeDirectory,
-    ),
-    computer: computerConfig(homeDirectory),
+    permissionMode: selectedPermissionMode,
+    securityProfile: selectedSecurityProfile,
+    trustedWorkspaceMcp,
+    computer,
   };
 }

@@ -1,5 +1,6 @@
 import type { AgentInputItem } from '@openai/agents';
-import type { AgentPermissionMode } from '../config.js';
+import type { AgentPermissionMode, SecurityProfileSummary } from '../config.js';
+import type { DaemonHealthSnapshot } from './health-model.js';
 import type { MemoryHit, SourceRef } from '../core/memory.js';
 import type { PlanStep } from '../core/plan.js';
 import type { RunCheckpoint } from '../core/session.js';
@@ -317,6 +318,7 @@ export interface DaemonStatus {
   protocolVersion: number;
   buildVersion?: string;
   permissionMode?: AgentPermissionMode;
+  securityProfile?: SecurityProfileSummary;
   pid: number;
   startedAt: string;
   workerId: string;
@@ -334,6 +336,7 @@ export interface DaemonStatus {
   tasks: Record<TaskStatus, number>;
   outbox: Record<OutboxStatus, number>;
   enabledSchedules: number;
+  health?: DaemonHealthSnapshot;
 }
 
 export type DaemonWorkerStatus = Omit<

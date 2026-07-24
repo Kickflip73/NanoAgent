@@ -1,5 +1,4 @@
 import { randomUUID } from 'node:crypto';
-import { tool } from '@openai/agents';
 import { z } from 'zod';
 import { assertSessionId } from './session-id.js';
 import { AtomicJsonStore } from './state-file.js';
@@ -225,53 +224,6 @@ export class TeamTaskStore {
       }
       return recovered;
     });
-  }
-
-  createTools() {
-    const input = z.object({
-      id: z.string().min(1).max(80),
-      description: z.string().min(1).max(2_000),
-      role: z.enum(['explorer', 'architect', 'builder', 'tester', 'reviewer']),
-      dependencies: z.array(z.string().min(1).max(80)).max(10).default([]),
-      paths: z.array(z.string().min(1).max(500)).max(30).default([]),
-    });
-    return [
-      tool({
-        name: 'set_team_tasks',
-        description: '在 Ultra Team 模式创建 2～6 个有角色、依赖和路径边界的子任务；会替换当前 Team task list。',
-        parameters: z.object({ tasks: z.array(input).min(2).max(6) }),
-        execute: async ({ tasks }) => this.set(tasks),
-      }),
-      tool({
-        name: 'show_team_tasks',
-        description: '查看当前会话的 Team task list、依赖、负责人和结果。',
-        parameters: z.object({}),
-        execute: async () => ({ tasks: await this.list(), ready: (await this.ready()).map((item) => item.id) }),
-      }),
-      tool({
-        name: 'claim_team_task',
-        description: '原子领取一个依赖已完成的 pending Team task，避免重复执行。',
-        parameters: z.object({ id: z.string().min(1), owner: z.string().min(1).max(100) }),
-        execute: async ({ id, owner }) => this.claim(id, owner),
-      }),
-      tool({
-        name: 'update_team_task',
-        description: '使用领取时返回的 claimId 更新 Team task，防止迟到 worker 覆盖新领取。',
-        parameters: z.object({
-          id: z.string().min(1),
-          claimId: z.string().min(1),
-          status: z.enum(['running', 'completed', 'failed']),
-          result: z.string().max(12_000).optional(),
-        }),
-        execute: async ({ id, claimId, status, result }) => this.update(id, status, result, claimId),
-      }),
-      tool({
-        name: 'retry_team_task',
-        description: '把一个 failed Team task 重置为 pending，供修正方案后重新执行；completed task 不会被重复运行。',
-        parameters: z.object({ id: z.string().min(1) }),
-        execute: async ({ id }) => this.retry(id),
-      }),
-    ];
   }
 
   private validate(inputs: TeamTaskInput[]): void {

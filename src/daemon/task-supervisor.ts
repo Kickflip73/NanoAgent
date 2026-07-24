@@ -169,7 +169,7 @@ export class TaskProcessSupervisor {
 
   start(): void {
     if (this.timer || this.stopping) return;
-    const pollMs = Math.max(25, this.options.pollMs ?? 250);
+    const pollMs = Math.max(25, this.options.pollMs ?? 1_000);
     this.timer = setInterval(() => { void this.safePump(); }, pollMs);
     this.timer.unref();
     void this.safePump();

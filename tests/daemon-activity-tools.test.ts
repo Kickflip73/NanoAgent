@@ -5,6 +5,7 @@ import path from 'node:path';
 import { test } from 'node:test';
 import { RunContext, type Tool } from '@openai/agents';
 import { createMimiActivityTools } from '../src/daemon/activity-tools.js';
+import { buildDaemonHealth } from '../src/daemon/health-model.js';
 import { buildOwnerStatusAnswer } from '../src/daemon/status-context.js';
 import { MimiStore } from '../src/daemon/store.js';
 import { isSideEffectTool, toolsForRunPolicy } from '../src/runtime/tool-policy.js';
@@ -101,6 +102,17 @@ test('owner status answer is generated from bounded daemon state without a model
     assert.match(answer, /检查构建状态/);
     assert.match(answer, /queued/);
     assert.ok(answer.length <= 6_000, answer.length.toString());
+
+    const degraded = buildOwnerStatusAnswer(store, 'mimi-owner-status-session', undefined, {
+      plan: [],
+      health: buildDaemonHealth({
+        tasks: { ...store.activitySnapshot(1).tasks, dead_letter: 2 },
+        outbox: store.activitySnapshot(1).outbox,
+      }),
+    });
+    assert.match(degraded, /系统健康：unhealthy/);
+    assert.match(degraded, /2 个任务进入 dead letter/);
+    assert.match(degraded, /mimi daemon tasks/);
   } finally {
     store.close();
   }

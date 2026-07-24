@@ -85,7 +85,18 @@ process.stdout.write("Now drawing from 'Battery Power'\\n -InternalBattery-0 (id
   });
   child.stderr.on('data', (chunk: string) => { stderr += chunk; });
   try {
-    const batteryEvent = await waitFor(messages, (message) => message.externalId?.startsWith('battery:critical:') === true);
+    let batteryEvent: ProtocolMessage;
+    try {
+      batteryEvent = await waitFor(
+        messages,
+        (message) => message.externalId?.startsWith('battery:critical:') === true,
+      );
+    } catch (error) {
+      throw new Error(
+        `${error instanceof Error ? error.message : String(error)}; `
+        + `connector exit=${String(child.exitCode)} signal=${String(child.signalCode)} stderr=${stderr}`,
+      );
+    }
     assert.equal(batteryEvent.type, 'event');
     assert.equal(batteryEvent.kind, 'alert');
     assert.equal(batteryEvent.priority, 100);

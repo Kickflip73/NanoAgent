@@ -44,7 +44,7 @@ async function main(): Promise<void> {
     await runDaemonCommand(config, args.slice(1));
     return;
   }
-  const { runMimiCli } = await import('./daemon/chat-client.js');
+  const { runMimiCli } = await import('./chat-terminal.js');
   await runMimiCli(config, args, await version());
 }
 

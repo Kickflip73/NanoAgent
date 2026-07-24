@@ -487,6 +487,9 @@ async function execute(message) {
     const result = await runOpen(payload.item, payload.application);
     return { type: 'action_result', id: message.id, ok: true, result };
   }
+  // A poll already reading the pre-write clipboard must not publish its late
+  // result after MimiAgent starts a self-write.
+  if (message.action === 'clipboard_write') clipboardWatchGeneration += 1;
   const result = await runJxa(message.action, message.target, payload);
   if (message.action === 'clipboard_write') rememberClipboard(payload.text);
   return { type: 'action_result', id: message.id, ok: true, result };

@@ -1,4 +1,5 @@
 import type { Goal, PlanStep } from '../core/plan.js';
+import type { DaemonHealthSnapshot } from './health-model.js';
 import type { MimiStore } from './store.js';
 
 const MAX_STATUS_CONTEXT_CHARS = 6_000;
@@ -17,7 +18,7 @@ export function buildOwnerStatusAnswer(
   store: MimiStore,
   sessionId: string,
   currentTaskId?: string,
-  state?: { plan: readonly PlanStep[]; goal?: Goal },
+  state?: { plan: readonly PlanStep[]; goal?: Goal; health?: DaemonHealthSnapshot },
 ): string {
   const sessionActivity = store.sessionActivity(sessionId, 4)
     .filter((activity) => activity.taskId !== currentTaskId)
@@ -57,6 +58,12 @@ export function buildOwnerStatusAnswer(
   const incompletePlan = state?.plan.filter((step) => step.status !== 'completed') ?? [];
   if (incompletePlan.length) {
     lines.push(`Plan 还有 ${incompletePlan.length} 步未完成：${incompletePlan.slice(0, 3).map((step) => step.description).join('；')}`);
+  }
+  if (state?.health && state.health.state !== 'ready') {
+    lines.push(`系统健康：${state.health.state}`);
+    for (const risk of state.health.risks.slice(0, 3)) {
+      lines.push(`- ${risk.message}；建议：${risk.nextAction}`);
+    }
   }
   if (recentTerminal.length) {
     lines.push('最近的后台结果：');

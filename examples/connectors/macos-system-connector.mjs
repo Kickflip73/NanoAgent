@@ -13,7 +13,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 const pmset = process.env.MACOS_SYSTEM_PMSET || '/usr/bin/pmset';
-const pollIntervalMs = numberEnv('MACOS_SYSTEM_POLL_INTERVAL_MS', 60_000, 0, 86_400_000);
+const pollIntervalMs = numberEnv('MACOS_SYSTEM_POLL_INTERVAL_MS', 300_000, 0, 86_400_000);
 const commandTimeoutMs = numberEnv('MACOS_SYSTEM_COMMAND_TIMEOUT_MS', 10_000, 1_000, 120_000);
 const batteryLowPercent = numberEnv('MACOS_SYSTEM_BATTERY_LOW_PERCENT', 20, 1, 100);
 const batteryCriticalPercent = Math.min(
@@ -157,19 +157,27 @@ async function storageStatus(target = diskPath) {
 }
 
 function runtimeStatus() {
-  const totalBytes = os.totalmem();
-  const freeBytes = os.freemem();
+  const totalBytes = safeSystemMetric(() => os.totalmem(), 0);
+  const freeBytes = safeSystemMetric(() => os.freemem(), 0);
   return {
-    uptimeSeconds: Math.floor(os.uptime()),
+    uptimeSeconds: Math.floor(safeSystemMetric(() => os.uptime(), 0)),
     memory: {
       totalBytes,
       freeBytes,
       usedBytes: Math.max(0, totalBytes - freeBytes),
       freePercent: totalBytes > 0 ? round(freeBytes / totalBytes * 100) : 0,
     },
-    loadAverage: os.loadavg().map((value) => round(value)),
-    logicalCpuCount: os.cpus().length,
+    loadAverage: safeSystemMetric(() => os.loadavg(), [0, 0, 0]).map((value) => round(value)),
+    logicalCpuCount: safeSystemMetric(() => os.cpus().length, 0),
   };
+}
+
+function safeSystemMetric(read, fallback) {
+  try {
+    return read();
+  } catch {
+    return fallback;
+  }
 }
 
 async function systemSnapshot() {

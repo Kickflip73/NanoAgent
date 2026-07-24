@@ -1,7 +1,7 @@
 import { Agent, type Tool } from '@openai/agents';
-import type { AgentMode } from '../runtime/instructions.js';
-import type { AgentModel } from '../runtime/model.js';
-import { subAgentToolNames } from '../runtime/tool-policy.js';
+import type { AgentMode } from '../core/agent-mode.js';
+import { subAgentToolNames } from '../core/tool-role-policy.js';
+import type { AgentModel } from './model-port.js';
 
 function selectTools(tools: Tool[], names: readonly string[]): Tool[] {
   const allowed = new Set(names);

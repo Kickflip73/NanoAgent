@@ -1,7 +1,12 @@
 import type { Tool } from '@openai/agents';
-import type { AgentPermissionMode } from '../config.js';
-import type { TeamRole } from '../core/team.js';
+import type { AgentPermissionMode, SecurityProfile } from '../config.js';
 import type { AgentMode } from './instructions.js';
+
+export {
+  subAgentToolNames,
+  teamRoleToolNames,
+  type SubAgentRole,
+} from '../core/tool-role-policy.js';
 
 export type ToolCapability =
   | 'read'
@@ -17,55 +22,43 @@ export type ToolCapability =
   | 'computer-read'
   | 'computer-write'
   | 'control';
-export type SubAgentRole = 'researcher' | 'reviewer' | 'architect';
-
-interface ToolPolicy {
+export interface ToolDescriptor {
+  name: string;
   capabilities?: readonly ToolCapability[];
   modes?: readonly AgentMode[];
-  subAgents?: readonly SubAgentRole[];
-  teamRoles?: readonly TeamRole[];
-  teamRolesWithShell?: readonly TeamRole[];
   sideEffect?: true;
   displayedOrchestrationTool?: true;
 }
+type ToolDescriptorDefinition = Omit<ToolDescriptor, 'name'>;
 
 const ALL_MODES = ['general', 'plan', 'ultra'] as const satisfies readonly AgentMode[];
 const PLAN_AND_ULTRA = ['plan', 'ultra'] as const satisfies readonly AgentMode[];
 const ULTRA_ONLY = ['ultra'] as const satisfies readonly AgentMode[];
-const ALL_SUBAGENTS = ['researcher', 'architect', 'reviewer'] as const satisfies readonly SubAgentRole[];
-const ALL_TEAM_ROLES = ['explorer', 'architect', 'builder', 'tester', 'reviewer'] as const satisfies readonly TeamRole[];
 
-const TOOL_POLICY = {
+const TOOL_DESCRIPTOR_DEFINITIONS = {
   current_time: {
     modes: ALL_MODES,
-    subAgents: ['researcher'],
-    teamRoles: ['explorer', 'builder', 'tester'],
   },
-  calculate: { modes: ALL_MODES, teamRoles: ['builder', 'tester'] },
-  read_file: { capabilities: ['read'], modes: ALL_MODES, subAgents: ALL_SUBAGENTS, teamRoles: ALL_TEAM_ROLES },
-  write_file: { capabilities: ['write'], teamRoles: ['builder'], sideEffect: true },
-  edit_file: { capabilities: ['write'], teamRoles: ['builder'], sideEffect: true },
-  apply_patch: { capabilities: ['write'], teamRoles: ['builder'], sideEffect: true },
-  move_file: { capabilities: ['write'], teamRoles: ['builder'], sideEffect: true },
-  list_directory: { capabilities: ['read'], modes: ALL_MODES, subAgents: ALL_SUBAGENTS, teamRoles: ALL_TEAM_ROLES },
-  search_files: { capabilities: ['read'], modes: ALL_MODES, subAgents: ALL_SUBAGENTS, teamRoles: ALL_TEAM_ROLES },
-  inspect_changes: { capabilities: ['read'], modes: ALL_MODES, subAgents: ALL_SUBAGENTS, teamRoles: ALL_TEAM_ROLES },
+  calculate: { modes: ALL_MODES },
+  read_file: { capabilities: ['read'], modes: ALL_MODES },
+  write_file: { capabilities: ['write'], sideEffect: true },
+  edit_file: { capabilities: ['write'], sideEffect: true },
+  apply_patch: { capabilities: ['write'], sideEffect: true },
+  move_file: { capabilities: ['write'], sideEffect: true },
+  list_directory: { capabilities: ['read'], modes: ALL_MODES },
+  search_files: { capabilities: ['read'], modes: ALL_MODES },
+  inspect_changes: { capabilities: ['read'], modes: ALL_MODES },
   run_shell: {
     capabilities: ['execute'],
-    teamRolesWithShell: ['builder', 'tester', 'reviewer'],
     sideEffect: true,
   },
   http_get: {
     capabilities: ['network-read'],
     modes: ALL_MODES,
-    subAgents: ['researcher'],
-    teamRoles: ['explorer'],
   },
   web_search: {
     capabilities: ['network-read'],
     modes: ALL_MODES,
-    subAgents: ['researcher', 'architect'],
-    teamRoles: ['explorer', 'architect'],
   },
   computer_observe: { capabilities: ['computer-read'], modes: ALL_MODES },
   computer_act: { capabilities: ['computer-write'], sideEffect: true },
@@ -74,9 +67,9 @@ const TOOL_POLICY = {
   set_mimi_connector_enabled: { capabilities: ['state-write'], sideEffect: true },
   reload_mimi_connectors: { capabilities: ['state-write'], sideEffect: true },
   connector_action: { capabilities: ['state-write'], sideEffect: true },
-  memory_search: { capabilities: ['memory-read'], modes: ALL_MODES, subAgents: ALL_SUBAGENTS, teamRoles: ALL_TEAM_ROLES },
-  memory_read: { capabilities: ['memory-read'], modes: ALL_MODES, subAgents: ALL_SUBAGENTS, teamRoles: ALL_TEAM_ROLES },
-  memory_links: { capabilities: ['memory-read'], modes: ALL_MODES, subAgents: ALL_SUBAGENTS, teamRoles: ALL_TEAM_ROLES },
+  memory_search: { capabilities: ['memory-read'], modes: ALL_MODES },
+  memory_read: { capabilities: ['memory-read'], modes: ALL_MODES },
+  memory_links: { capabilities: ['memory-read'], modes: ALL_MODES },
   remember: { capabilities: ['memory-write'], sideEffect: true },
   forget: { capabilities: ['memory-write'], sideEffect: true },
   memory_ingest: { capabilities: ['memory-write'], sideEffect: true },
@@ -161,47 +154,38 @@ const TOOL_POLICY = {
   update_team_task: { capabilities: ['state-write'], modes: ULTRA_ONLY, sideEffect: true, displayedOrchestrationTool: true },
   retry_team_task: { capabilities: ['state-write'], modes: ULTRA_ONLY, sideEffect: true, displayedOrchestrationTool: true },
   run_team: { capabilities: ['execute', 'state-write'], modes: ULTRA_ONLY, sideEffect: true, displayedOrchestrationTool: true },
-} as const satisfies Record<string, ToolPolicy>;
+} as const satisfies Record<string, ToolDescriptorDefinition>;
 
-type RegisteredToolName = keyof typeof TOOL_POLICY;
-const TOOL_POLICY_ENTRIES = Object.entries(TOOL_POLICY) as Array<[RegisteredToolName, ToolPolicy]>;
+type RegisteredToolName = keyof typeof TOOL_DESCRIPTOR_DEFINITIONS;
+const TOOL_DESCRIPTOR_ENTRIES = Object.entries(TOOL_DESCRIPTOR_DEFINITIONS) as Array<
+  [RegisteredToolName, ToolDescriptorDefinition]
+>;
 
-function policyFor(name: string): ToolPolicy | undefined {
-  return TOOL_POLICY[name as RegisteredToolName];
+export const TOOL_DESCRIPTORS: readonly ToolDescriptor[] = Object.freeze(
+  TOOL_DESCRIPTOR_ENTRIES.map(([name, descriptor]) => Object.freeze({ name, ...descriptor })),
+);
+const TOOL_DESCRIPTOR_BY_NAME = new Map(
+  TOOL_DESCRIPTORS.map((descriptor) => [descriptor.name, descriptor]),
+);
+
+export function toolDescriptor(name: string): ToolDescriptor | undefined {
+  return TOOL_DESCRIPTOR_BY_NAME.get(name);
 }
 
 function availableInMode(name: string, mode: AgentMode): boolean {
-  const modes = policyFor(name)?.modes;
+  const modes = toolDescriptor(name)?.modes;
   if (modes) return modes.includes(mode);
   return mode !== 'plan';
 }
 
 export const TOOL_CAPABILITIES: Readonly<Record<string, readonly ToolCapability[]>> = Object.freeze(
-  Object.fromEntries(TOOL_POLICY_ENTRIES
-    .filter((entry) => entry[1].capabilities !== undefined)
-    .map(([name, policy]) => [name, policy.capabilities!])),
+  Object.fromEntries(TOOL_DESCRIPTORS
+    .filter((descriptor) => descriptor.capabilities !== undefined)
+    .map((descriptor) => [descriptor.name, descriptor.capabilities!])),
 );
 
 export function isSideEffectTool(name: string): boolean {
-  return policyFor(name)?.sideEffect === true;
-}
-
-export function subAgentToolNames(role: SubAgentRole): readonly string[] {
-  return TOOL_POLICY_ENTRIES
-    .filter((entry) => entry[1].subAgents?.includes(role))
-    .map(([name]) => name);
-}
-
-export function teamRoleToolNames(role: TeamRole, allowUnsandboxedShell = false): readonly string[] {
-  const names = TOOL_POLICY_ENTRIES
-    .filter((entry) => entry[1].teamRoles?.includes(role))
-    .map(([name]) => name);
-  if (allowUnsandboxedShell) {
-    names.push(...TOOL_POLICY_ENTRIES
-      .filter((entry) => entry[1].teamRolesWithShell?.includes(role))
-      .map(([name]) => name));
-  }
-  return names;
+  return toolDescriptor(name)?.sideEffect === true;
 }
 
 export function toolsForMode(mode: AgentMode, baseTools: Tool[], teamTools: Tool[] = []): Tool[] {
@@ -213,10 +197,10 @@ export function toolsForPermission(
   mode: AgentPermissionMode,
   tools: Tool[],
   customCapabilities: Readonly<Record<string, readonly ToolCapability[]>> = {},
+  securityProfile?: SecurityProfile,
 ): Tool[] {
-  if (mode === 'trusted') return tools;
-  return tools.filter((tool) => {
-    const policy = policyFor(tool.name);
+  const permitted = mode === 'trusted' ? tools : tools.filter((tool) => {
+    const policy = toolDescriptor(tool.name);
     const declared = customCapabilities[tool.name];
     if (!policy && !declared) return false;
     const capabilities = policy?.capabilities ?? declared ?? [];
@@ -228,6 +212,20 @@ export function toolsForPermission(
     // would make configured messaging channels mysteriously unavailable.
     return mode !== 'read-only' || tool.name === 'connector_action' || !capabilities.some((capability) => (
       capability === 'write' || capability === 'memory-write' || capability === 'state-write'
+    ));
+  });
+  if (securityProfile !== 'safe') return permitted;
+  return permitted.filter((tool) => {
+    const capabilities = toolDescriptor(tool.name)?.capabilities;
+    if (!capabilities) return false;
+    return !capabilities.some((capability) => (
+      capability === 'write'
+      || capability === 'execute'
+      || capability === 'network-write'
+      || capability === 'memory-write'
+      || capability === 'state-write'
+      || capability === 'computer-read'
+      || capability === 'computer-write'
     ));
   });
 }
@@ -249,7 +247,7 @@ export function toolsForRunPolicy(tools: Tool[], policy?: RunToolPolicy): Tool[]
     : undefined;
   return tools.filter((tool) => {
     if (allowedTools && !allowedTools.has(tool.name)) return false;
-    const registered = policyFor(tool.name);
+    const registered = toolDescriptor(tool.name);
     if (!registered) return policy.allowUnknownTools === true;
     if (registered.sideEffect && policy.allowSideEffects !== true) return false;
     if (registered.sideEffect && allowedSideEffects && !allowedSideEffects.has(tool.name)) return false;
@@ -261,11 +259,22 @@ export function toolNamesForMode(
   mode: AgentMode,
   baseTools: Tool[],
   permissionMode: AgentPermissionMode = 'trusted',
+  securityProfile?: SecurityProfile,
 ): string[] {
-  const names = toolsForMode(mode, toolsForPermission(permissionMode, baseTools)).map((tool) => tool.name);
-  names.push(...TOOL_POLICY_ENTRIES
-    .filter(([name, policy]) => policy.displayedOrchestrationTool && availableInMode(name, mode))
-    .filter(([name]) => toolsForPermission(permissionMode, [{ name } as Tool]).length === 1)
-    .map(([name]) => name));
+  const names = toolsForMode(
+    mode,
+    toolsForPermission(permissionMode, baseTools, {}, securityProfile),
+  ).map((tool) => tool.name);
+  names.push(...TOOL_DESCRIPTORS
+    .filter((descriptor) => descriptor.displayedOrchestrationTool
+      && availableInMode(descriptor.name, mode))
+    .filter((descriptor) =>
+      toolsForPermission(
+        permissionMode,
+        [{ name: descriptor.name } as Tool],
+        {},
+        securityProfile,
+      ).length === 1)
+    .map((descriptor) => descriptor.name));
   return [...new Set(names)].sort();
 }

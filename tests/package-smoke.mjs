@@ -36,7 +36,14 @@ try {
     access(path.join(packageRoot, 'dist', 'agent.d.ts')),
     access(path.join(packageRoot, 'dist', 'orchestration.d.ts')),
     access(path.join(packageRoot, 'MIMI.md')),
+    access(path.join(packageRoot, 'skills', 'manifest.json')),
     access(path.join(packageRoot, 'knowledge', 'mimi-agent.md')),
+    access(path.join(packageRoot, 'docs', 'BENCHMARKS.md')),
+    access(path.join(packageRoot, 'docs', 'PROVIDER_CANARY.md')),
+    access(path.join(packageRoot, 'docs', 'PROVIDER_CONTRACTS.md')),
+    access(path.join(packageRoot, 'docs', 'PUBLIC_API.md')),
+    access(path.join(packageRoot, 'docs', 'REPOSITORY_BOUNDARIES.md')),
+    access(path.join(packageRoot, 'docs', 'SECURITY_EVALS.md')),
     access(path.join(packageRoot, 'examples', 'connectors', 'daxiang-connector.mjs')),
     access(path.join(packageRoot, 'examples', 'connectors', 'qq-napcat-connector.mjs')),
     access(path.join(packageRoot, 'scripts', 'install-napcat-macos.mjs'), constants.X_OK),
@@ -45,6 +52,7 @@ try {
     access(path.join(packageRoot, 'examples', 'connectors', 'http-action-connector.mjs')),
     access(path.join(packageRoot, 'examples', 'connectors', 'macos-system-connector.mjs')),
     access(path.join(packageRoot, 'examples', 'connectors', 'macos-life-connector.mjs')),
+    access(path.join(packageRoot, 'examples', 'connectors', 'macos-life-eventkit.swift')),
     access(path.join(packageRoot, 'examples', 'connectors', 'macos-mail-connector.mjs')),
     access(path.join(packageRoot, 'examples', 'connectors', 'macos-messages-connector.mjs')),
     access(path.join(packageRoot, 'examples', 'connectors', 'macos-contacts-connector.mjs')),
@@ -63,7 +71,11 @@ try {
     access(path.join(packageRoot, 'mimi.connectors.example.json')),
   ]);
   const manifest = JSON.parse(await readFile(path.join(packageRoot, 'package.json'), 'utf8'));
+  const apiContract = JSON.parse(
+    await readFile(path.join(packageRoot, 'evals', 'public-api-contract.json'), 'utf8'),
+  );
   assert.equal(manifest.name, 'mimi-agent');
+  assert.equal(apiContract.packageVersion, manifest.version);
   assert.deepEqual(manifest.bin, { mimi: 'dist/index.js' });
   assert.deepEqual(await readdir(path.join(packageRoot, 'knowledge')), ['mimi-agent.md']);
   const cliTarget = path.join(packageRoot, manifest.bin.mimi);
@@ -137,11 +149,19 @@ try {
   }
   await execFileAsync(process.execPath, ['--input-type=module', '--eval', `
     import assert from 'node:assert/strict';
+    import { readFile } from 'node:fs/promises';
     const root = await import('mimi-agent');
     const orchestration = await import('mimi-agent/orchestration');
+    const contract = JSON.parse(await readFile(
+      new URL('./node_modules/mimi-agent/evals/public-api-contract.json', import.meta.url),
+      'utf8',
+    ));
+    assert.deepEqual(Object.keys(root).sort(), contract.entrypoints['.'].runtimeExports);
+    assert.deepEqual(
+      Object.keys(orchestration).sort(),
+      contract.entrypoints['./orchestration'].runtimeExports,
+    );
     assert.equal(typeof root.MimiAgent, 'function');
-    assert.equal(typeof root.MimiAgent, 'function');
-    assert.equal(root.MimiAgent, root.MimiAgent);
     assert.equal(typeof root.loadConfig, 'function');
     assert.equal(typeof root.TeamTaskStore, 'function');
     assert.equal(typeof orchestration.createTeamTools, 'function');

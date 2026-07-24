@@ -48,11 +48,15 @@ async function stop(child: ChildProcessWithoutNullStreams): Promise<void> {
 
 test('macOS life connector executes actions without shell interpolation and emits proactive events', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'macos-life-connector-'));
-  const mock = path.join(root, 'mock-osascript.mjs');
+  const mock = path.join(root, 'mock-platform-helper.mjs');
   await writeFile(mock, `#!/usr/bin/env node
 const marker = process.argv.indexOf('-e');
-const args = process.argv.slice(marker + 2);
-if (/^\\d{4}-/.test(args[0] || '')) {
+if (marker >= 0) {
+  process.stdout.write(JSON.stringify({ notified: true }));
+  process.exit(0);
+}
+const args = process.argv.slice(2);
+if (args[0] === 'poll') {
   process.stdout.write(JSON.stringify({
     calendar: [{ id: 'event-1', calendar: 'Work', title: 'Standup', startAt: '2026-07-15T10:00:00.000Z', endAt: '2026-07-15T11:00:00.000Z' }],
     reminders: [{ id: 'reminder-1', list: 'Inbox', title: 'Buy milk', dueAt: '2026-07-15T09:00:00.000Z' }]
@@ -67,6 +71,8 @@ if (/^\\d{4}-/.test(args[0] || '')) {
     env: {
       ...process.env,
       MACOS_OSASCRIPT: mock,
+      MACOS_LIFE_EVENTKIT_COMMAND: mock,
+      MACOS_LIFE_EVENTKIT_HELPER: path.join(root, 'eventkit-helper.swift'),
       MACOS_POLL_INTERVAL_MS: '1000',
       MACOS_LOOKAHEAD_MINUTES: '30',
       MACOS_LIFE_STATE_FILE: path.join(root, 'life-state.json'),
@@ -138,15 +144,14 @@ if (/^\\d{4}-/.test(args[0] || '')) {
 
 test('macOS life connector persists a bounded baseline and emits changed or deleted items once', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'macos-life-changes-'));
-  const mock = path.join(root, 'mock-osascript.mjs');
+  const mock = path.join(root, 'mock-eventkit-helper.mjs');
   const counter = path.join(root, 'poll-count');
   const dueFile = path.join(root, 'due-at');
   const state = path.join(root, 'life-state.json');
   await writeFile(mock, `#!/usr/bin/env node
 import fs from 'node:fs';
-const marker = process.argv.indexOf('-e');
-const args = process.argv.slice(marker + 2);
-if (!/^\\d{4}-/.test(args[0] || '')) {
+const args = process.argv.slice(2);
+if (args[0] !== 'poll') {
   process.stdout.write('{}');
   process.exit(0);
 }
@@ -172,7 +177,8 @@ process.stdout.write(JSON.stringify(count === 0 ? {
   const child = spawn(process.execPath, [connector], {
     env: {
       ...process.env,
-      MACOS_OSASCRIPT: mock,
+      MACOS_LIFE_EVENTKIT_COMMAND: mock,
+      MACOS_LIFE_EVENTKIT_HELPER: path.join(root, 'eventkit-helper.swift'),
       MACOS_POLL_INTERVAL_MS: '100',
       MACOS_LOOKAHEAD_MINUTES: '10080',
       MACOS_LIFE_STATE_FILE: state,

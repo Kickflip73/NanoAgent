@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    {
+      "provider": "openai",
+      "apiKeyEnvironment": "OPENAI_API_KEY",
+      "input": "Provider canary. You must call the calculate tool with the expression 17*19, then reply with exactly CANARY_OK=323.",
+      "expectedTools": ["calculate"],
+      "expectedOutput": "CANARY_OK=323"
+    },
+    {
+      "provider": "deepseek",
+      "apiKeyEnvironment": "DEEPSEEK_API_KEY",
+      "input": "Provider canary. You must call the calculate tool with the expression 17*19, then reply with exactly CANARY_OK=323.",
+      "expectedTools": ["calculate"],
+      "expectedOutput": "CANARY_OK=323"
+    }
+  ]
+}

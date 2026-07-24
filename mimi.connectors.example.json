@@ -152,7 +152,7 @@
       "enabled": false,
       "command": "node",
       "args": ["/absolute/path/to/MimiAgent/examples/connectors/macos-life-connector.mjs"],
-      "envAllowlist": ["MIMI_DAEMON_DATA_DIR", "JARVIS_DATA_DIR", "MACOS_POLL_INTERVAL_MS", "MACOS_LOOKAHEAD_MINUTES", "MACOS_LIFE_MAX_ITEMS", "MACOS_LIFE_STATE_FILE", "MACOS_CALENDAR", "MACOS_REMINDER_LIST"],
+      "envAllowlist": ["MIMI_DAEMON_DATA_DIR", "JARVIS_DATA_DIR", "MACOS_POLL_INTERVAL_MS", "MACOS_LOOKAHEAD_MINUTES", "MACOS_LIFE_MAX_ITEMS", "MACOS_LIFE_STATE_FILE", "MACOS_CALENDAR", "MACOS_REMINDER_LIST", "MACOS_SWIFTC_BIN", "MACOS_LIFE_EVENTKIT_HELPER", "MACOS_LIFE_EVENTKIT_COMMAND"],
       "source": "macos-life",
       "trust": "external",
       "profileId": "owner",

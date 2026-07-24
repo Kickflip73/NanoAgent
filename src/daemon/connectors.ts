@@ -35,6 +35,7 @@ const connectorSchema = z.object({
 }).strict();
 
 const configSchema = z.object({
+  backgroundDefaultsVersion: z.number().int().min(0).default(0),
   connectors: z.record(z.string().regex(/^[a-zA-Z0-9._-]+$/), connectorSchema).default({}),
 }).strict();
 
@@ -90,6 +91,7 @@ interface ConnectorStatusMessage {
   outbound: ConnectorReadiness;
   deliveryConfirmed?: boolean;
   eventAcknowledgement?: boolean;
+  freshForMs?: number;
 }
 
 interface PendingDelivery {
@@ -112,6 +114,9 @@ export interface ConnectorCapability {
     inbound: ConnectorReadiness;
     outbound: ConnectorReadiness;
     deliveryConfirmed?: boolean;
+    reportedAt?: string;
+    freshUntil?: string;
+    stale?: boolean;
   };
   source: string;
   trust: EventTrust;
@@ -167,6 +172,8 @@ class ConnectorProcess implements NotificationSink {
   private readonly pendingActions = new Map<string, PendingAction>();
   private readiness: ConnectorCapability['readiness'] = { inbound: 'unknown', outbound: 'unknown' };
   private supportsEventAcknowledgement = false;
+  private statusReportedAt?: string;
+  private statusFreshForMs?: number;
 
   constructor(
     readonly id: string,
@@ -260,12 +267,22 @@ class ConnectorProcess implements NotificationSink {
   }
 
   capability(): ConnectorCapability {
+    const freshUntil = this.statusReportedAt && this.statusFreshForMs
+      ? new Date(Date.parse(this.statusReportedAt) + this.statusFreshForMs).toISOString()
+      : undefined;
     return {
       id: this.id,
       enabled: this.config.enabled,
       online: this.isOnline,
       readiness: this.isOnline
-        ? this.readiness
+        ? {
+            ...this.readiness,
+            ...(this.statusReportedAt ? { reportedAt: this.statusReportedAt } : {}),
+            ...(freshUntil ? {
+              freshUntil,
+              stale: Date.now() >= Date.parse(freshUntil),
+            } : {}),
+          }
         : { inbound: 'unavailable', outbound: 'unavailable' },
       source: this.config.source ?? `connector:${this.id}`,
       trust: this.config.trust as EventTrust,
@@ -436,7 +453,16 @@ class ConnectorProcess implements NotificationSink {
     if (message.eventAcknowledgement !== undefined && typeof message.eventAcknowledgement !== 'boolean') {
       throw new Error('status.eventAcknowledgement 必须是 boolean');
     }
+    if (message.freshForMs !== undefined && (
+      !Number.isSafeInteger(message.freshForMs)
+      || message.freshForMs < 1_000
+      || message.freshForMs > 7 * 24 * 60 * 60_000
+    )) {
+      throw new Error('status.freshForMs 必须是 1000 到 604800000 的安全整数');
+    }
     this.supportsEventAcknowledgement = message.eventAcknowledgement === true;
+    this.statusReportedAt = new Date().toISOString();
+    this.statusFreshForMs = message.freshForMs;
     this.readiness = {
       inbound: message.inbound,
       outbound: message.outbound,
@@ -484,6 +510,8 @@ class ConnectorProcess implements NotificationSink {
     if (!child) return;
     this.child = undefined;
     this.readiness = { inbound: 'unknown', outbound: 'unknown' };
+    this.statusReportedAt = undefined;
+    this.statusFreshForMs = undefined;
     if (this.stableTimer) clearTimeout(this.stableTimer);
     this.stableTimer = undefined;
     if (this.healthTimer) clearTimeout(this.healthTimer);
@@ -609,7 +637,9 @@ export class ConnectorManager {
       raw = await readFile(configFile, 'utf8');
       await chmod(configFile, 0o600);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { connectors: {} };
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        return { backgroundDefaultsVersion: 0, connectors: {} };
+      }
       throw error;
     }
     return parseConnectorConfig(JSON.parse(raw) as unknown);
@@ -695,6 +725,7 @@ export class ConnectorManager {
         return { connector: live, changed: false };
       }
       const updated = parseConnectorConfig({
+        backgroundDefaultsVersion: config.backgroundDefaultsVersion,
         connectors: { ...config.connectors, [id]: { ...connector, enabled } },
       });
       const replacements = ConnectorManager.createProcesses(updated, this.store);
