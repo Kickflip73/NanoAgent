@@ -14,6 +14,7 @@ test('Task worker configuration excludes Computer Use capability', () => {
     historyLimit: 40,
     maxTurns: null,
     permissionMode: 'trusted',
+    securityProfile: 'full-owner',
     computer: {
       backend: 'cua',
       driverCommand: '/usr/local/bin/cua-driver',
@@ -29,6 +30,7 @@ test('Task worker configuration excludes Computer Use capability', () => {
 
   const workerConfig = taskWorkerConfig(config);
   assert.equal('computer' in workerConfig, false);
+  assert.equal(workerConfig.securityProfile, 'full-owner');
   assert.doesNotThrow(() => taskWorkerInitSchema.parse({
     type: 'init',
     executor: 'codex',

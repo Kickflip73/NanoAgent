@@ -367,9 +367,11 @@ export class TaskProcessSupervisor {
     let mcpEnvironment: Record<string, string>;
     let enableMcp: boolean;
     let mcpEnvironmentKeys: string[];
+    let workerConfig: ReturnType<typeof taskWorkerConfig>;
     const task = this.store.getTask(taskId);
     const executor = task?.executor === 'codex' ? 'codex' as const : 'mimi' as const;
     try {
+      workerConfig = taskWorkerConfig(this.config);
       providerCredential = executor === 'mimi' ? taskProviderCredential(this.config) : undefined;
       embeddingCredential = executor === 'mimi' ? taskEmbeddingCredential(this.config) : undefined;
       const mcpConfigurationTrusted = await isMcpConfigurationTrusted(
@@ -487,7 +489,7 @@ export class TaskProcessSupervisor {
       providerCredential,
       embeddingCredential,
       mcpEnvironment,
-      config: taskWorkerConfig(this.config),
+      config: workerConfig,
     } satisfies TaskWorkerInit;
     child.send(init, (error) => {
       if (!error) return;

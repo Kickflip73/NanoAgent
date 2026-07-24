@@ -72,6 +72,7 @@ const appConfigSchema = z.object({
   teamMaxConcurrency: z.number().int().positive().optional(),
   sessionMaxConcurrency: z.number().int().positive().optional(),
   permissionMode: z.enum(['workspace', 'read-only', 'trusted']).optional(),
+  securityProfile: z.enum(['safe', 'workstation', 'full-owner']).optional(),
   trustedWorkspaceMcp: z.string().min(1).optional(),
 }).strict();
 
