@@ -962,6 +962,10 @@ npm run eval
 
 ### Phase 1：Context Manifest 与 TUI
 
+状态：已完成（2026-07-24）。实现采用 `mimi-char-v1` 保守估算器；Daemon
+协议升级为 10，并在一个兼容周期内继续派生 `contextUsed`。聚焦验证覆盖预算、
+分项、压缩记录、actual usage 映射和 TUI 三种来源标签。
+
 目标：先让系统准确解释模型上下文。
 
 工作：
@@ -995,6 +999,10 @@ npm run eval
 
 ### Phase 2：Run Pipeline 提取
 
+状态：已完成（2026-07-24）。已提取并接入冻结 RunScope、StateLoader、
+CapabilityResolver、ContextAssembler、ToolSetBuilder、RequestFactory 与
+RunCommitCoordinator facade，阶段契约由 `tests/run-pipeline.test.ts` 固定。
+
 目标：不改变行为地拆解组合根。
 
 工作：
@@ -1013,6 +1021,9 @@ npm run eval
 回滚：每个提取提交保持 facade，可逐提交回退。
 
 ### Phase 3：Memory V2 控制面
+
+状态：已完成（2026-07-24）。SQLite catalog v2、旧页 revision 1 迁移、
+CompilationCoordinator、planned digest 恢复和 uncertain 冲突处理已经接入。
 
 目标：建立 Candidate、Job、Revision 和 Receipt，不切换模型工具。
 
@@ -1033,6 +1044,10 @@ npm run eval
 回滚：cutover marker 前继续使用 V1；marker 后使用备份离线恢复。
 
 ### Phase 4：统一全部 Memory 写入
+
+状态：已完成（2026-07-24）。remember/capture/reject/ingest/maintenance 均生成
+V2 terminal receipt；Daemon v15 保存 ≤8KB 不可变 Task evidence snapshot，
+`/memory refresh` 显式重编译 stale 来源并保留旧 revision。
 
 目标：`remember` 和 maintenance 进入 V2。
 
@@ -1055,6 +1070,11 @@ npm run eval
 
 ### Phase 5：Run Commit Journal 与状态端口
 
+状态：已完成（2026-07-24）。文件 stores 经 state ports 集中装配；Journal
+只保存摘要、phase 和 action，completed execution 恢复会核对摘要并复用 receipt。
+本轮不迁移 JSON stores，决策与后续 SQLite cutover 门槛记录在
+`docs/STATE_STORAGE_DECISION.md`。
+
 目标：收敛跨 Store 完成语义。
 
 工作：
@@ -1075,6 +1095,10 @@ npm run eval
 
 ### Phase 6：WorkUnit 契约
 
+状态：已完成（2026-07-24）。core WorkUnit types 已由 SubAgent、Team、
+Background 与 Codex adapter 使用；统一事件进入 Trace/TUI，Completion Gate
+可消费 artifacts/test evidence。SubAgent 文档与实现统一为无固定 turn。
+
 目标：统一观测和结果，不统一调度。
 
 工作：
@@ -1092,6 +1116,11 @@ npm run eval
 - 父 Agent 不需要按四种 executor 解析不同结果格式。
 
 ### Phase 7：全量验证和文档收口
+
+状态：实现与文档已收口（2026-07-24）。`npm test` 471/471、`npm run build`、
+package smoke、retrieval eval 10/10 与容量基准通过。`npm run ci` 的功能测试
+全部通过，但既有全仓 line coverage 为 80.36%，低于仓库配置的 85% 门槛；
+未通过降低阈值或排除低覆盖旧模块掩盖该债务。
 
 工作：
 

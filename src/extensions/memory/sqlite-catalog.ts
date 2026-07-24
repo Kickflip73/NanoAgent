@@ -1,9 +1,15 @@
-import { chmodSync, mkdirSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import path from 'node:path';
 import type {
   CompilationPlan,
   CompilationReceipt,
+  CompilationJob,
+  CompilationReceiptV2,
+  EvidenceRef,
+  MemoryCandidate,
+  MemoryPageRevision,
   MemoryDocument,
   MemoryDecisionEvent,
   MemoryHit,
@@ -14,7 +20,7 @@ import type {
   MemoryStatusSnapshot,
   WikiLintIssue,
 } from '../../core/memory.js';
-import { reciprocalRankFusion } from '../../core/memory.js';
+import { evidenceFromSource, reciprocalRankFusion } from '../../core/memory.js';
 
 type Row = Record<string, string | number | bigint | Uint8Array | null | undefined>;
 
@@ -94,6 +100,7 @@ export class SqliteMemoryCatalog {
     this.database = new DatabaseSync(file);
     chmodSync(file, 0o600);
     this.database.exec('PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;');
+    this.backupV1IfNeeded();
     this.initialize();
   }
 
@@ -243,6 +250,23 @@ export class SqliteMemoryCatalog {
       .all(...where.parameters, limit) as Row[]).map((row) => hitFromRow(row));
   }
 
+  staleDocuments(limit = 20): MemoryDocument[] {
+    return (this.database.prepare(`
+      SELECT ref_key FROM documents
+      WHERE document_type='wiki' AND stale=1
+      ORDER BY updated_at, ref_key LIMIT ?
+    `).all(Math.max(1, Math.min(100, limit))) as Row[])
+      .map((row) => {
+        const [scope, profileId, id] = String(row.ref_key).split(':');
+        return this.readDocument({
+          scope: scope as MemoryScope,
+          id: id!,
+          ...(profileId && profileId !== '-' ? { profileId } : {}),
+        });
+      })
+      .filter((document): document is MemoryDocument => Boolean(document));
+  }
+
   links(ref: MemoryRef): MemoryLink[] {
     const key = refKey(ref);
     const outgoing = this.database.prepare(`
@@ -328,6 +352,190 @@ export class SqliteMemoryCatalog {
         reason_code=excluded.reason_code, plan_json=excluded.plan_json, updated_at=excluded.updated_at
     `).run(receipt.id, receipt.digest, receipt.operation, receipt.status, receipt.reasonCode ?? null,
       plan.compilerVersion, JSON.stringify(plan), new Date().toISOString());
+  }
+
+  saveCandidate(candidate: MemoryCandidate): void {
+    this.database.prepare(`
+      INSERT INTO memory_candidates (
+        id, profile_id, workspace_id, scope, proposed_kind, title, content,
+        evidence_refs_json, confidence, status, reason_code, created_by, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET status=excluded.status, reason_code=excluded.reason_code,
+        updated_at=excluded.updated_at
+    `).run(
+      candidate.id, candidate.profileId, candidate.workspaceId, candidate.scope,
+      candidate.proposedKind, candidate.title, candidate.content,
+      JSON.stringify(candidate.evidenceRefs), candidate.confidence, candidate.status,
+      candidate.reasonCode ?? null, candidate.createdBy, candidate.createdAt, candidate.updatedAt,
+    );
+  }
+
+  getCandidate(id: string): MemoryCandidate | undefined {
+    const row = this.database.prepare('SELECT * FROM memory_candidates WHERE id = ?').get(id) as Row | undefined;
+    if (!row) return undefined;
+    return {
+      id: String(row.id),
+      profileId: String(row.profile_id),
+      workspaceId: String(row.workspace_id),
+      scope: String(row.scope) as MemoryCandidate['scope'],
+      proposedKind: String(row.proposed_kind) as MemoryCandidate['proposedKind'],
+      title: String(row.title),
+      content: String(row.content),
+      evidenceRefs: json(row.evidence_refs_json),
+      confidence: String(row.confidence) as MemoryCandidate['confidence'],
+      status: String(row.status) as MemoryCandidate['status'],
+      reasonCode: row.reason_code ? String(row.reason_code) : undefined,
+      createdBy: String(row.created_by) as MemoryCandidate['createdBy'],
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at),
+    };
+  }
+
+  saveJob(job: CompilationJob): void {
+    this.database.prepare(`
+      INSERT INTO compilation_jobs (
+        id, candidate_id, operation, compiler_version, expected_revisions_json,
+        planned_writes_json, applied_writes_json, status, error, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET applied_writes_json=excluded.applied_writes_json,
+        status=excluded.status, error=excluded.error, updated_at=excluded.updated_at
+    `).run(
+      job.id, job.candidateId, job.operation, job.compilerVersion,
+      JSON.stringify(job.expectedRevisions), JSON.stringify(job.plannedWrites),
+      JSON.stringify(job.appliedWrites), job.status, job.error ?? null, job.createdAt, job.updatedAt,
+    );
+  }
+
+  getJob(id: string): CompilationJob | undefined {
+    const row = this.database.prepare('SELECT * FROM compilation_jobs WHERE id = ?').get(id) as Row | undefined;
+    if (!row) return undefined;
+    return {
+      id: String(row.id),
+      candidateId: String(row.candidate_id),
+      operation: String(row.operation) as CompilationJob['operation'],
+      compilerVersion: String(row.compiler_version),
+      expectedRevisions: json(row.expected_revisions_json),
+      plannedWrites: json(row.planned_writes_json),
+      appliedWrites: json(row.applied_writes_json),
+      status: String(row.status) as CompilationJob['status'],
+      error: row.error ? String(row.error) : undefined,
+      createdAt: String(row.created_at),
+      updatedAt: String(row.updated_at),
+    };
+  }
+
+  commitRevision(
+    revision: MemoryPageRevision,
+    job: CompilationJob,
+    receipt: CompilationReceiptV2,
+  ): void {
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      this.insertRevision(revision);
+      this.database.prepare(`
+        UPDATE compilation_jobs SET applied_writes_json=?, status=?, error=?, updated_at=? WHERE id=?
+      `).run(
+        JSON.stringify(job.appliedWrites), job.status, job.error ?? null, job.updatedAt, job.id,
+      );
+      this.database.prepare(`
+        INSERT INTO compilation_receipts_v2 (
+          id, candidate_id, job_id, status, page_revisions_json, reason_code, completed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(job_id) DO UPDATE SET status=excluded.status,
+          page_revisions_json=excluded.page_revisions_json,
+          reason_code=excluded.reason_code, completed_at=excluded.completed_at
+      `).run(
+        receipt.id, receipt.candidateId, receipt.jobId, receipt.status,
+        JSON.stringify(receipt.pageRevisions), receipt.reasonCode ?? null, receipt.completedAt,
+      );
+      this.database.exec('COMMIT');
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  saveRevision(revision: MemoryPageRevision, job: CompilationJob): void {
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      this.insertRevision(revision);
+      this.database.prepare(`
+        UPDATE compilation_jobs SET applied_writes_json=?, status=?, error=?, updated_at=? WHERE id=?
+      `).run(JSON.stringify(job.appliedWrites), job.status, job.error ?? null, job.updatedAt, job.id);
+      this.database.exec('COMMIT');
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  saveReceiptV2(job: CompilationJob, receipt: CompilationReceiptV2): void {
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      this.database.prepare(`
+        UPDATE compilation_jobs SET applied_writes_json=?, status=?, error=?, updated_at=? WHERE id=?
+      `).run(JSON.stringify(job.appliedWrites), job.status, job.error ?? null, job.updatedAt, job.id);
+      this.database.prepare(`
+        INSERT INTO compilation_receipts_v2 (
+          id, candidate_id, job_id, status, page_revisions_json, reason_code, completed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(job_id) DO UPDATE SET status=excluded.status,
+          page_revisions_json=excluded.page_revisions_json,
+          reason_code=excluded.reason_code, completed_at=excluded.completed_at
+      `).run(
+        receipt.id, receipt.candidateId, receipt.jobId, receipt.status,
+        JSON.stringify(receipt.pageRevisions), receipt.reasonCode ?? null, receipt.completedAt,
+      );
+      this.database.exec('COMMIT');
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  applyingJobs(limit = 100): CompilationJob[] {
+    return (this.database.prepare(`
+      SELECT id FROM compilation_jobs WHERE status='applying'
+      ORDER BY updated_at, id LIMIT ?
+    `).all(Math.max(1, Math.min(1_000, limit))) as Row[])
+      .map((row) => this.getJob(String(row.id))!)
+      .filter(Boolean);
+  }
+
+  getReceiptV2(jobId: string): CompilationReceiptV2 | undefined {
+    const row = this.database.prepare('SELECT * FROM compilation_receipts_v2 WHERE job_id = ?')
+      .get(jobId) as Row | undefined;
+    if (!row) return undefined;
+    return {
+      id: String(row.id),
+      candidateId: String(row.candidate_id),
+      jobId: String(row.job_id),
+      status: String(row.status) as CompilationReceiptV2['status'],
+      pageRevisions: json(row.page_revisions_json),
+      reasonCode: row.reason_code ? String(row.reason_code) : undefined,
+      completedAt: String(row.completed_at),
+    };
+  }
+
+  currentRevision(pageId: string): MemoryPageRevision | undefined {
+    const row = this.database.prepare(`
+      SELECT r.* FROM memory_page_current c
+      JOIN memory_page_revisions r ON r.revision_id=c.revision_id
+      WHERE c.page_id=?
+    `).get(pageId) as Row | undefined;
+    if (!row) return undefined;
+    return {
+      revisionId: String(row.revision_id),
+      pageId: String(row.page_id),
+      revision: Number(row.revision),
+      scope: String(row.scope) as MemoryPageRevision['scope'],
+      profileId: row.profile_id ? String(row.profile_id) : null,
+      metadata: json(row.metadata_json),
+      bodyDigest: String(row.body_digest),
+      evidenceRefs: json(row.evidence_refs_json),
+      compilationJobId: String(row.compilation_job_id),
+      createdAt: String(row.created_at),
+    };
   }
 
   recordDecision(operation: string, reasonCode: string, refId?: string): number {
@@ -455,7 +663,11 @@ export class SqliteMemoryCatalog {
     const controls = this.database.prepare(`
       SELECT
         (SELECT COUNT(*) FROM source_receipts WHERE status = 'pending') AS pending_receipts,
-        (SELECT COUNT(*) FROM decision_events) AS decisions
+        (SELECT COUNT(*) FROM decision_events) AS decisions,
+        (SELECT COUNT(*) FROM memory_candidates) AS candidates,
+        (SELECT COUNT(*) FROM memory_page_revisions) AS revisions,
+        (SELECT COUNT(*) FROM compilation_jobs WHERE status IN ('pending', 'applying')) AS pending_compilations,
+        (SELECT COUNT(*) FROM compilation_jobs WHERE status='uncertain') AS uncertain_compilations
     `).get() as Row;
     return {
       pages: Number(totals.pages),
@@ -469,6 +681,10 @@ export class SqliteMemoryCatalog {
       decisions: Number(controls.decisions),
       pageLimitReached: Number(totals.pages) >= 10_000,
       episodes: Number(totals.episodes ?? 0),
+      candidates: Number(controls.candidates),
+      revisions: Number(controls.revisions),
+      pendingCompilations: Number(controls.pending_compilations),
+      uncertainCompilations: Number(controls.uncertain_compilations),
       ...(embedding ? { embeddingModel: String(embedding.model), embeddingDimensions: Number(embedding.dimensions) } : {}),
     };
   }
@@ -535,6 +751,34 @@ export class SqliteMemoryCatalog {
         issue_key TEXT PRIMARY KEY, code TEXT NOT NULL, message TEXT NOT NULL,
         occurrences INTEGER NOT NULL, resolved INTEGER NOT NULL, last_seen_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS memory_candidates (
+        id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, workspace_id TEXT NOT NULL,
+        scope TEXT NOT NULL, proposed_kind TEXT NOT NULL, title TEXT NOT NULL, content TEXT NOT NULL,
+        evidence_refs_json TEXT NOT NULL, confidence TEXT NOT NULL, status TEXT NOT NULL,
+        reason_code TEXT, created_by TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS compilation_jobs (
+        id TEXT PRIMARY KEY, candidate_id TEXT NOT NULL REFERENCES memory_candidates(id),
+        operation TEXT NOT NULL, compiler_version TEXT NOT NULL,
+        expected_revisions_json TEXT NOT NULL, planned_writes_json TEXT NOT NULL,
+        applied_writes_json TEXT NOT NULL, status TEXT NOT NULL, error TEXT,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS memory_page_revisions (
+        revision_id TEXT PRIMARY KEY, page_id TEXT NOT NULL, revision INTEGER NOT NULL,
+        scope TEXT NOT NULL, profile_id TEXT, metadata_json TEXT NOT NULL, body_digest TEXT NOT NULL,
+        evidence_refs_json TEXT NOT NULL, compilation_job_id TEXT NOT NULL REFERENCES compilation_jobs(id),
+        created_at TEXT NOT NULL, UNIQUE(page_id, revision)
+      );
+      CREATE TABLE IF NOT EXISTS memory_page_current (
+        page_id TEXT PRIMARY KEY, revision_id TEXT NOT NULL REFERENCES memory_page_revisions(revision_id),
+        revision INTEGER NOT NULL, updated_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS compilation_receipts_v2 (
+        id TEXT PRIMARY KEY, candidate_id TEXT NOT NULL REFERENCES memory_candidates(id),
+        job_id TEXT NOT NULL UNIQUE REFERENCES compilation_jobs(id), status TEXT NOT NULL,
+        page_revisions_json TEXT NOT NULL, reason_code TEXT, completed_at TEXT NOT NULL
+      );
     `);
     try {
       this.database.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS documents_fts USING fts5(
@@ -551,6 +795,111 @@ export class SqliteMemoryCatalog {
         this.fts5 = false;
       }
     }
-    this.database.prepare(`INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('version', '1')`).run();
+    this.migrateExistingPagesToV2();
+    this.database.prepare(`INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('version', '2')`).run();
+  }
+
+  private backupV1IfNeeded(): void {
+    const hasMetadata = this.database.prepare(`
+      SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_meta'
+    `).get();
+    if (!hasMetadata) return;
+    const version = this.database.prepare(`SELECT value FROM schema_meta WHERE key='version'`).get() as Row | undefined;
+    if (String(version?.value ?? '') !== '1') return;
+    const backup = `${this.file}.pre-memory-v2.bak`;
+    if (existsSync(backup)) return;
+    const escaped = backup.replaceAll("'", "''");
+    this.database.exec(`VACUUM INTO '${escaped}'`);
+    chmodSync(backup, 0o600);
+  }
+
+  private migrateExistingPagesToV2(): void {
+    const rows = this.database.prepare(`
+      SELECT * FROM documents d WHERE document_type='wiki'
+        AND NOT EXISTS (SELECT 1 FROM memory_page_current c WHERE c.page_id=d.id)
+    `).all() as Row[];
+    for (const row of rows) {
+      const stable = createHash('sha256').update(`${this.scope}:${String(row.id)}:${String(row.digest)}`).digest('hex').slice(0, 24);
+      const candidateId = `migration_candidate_${stable}`;
+      const jobId = `migration_job_${stable}`;
+      const revisionId = `revision_${stable}`;
+      const timestamp = String(row.updated_at);
+      const profileId = row.profile_id ? String(row.profile_id) : this.profileId ?? 'owner';
+      const sourceRefs = json<MemoryDocument['metadata']['sourceRefs']>(row.source_refs_json);
+      const evidenceRefs: EvidenceRef[] = sourceRefs.map((source) =>
+        evidenceFromSource(source, profileId, 'legacy-workspace'));
+      const document = this.readDocument(hitFromRow(row).ref);
+      if (!document) continue;
+      const candidate: MemoryCandidate = {
+        id: candidateId,
+        profileId,
+        workspaceId: 'legacy-workspace',
+        scope: String(row.scope) as MemoryCandidate['scope'],
+        proposedKind: String(row.kind) as MemoryCandidate['proposedKind'],
+        title: String(row.title),
+        content: String(row.body),
+        evidenceRefs,
+        confidence: String(row.confidence) as MemoryCandidate['confidence'],
+        status: 'accepted',
+        reasonCode: 'legacy_page_migration',
+        createdBy: 'migration',
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      };
+      const job: CompilationJob = {
+        id: jobId,
+        candidateId,
+        operation: 'legacy-import',
+        compilerVersion: 'memory-hub-v1-migration',
+        expectedRevisions: [],
+        plannedWrites: [{ pageId: String(row.id), nextRevision: 1 }],
+        appliedWrites: [{ pageId: String(row.id), revisionId }],
+        status: 'applied',
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      };
+      this.saveCandidate(candidate);
+      this.saveJob(job);
+      this.commitRevision({
+        revisionId,
+        pageId: String(row.id),
+        revision: 1,
+        scope: document.ref.scope,
+        profileId: document.metadata.profileId,
+        metadata: document.metadata,
+        bodyDigest: document.digest,
+        evidenceRefs,
+        compilationJobId: jobId,
+        createdAt: timestamp,
+      }, job, {
+        id: `migration_receipt_${stable}`,
+        candidateId,
+        jobId,
+        status: 'applied',
+        pageRevisions: [{ pageId: String(row.id), revisionId, revision: 1 }],
+        reasonCode: 'legacy_page_migration',
+        completedAt: timestamp,
+      });
+    }
+  }
+
+  private insertRevision(revision: MemoryPageRevision): void {
+    this.database.prepare(`
+      INSERT OR IGNORE INTO memory_page_revisions (
+        revision_id, page_id, revision, scope, profile_id, metadata_json, body_digest,
+        evidence_refs_json, compilation_job_id, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      revision.revisionId, revision.pageId, revision.revision, revision.scope,
+      revision.profileId, JSON.stringify(revision.metadata), revision.bodyDigest,
+      JSON.stringify(revision.evidenceRefs), revision.compilationJobId, revision.createdAt,
+    );
+    this.database.prepare(`
+      INSERT INTO memory_page_current (page_id, revision_id, revision, updated_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(page_id) DO UPDATE SET revision_id=excluded.revision_id,
+        revision=excluded.revision, updated_at=excluded.updated_at
+      WHERE excluded.revision >= memory_page_current.revision
+    `).run(revision.pageId, revision.revisionId, revision.revision, revision.createdAt);
   }
 }

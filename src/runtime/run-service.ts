@@ -8,6 +8,7 @@ import type {
   MimiRunOptions,
 } from './mimi-agent.js';
 import { assertRunCanComplete, isRunInterrupted, isTerminalRunInterruption } from './run-outcome.js';
+import { RunCommitCoordinator } from './pipeline/run-commit-coordinator.js';
 
 export interface AgentRunRequest {
   input: string;
@@ -91,7 +92,14 @@ async function observe<T>(callback: ((value: T) => void | Promise<void>) | undef
 }
 
 export class AgentRunService {
-  constructor(private readonly agent: MimiAgent) {}
+  private readonly commits: RunCommitCoordinator;
+
+  constructor(private readonly agent: MimiAgent) {
+    this.commits = new RunCommitCoordinator({
+      complete: (answer, usage) => this.agent.completeRun(answer, usage),
+      fail: (error, interrupted, usage) => this.agent.failRun(error, interrupted, usage),
+    });
+  }
 
   async execute(request: AgentRunRequest, observer: AgentRunObserver = {}): Promise<AgentRunResult> {
     let stream: RunStream | undefined;
@@ -132,7 +140,7 @@ export class AgentRunService {
         ? finalOutput
         : finalOutput === undefined ? streamedAnswer : JSON.stringify(finalOutput)).slice(0, 20_000);
       const usage = usageFrom(stream);
-      const effects = await this.agent.completeRun(answer, usage);
+      const effects = await this.commits.complete({ answer, usage });
       const committedAnswer = this.agent.completedRunAnswer ?? answer;
       const result = {
         answer: committedAnswer,
@@ -147,11 +155,11 @@ export class AgentRunService {
         && isTerminalRunInterruption(request.signal.reason)
         ? request.signal.reason
         : undefined;
-      await this.agent.failRun(
-        isTerminalRunInterruption(error) ? error : terminalReason ?? error,
-        isRunInterrupted(error, request.signal),
-        usageFrom(stream),
-      );
+      await this.commits.fail({
+        error: isTerminalRunInterruption(error) ? error : terminalReason ?? error,
+        interrupted: isRunInterrupted(error, request.signal),
+        usage: usageFrom(stream),
+      });
       await observe(observer.onError, error);
       throw error;
     } finally {

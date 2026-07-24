@@ -51,6 +51,7 @@ function fakeAgent(): MimiAgent {
     memoryIngest: async () => ({ id: 'r1', operation: 'ingest', status: 'applied', digest: 'd', pageRefs: [] }),
     memoryCaptureRound: async () => ({ id: 'capture-1', operation: 'capture', status: 'applied', digest: 'd', pageRefs: [] }),
     memoryLint: async () => ({ valid: true, checked: 1, issues: [] }),
+    memoryRefresh: async () => [],
     memoryConflicts: async () => [],
     memoryAudit: async () => [{ id: 1, operation: 'capture', reasonCode: 'test', createdAt: '' }],
     memoryMaintain: async () => ({ created: [] }),
@@ -99,6 +100,7 @@ test('handles status and high-frequency inspection commands', async () => {
     assert.equal(await handler.execute('/memory capture'), 'handled');
     assert.equal(await handler.execute('/memory audit'), 'handled');
     assert.equal(await handler.execute('/memory maintain'), 'handled');
+    assert.equal(await handler.execute('/memory refresh'), 'handled');
     assert.equal(await handler.execute('/plan'), 'handled');
     assert.equal(await handler.execute('/team'), 'handled');
     assert.equal(await handler.execute('/instructions'), 'handled');

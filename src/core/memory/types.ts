@@ -131,6 +131,10 @@ export interface MemoryStatusSnapshot {
   decisions?: number;
   pageLimitReached?: boolean;
   episodes?: number;
+  candidates?: number;
+  revisions?: number;
+  pendingCompilations?: number;
+  uncertainCompilations?: number;
 }
 
 export interface EpisodeInput {

@@ -1,6 +1,12 @@
 import { createHash } from 'node:crypto';
 import { tool, type Tool } from '@openai/agents';
 import { z } from 'zod';
+import type {
+  WorkUnitArtifact,
+  WorkUnitDescriptor,
+  WorkUnitResult,
+  WorkUnitStatus,
+} from '../core/work-unit.js';
 import type { EventCancelResult } from './dispatcher.js';
 import type { ImmutableEvent, ReplyRoute, TaskRecord } from './types.js';
 import { MimiStore } from './store.js';
@@ -94,6 +100,10 @@ export interface BackgroundTaskSummary {
   result?: unknown;
   error?: string;
   previousAttemptError?: string;
+  workUnit: {
+    descriptor: WorkUnitDescriptor;
+    result: WorkUnitResult;
+  };
   execution?: {
     leaseActive: boolean;
     leaseUntil?: string;
@@ -111,6 +121,72 @@ export interface BackgroundTaskSummary {
     logUpdatedAt?: string;
     latestActivity?: string;
     recentEvents?: CodexProgressEvent[];
+  };
+}
+
+function workUnitStatus(status: TaskRecord['status']): WorkUnitStatus {
+  if (status === 'queued' || status === 'paused') return 'pending';
+  if (status === 'running') return 'running';
+  if (status === 'blocked') return 'blocked';
+  if (status === 'completed') return 'completed';
+  if (status === 'cancelled') return 'cancelled';
+  return 'failed';
+}
+
+function workUnitArtifacts(result: unknown): WorkUnitArtifact[] {
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return [];
+  const artifacts = (result as Record<string, unknown>).artifacts;
+  if (!artifacts || typeof artifacts !== 'object' || Array.isArray(artifacts)) return [];
+  return Object.values(artifacts).filter((value): value is string => typeof value === 'string')
+    .map((artifactPath) => ({ path: artifactPath }));
+}
+
+export function backgroundTaskWorkUnit(task: TaskRecord): {
+  descriptor: WorkUnitDescriptor;
+  result: WorkUnitResult;
+} {
+  const payload = task.objective && typeof task.objective === 'object' && !Array.isArray(task.objective)
+    ? task.objective as Record<string, unknown>
+    : {};
+  const objective = typeof payload.objective === 'string'
+    ? payload.objective
+    : typeof payload.prompt === 'string' ? payload.prompt : `Task ${task.id}`;
+  const status = workUnitStatus(task.status);
+  const resultText = task.result === undefined
+    ? ''
+    : typeof task.result === 'string' ? task.result : JSON.stringify(task.result);
+  const descriptor: WorkUnitDescriptor = {
+    id: task.id,
+    kind: task.executor === 'codex' ? 'codex' : 'background',
+    parentRunId: task.parentTaskId ? `task:${task.parentTaskId}` : `event:${task.authorityEventId}`,
+    ...(task.parentTaskId ? { parentWorkUnitId: task.parentTaskId } : {}),
+    objective: objective.slice(0, 8_000),
+    dependencies: [],
+    capabilities: task.workspaceAccess === 'write'
+      ? ['read', 'write', 'execute', 'state-read', 'state-write']
+      : ['read', 'state-read'],
+    workspaceAccess: task.workspaceAccess,
+    paths: [],
+  };
+  return {
+    descriptor,
+    result: {
+      id: task.id,
+      status,
+      summary: (resultText || task.error || `${status}: ${objective}`).slice(0, 12_000),
+      artifacts: workUnitArtifacts(task.result),
+      evidence: [
+        { type: 'task', ref: `task:${task.id}` },
+        ...(task.executor === 'codex' && typeof payload.codex === 'object'
+          ? [{ type: 'codex-checkpoint', ref: `task:${task.id}:codex` }]
+          : []),
+      ],
+      ...(status === 'failed' && task.error ? { error: task.error.slice(0, 2_000) } : {}),
+      startedAt: task.createdAt,
+      ...(status === 'completed' || status === 'failed' || status === 'cancelled'
+        ? { completedAt: task.updatedAt }
+        : {}),
+    },
   };
 }
 
@@ -136,6 +212,7 @@ export function backgroundTaskSummary(task: TaskRecord): BackgroundTaskSummary {
     result: task.result,
     error: retrying ? undefined : task.error,
     previousAttemptError: retrying ? task.error : undefined,
+    workUnit: backgroundTaskWorkUnit(task),
     execution: {
       leaseActive: task.status === 'running'
         && task.leaseUntil !== undefined

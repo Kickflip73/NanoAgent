@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { isWorkUnitResult, type WorkUnitResult } from './work-unit.js';
 
 export const completionEvidenceTypeSchema = z.enum(['tool_receipt', 'artifact', 'test', 'semantic']);
 export const completionCriterionSchema = z.object({
@@ -93,6 +94,19 @@ function receiptOutcome(value: unknown): string | undefined {
   const record = objectValue(value);
   return typeof record?.outcome === 'string' ? record.outcome : undefined;
 }
+function workUnitResults(value: unknown): WorkUnitResult[] {
+  if (typeof value === 'string') {
+    try {
+      return workUnitResults(JSON.parse(value) as unknown);
+    } catch {
+      return [];
+    }
+  }
+  if (isWorkUnitResult(value)) return [value];
+  if (Array.isArray(value)) return value.flatMap(workUnitResults);
+  const record = objectValue(value);
+  return record ? Object.values(record).flatMap(workUnitResults) : [];
+}
 function isConfirmedActionReceipt(item: CompletionEvidence): boolean {
   const receipt = objectValue(item.output);
   return item.toolName === 'connector_action'
@@ -142,19 +156,26 @@ function criterionSatisfied(
     return {
       satisfied: succeeded.some((item) => {
         const outcome = receiptOutcome(item.output);
-        return outcome === undefined || outcome === 'accepted' || outcome === 'confirmed';
+        return outcome === undefined || outcome === 'accepted' || outcome === 'confirmed'
+          || workUnitResults(item.output).some((unit) => unit.status === 'completed');
       }),
       uncertain: false,
     };
   }
   if (criterion.requiredEvidence === 'artifact') {
     return {
-      satisfied: succeeded.some((item) => ['write_file', 'edit_file', 'apply_patch', 'move_file'].includes(item.toolName)),
+      satisfied: succeeded.some((item) =>
+        ['write_file', 'edit_file', 'apply_patch', 'move_file'].includes(item.toolName)
+        || workUnitResults(item.output).some((unit) =>
+          unit.status === 'completed' && unit.artifacts.length > 0)),
       uncertain: false,
     };
   }
   return {
-    satisfied: succeeded.some((item) => item.toolName === 'run_shell' && objectValue(item.output)?.exitCode === 0),
+    satisfied: succeeded.some((item) =>
+      (item.toolName === 'run_shell' && objectValue(item.output)?.exitCode === 0)
+      || workUnitResults(item.output).some((unit) =>
+        unit.status === 'completed' && unit.evidence.some((evidenceItem) => evidenceItem.type === 'test'))),
     uncertain: false,
   };
 }

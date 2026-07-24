@@ -4,7 +4,9 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { RunContext } from '@openai/agents';
+import { DatabaseSync } from 'node:sqlite';
 import { createMemoryMaintenanceTools } from '../src/daemon/memory-maintenance-tools.js';
+import { MAX_MEMORY_EVIDENCE_SNAPSHOT_BYTES } from '../src/daemon/persistence/memory-evidence.js';
 import { decideEvent } from '../src/daemon/policy.js';
 import { MimiStore } from '../src/daemon/store.js';
 import type { EventTrust } from '../src/daemon/types.js';
@@ -86,6 +88,109 @@ test('terminal Tasks atomically register observations and emit one bounded maint
   } finally {
     store.close();
   }
+});
+
+test('terminal Task observations retain an immutable evidence snapshot bounded to 8KB', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-memory-evidence-'));
+  const file = path.join(root, 'mimi.db');
+  const store = new MimiStore(file);
+  const at = new Date();
+  const large = '证据'.repeat(20_000);
+  try {
+    const event = store.appendEvent({
+      id: 'event-large', externalId: 'event-large', source: 'test', type: 'command.received',
+      trust: 'owner', payload: { prompt: large }, profileId: 'owner',
+      occurredAt: at.toISOString(), receivedAt: at.toISOString(),
+    }).event;
+    store.routeEvent(event.id, {
+      routerVersion: 'test', decision: 'task_created', reasonCode: 'test', tasks: [{
+        id: 'task-large', type: 'conversation', idempotencyKey: 'task-large',
+        triggerEventId: event.id, authorityEventId: event.id, profileId: 'owner',
+        sessionKey: 'session-large', objective: { prompt: large }, executor: 'session_actor',
+        workspaceAccess: 'write', priority: 50,
+      }],
+    });
+    const executionAt = new Date(at.getTime() + 1_000);
+    store.claimTaskById('task-large', 'worker-large', 60_000, executionAt);
+    const attempt = store.beginTaskAttempt(
+      'task-large',
+      'worker-large',
+      'session-large',
+      'worker-large',
+      executionAt,
+    );
+    store.completeTask('task-large', 'worker-large', { answer: large }, attempt.id, executionAt);
+    const observation = store.listMemoryObservations('owner')[0]!;
+    assert.equal(
+      Buffer.byteLength(JSON.stringify(observation.evidenceSnapshot)) <= MAX_MEMORY_EVIDENCE_SNAPSHOT_BYTES,
+      true,
+    );
+    assert.equal((observation.objective as { truncated: boolean }).truncated, true);
+    assert.equal((observation.result as { truncated: boolean }).truncated, true);
+  } finally {
+    store.close();
+  }
+
+  const database = new DatabaseSync(file);
+  database.prepare(`
+    UPDATE tasks SET objective_json = '{"prompt":"mutated"}', result_json = '{"answer":"mutated"}'
+    WHERE id = 'task-large'
+  `).run();
+  const stored = database.prepare(`
+    SELECT evidence_snapshot_json FROM memory_observations WHERE task_id = 'task-large'
+  `).get() as { evidence_snapshot_json: string };
+  assert.equal(
+    Buffer.byteLength(stored.evidence_snapshot_json) <= MAX_MEMORY_EVIDENCE_SNAPSHOT_BYTES,
+    true,
+  );
+  database.close();
+
+  const reopened = new MimiStore(file);
+  try {
+    const observation = reopened.listMemoryObservations('owner')[0]!;
+    assert.notEqual(
+      (observation.objective as { preview: string }).preview,
+      JSON.stringify({ prompt: 'mutated' }),
+    );
+    assert.equal(observation.contentDigest.length, 64);
+    assert.equal(observation.sourceRef.trust, 'owner');
+    assert.match(observation.sourceRef.id, /task:task-large\/run:/);
+  } finally {
+    reopened.close();
+  }
+});
+
+test('v15 migration backfills bounded evidence for existing v14 observations', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-memory-evidence-v14-'));
+  const file = path.join(root, 'mimi.db');
+  const first = new MimiStore(file);
+  try {
+    addTask(first, 'legacy-observation', new Date());
+  } finally {
+    first.close();
+  }
+  const database = new DatabaseSync(file);
+  database.exec(`
+    UPDATE memory_observations SET evidence_snapshot_json = NULL
+      WHERE task_id = 'legacy-observation';
+    PRAGMA user_version = 14;
+  `);
+  database.close();
+
+  const migrated = new MimiStore(file);
+  try {
+    const observation = migrated.listMemoryObservations('owner')[0]!;
+    assert.deepEqual(observation.objective, { prompt: 'objective legacy-observation' });
+    assert.deepEqual(observation.result, { answer: 'durable result legacy-observation' });
+  } finally {
+    migrated.close();
+  }
+  const verified = new DatabaseSync(file, { readOnly: true });
+  assert.equal(
+    (verified.prepare('PRAGMA user_version').get() as { user_version: number }).user_version,
+    15,
+  );
+  verified.close();
 });
 
 test('maintenance cannot promote one untrusted observation to active memory', async () => {

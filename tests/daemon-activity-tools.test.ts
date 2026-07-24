@@ -110,7 +110,7 @@ test('owner status answer is generated from bounded daemon state without a model
         outbox: store.activitySnapshot(1).outbox,
       }),
     });
-    assert.match(degraded, /系统健康：unhealthy/);
+    assert.match(degraded, /系统健康：degraded/);
     assert.match(degraded, /2 个任务进入 dead letter/);
     assert.match(degraded, /mimi daemon tasks/);
   } finally {

@@ -235,6 +235,26 @@ test('keeps queue and static runtime status above the bottom input box', async (
   terminal.close();
 });
 
+test('labels structured context status as estimate and shows compression', () => {
+  const input = new FakeInput();
+  const output = new FakeOutput();
+  output.columns = 140;
+  const terminal = new InteractiveTerminal([], input as never, output as never);
+  terminal.setRuntimeStatus({
+    mode: '标准',
+    model: 'test',
+    contextUsed: 1_200,
+    contextWindow: 128_000,
+    contextSource: 'estimate',
+    compressedFrom: 9_000,
+  });
+  terminal.start({ onLine: () => undefined, onEscape: () => undefined, onExit: () => undefined });
+  const plain = output.value.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '');
+  assert.match(plain, /上下文 ~1\.2k est\/128k/);
+  assert.match(plain, /已压缩 9\.0k→1\.2k/);
+  terminal.close();
+});
+
 test('keeps the input cursor away from the right edge for IME composition', () => {
   const input = new FakeInput();
   const output = new FakeOutput();

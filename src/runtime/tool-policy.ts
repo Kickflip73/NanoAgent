@@ -1,5 +1,6 @@
 import type { Tool } from '@openai/agents';
 import type { AgentPermissionMode, SecurityProfile } from '../config.js';
+import type { ToolCapability } from '../core/work-unit.js';
 import type { AgentMode } from './instructions.js';
 
 export {
@@ -7,21 +8,7 @@ export {
   teamRoleToolNames,
   type SubAgentRole,
 } from '../core/tool-role-policy.js';
-
-export type ToolCapability =
-  | 'read'
-  | 'write'
-  | 'execute'
-  | 'network-read'
-  | 'network-write'
-  | 'memory-read'
-  | 'memory-write'
-  | 'state-read'
-  | 'state-write'
-  | 'delivery-control'
-  | 'computer-read'
-  | 'computer-write'
-  | 'control';
+export type { ToolCapability } from '../core/work-unit.js';
 export interface ToolDescriptor {
   name: string;
   capabilities?: readonly ToolCapability[];

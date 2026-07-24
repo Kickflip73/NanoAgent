@@ -1,6 +1,11 @@
 import { Agent, type Tool } from '@openai/agents';
 import type { AgentMode } from '../core/agent-mode.js';
 import { subAgentToolNames } from '../core/tool-role-policy.js';
+import type {
+  WorkUnitDescriptor,
+  WorkUnitObservation,
+  WorkUnitResult,
+} from '../core/work-unit.js';
 import type { AgentModel } from './model-port.js';
 
 function selectTools(tools: Tool[], names: readonly string[]): Tool[] {
@@ -22,7 +27,79 @@ export interface SubAgentToolsOptions {
   model: AgentModel;
   tools: Tool[];
   persistentInstructions?: string;
+  parentRunId?: string;
   onEvent?: (agent: string, eventType: string) => void | Promise<void>;
+  onWorkUnit?: (observation: WorkUnitObservation) => void | Promise<void>;
+}
+
+function delegatedObjective(argumentsJson: string | undefined): string {
+  if (!argumentsJson) return 'Delegated subagent task';
+  try {
+    const parsed = JSON.parse(argumentsJson) as { input?: unknown };
+    return typeof parsed.input === 'string' ? parsed.input : argumentsJson;
+  } catch {
+    return argumentsJson;
+  }
+}
+
+function observedSubAgentTool(
+  agent: Agent,
+  role: 'researcher' | 'reviewer' | 'architect',
+  toolName: string,
+  toolDescription: string,
+  options: SubAgentToolsOptions,
+): Tool {
+  const started = new Map<string, string>();
+  return agent.asTool({
+    toolName,
+    toolDescription,
+    runOptions: { maxTurns: null },
+    onStream: async ({ event, toolCall }) => {
+      const id = toolCall?.callId ?? `${options.parentRunId ?? 'run'}:${toolName}`;
+      if (!started.has(id)) started.set(id, new Date().toISOString());
+      await forwardEvent(options.onEvent, role, event.type);
+    },
+    customOutputExtractor: async (output) => {
+      const invocation = output.agentToolInvocation;
+      const id = invocation.toolCallId ?? `${options.parentRunId ?? 'run'}:${toolName}`;
+      const objective = delegatedObjective(invocation.toolArguments);
+      const descriptor: WorkUnitDescriptor = {
+        id,
+        kind: 'subagent',
+        parentRunId: options.parentRunId ?? 'unbound-run',
+        objective: objective.slice(0, 8_000),
+        role,
+        dependencies: [],
+        capabilities: role === 'researcher' ? ['read', 'network-read', 'memory-read'] : ['read', 'memory-read'],
+        workspaceAccess: 'read',
+        paths: [],
+      };
+      const summary = String(output.finalOutput ?? 'SubAgent 未返回摘要');
+      const completedAt = new Date().toISOString();
+      const result: WorkUnitResult = {
+        id,
+        status: 'completed',
+        summary,
+        artifacts: [],
+        evidence: [{ type: 'agent-tool-call', ref: `${toolName}:${id}` }],
+        startedAt: started.get(id) ?? new Date().toISOString(),
+        completedAt,
+      };
+      try {
+        await options.onWorkUnit?.({
+          descriptor,
+          status: 'completed',
+          observedAt: completedAt,
+          result,
+        });
+      } catch {
+        // WorkUnit observers are telemetry and cannot change the nested result.
+      } finally {
+        started.delete(id);
+      }
+      return JSON.stringify(result);
+    },
+  });
 }
 
 export function createSubAgentTools(options: SubAgentToolsOptions): Tool[] {
@@ -60,26 +137,29 @@ export function createSubAgentTools(options: SubAgentToolsOptions): Tool[] {
   });
 
   const tools = [
-    researcher.asTool({
-      toolName: 'delegate_research',
-      toolDescription: '把独立、资料密集的研究子任务交给只读 researcher；简单查询不要委派。',
-      runOptions: { maxTurns: null },
-      onStream: async ({ event }) => forwardEvent(options.onEvent, 'researcher', event.type),
-    }),
-    reviewer.asTool({
-      toolName: 'delegate_review',
-      toolDescription: '把边界清晰的代码、文档或方案审查交给只读 reviewer。',
-      runOptions: { maxTurns: null },
-      onStream: async ({ event }) => forwardEvent(options.onEvent, 'reviewer', event.type),
-    }),
+    observedSubAgentTool(
+      researcher,
+      'researcher',
+      'delegate_research',
+      '把独立、资料密集的研究子任务交给只读 researcher；简单查询不要委派。',
+      options,
+    ),
+    observedSubAgentTool(
+      reviewer,
+      'reviewer',
+      'delegate_review',
+      '把边界清晰的代码、文档或方案审查交给只读 reviewer。',
+      options,
+    ),
   ];
   if (options.mode !== 'general') {
-    tools.splice(1, 0, architect.asTool({
-      toolName: 'delegate_architecture',
-      toolDescription: '把边界清晰的架构分析或实施方案设计交给只读 architect。',
-      runOptions: { maxTurns: null },
-      onStream: async ({ event }) => forwardEvent(options.onEvent, 'architect', event.type),
-    }));
+    tools.splice(1, 0, observedSubAgentTool(
+      architect,
+      'architect',
+      'delegate_architecture',
+      '把边界清晰的架构分析或实施方案设计交给只读 architect。',
+      options,
+    ));
   }
   return tools;
 }

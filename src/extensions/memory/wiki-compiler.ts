@@ -14,7 +14,8 @@ import { contentDigest, sourceDigest } from '../../core/memory.js';
 import { DocumentSource } from './document-source.js';
 import { SqliteMemoryCatalog } from './sqlite-catalog.js';
 import { lintWiki } from './wiki-lint.js';
-import { WikiVault } from './wiki-vault.js';
+import { parsePage, serializePage, WikiVault } from './wiki-vault.js';
+import { MemoryCompilationCoordinator } from './compilation-coordinator.js';
 
 const COMPILER_VERSION = 'memory-hub-v1';
 
@@ -70,13 +71,35 @@ function ingestUnits(title: string, content: string, source: SourceRef): Array<{
 }
 
 export class DefaultWikiCompiler implements WikiCompiler {
+  private readonly privateCoordinator: MemoryCompilationCoordinator;
+  private readonly workspaceCoordinator: MemoryCompilationCoordinator;
+
   constructor(
     private readonly privateVault: WikiVault,
     private readonly workspaceVault: WikiVault,
     private readonly privateCatalog: SqliteMemoryCatalog,
     private readonly workspaceCatalog: SqliteMemoryCatalog,
     private readonly documents: DocumentSource,
-  ) {}
+    workspaceId: string,
+  ) {
+    this.privateCoordinator = new MemoryCompilationCoordinator(
+      privateCatalog,
+      privateVault,
+      workspaceId,
+    );
+    this.workspaceCoordinator = new MemoryCompilationCoordinator(
+      workspaceCatalog,
+      workspaceVault,
+      workspaceId,
+    );
+  }
+
+  async recover(): Promise<void> {
+    await Promise.all([
+      this.privateCoordinator.recover(),
+      this.workspaceCoordinator.recover(),
+    ]);
+  }
 
   async ingest(source: SourceRef, context: RunMemoryContext): Promise<CompilationReceipt> {
     if (source.type !== 'file') throw new Error('Ingest 只接受明确的 workspace 文件 SourceRef');
@@ -110,10 +133,34 @@ export class DefaultWikiCompiler implements WikiCompiler {
         validFrom: null, validUntil: null, supersedes: existing?.metadata.supersedes ?? [],
         createdAt: existing?.metadata.createdAt ?? timestamp, updatedAt: timestamp,
       };
-      const page = await this.workspaceVault.write(
-        metadata, pageBody(unit.title, unit.content, [source], unit.links), existing?.digest,
-      );
-      this.workspaceCatalog.index({ ...page, path: existing?.path });
+      const body = pageBody(unit.title, unit.content, [source], unit.links);
+      const prepared = this.workspaceCoordinator.prepare({
+        operation: 'ingest',
+        scope: 'workspace',
+        title: unit.title,
+        content: unit.content,
+        kind: unit.kind,
+        confidence: 'source-grounded',
+        sourceRefs: [source],
+        metadata,
+        targetDigest: parsePage(serializePage(metadata, body)).digest,
+        createdBy: context.cause?.source === 'memory-maintenance' ? 'maintenance' : 'owner',
+        reasonCode: 'workspace_source_ingest',
+        context,
+      });
+      let page;
+      try {
+        page = await this.workspaceVault.write(metadata, body, existing?.digest);
+      } catch (error) {
+        this.workspaceCoordinator.fail(prepared, error);
+        throw error;
+      }
+      try {
+        this.workspaceCoordinator.commit(prepared, { ...page, path: existing?.path });
+      } catch (error) {
+        this.workspaceCoordinator.fail(prepared, error, true);
+        throw error;
+      }
       if (!plan.appliedPageRefs.some((ref) => ref.id === unit.ref.id)) plan.appliedPageRefs.push(unit.ref);
       this.workspaceCatalog.saveReceipt({ ...pending, pageRefs: [...plan.appliedPageRefs] }, plan);
     }
@@ -161,8 +208,35 @@ export class DefaultWikiCompiler implements WikiCompiler {
       validFrom: null, validUntil: null, supersedes: input.supersedes ?? existing?.metadata.supersedes ?? [],
       createdAt: existing?.metadata.createdAt ?? timestamp, updatedAt: timestamp,
     };
-    const page = await vault.write(metadata, pageBody(input.title, input.content, input.sourceRefs), existing?.digest);
-    catalog.index(page);
+    const body = pageBody(input.title, input.content, input.sourceRefs);
+    const coordinator = scope === 'private' ? this.privateCoordinator : this.workspaceCoordinator;
+    const prepared = coordinator.prepare({
+      operation: 'capture',
+      scope,
+      title: input.title.trim(),
+      content: input.content,
+      kind: input.kind ?? 'synthesis',
+      confidence: input.confidence ?? 'inferred',
+      sourceRefs: input.sourceRefs,
+      metadata,
+      targetDigest: parsePage(serializePage(metadata, body)).digest,
+      createdBy: context.cause?.source === 'memory-maintenance' ? 'maintenance' : 'runtime',
+      reasonCode: input.reasonCode,
+      context,
+    });
+    let page;
+    try {
+      page = await vault.write(metadata, body, existing?.digest);
+    } catch (error) {
+      coordinator.fail(prepared, error);
+      throw error;
+    }
+    try {
+      coordinator.commit(prepared, page);
+    } catch (error) {
+      coordinator.fail(prepared, error, true);
+      throw error;
+    }
     plan.appliedPageRefs.push(ref);
     catalog.saveReceipt({ ...pending, pageRefs: [ref] }, plan);
     const inspection = await vault.inspect();
@@ -191,6 +265,7 @@ export class DefaultWikiCompiler implements WikiCompiler {
       id: previous?.id ?? `receipt_${randomUUID()}`, operation: 'capture', status: 'rejected',
       digest, pageRefs: [], reasonCode: normalizedReason,
     };
+    this.privateCoordinator.reject(sourceRefs, normalizedReason, _context);
     this.privateCatalog.saveReceipt(receipt, plan);
     this.privateCatalog.recordDecision('capture', normalizedReason);
     return receipt;

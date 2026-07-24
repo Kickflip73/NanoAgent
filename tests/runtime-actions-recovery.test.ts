@@ -6,6 +6,7 @@ import test from 'node:test';
 import { RunContext, tool, type AgentInputItem } from '@openai/agents';
 import { z } from 'zod';
 import { ExecutionLedger, type ExecutionCall } from '../src/core/execution-ledger.js';
+import type { RunCommitJournal } from '../src/core/run-commit-journal.js';
 import { FileSession } from '../src/core/session.js';
 import { MimiHost, type HostedRunExecutor } from '../src/runtime/mimi-host.js';
 import { MimiAgent } from '../src/runtime/mimi-agent.js';
@@ -17,6 +18,7 @@ interface RuntimeCall {
 
 interface AgentInternals {
   ledger: ExecutionLedger;
+  runCommits: RunCommitJournal;
   runner: { run: (agent: unknown) => Promise<unknown> };
 }
 
@@ -101,6 +103,10 @@ test('defers model and mode changes and restores them from a completion receipt 
   assert.equal((await first.runtimeInfo()).mode.id, before.mode.id);
   crashBeforeRuntimeActions(first);
   await assert.rejects(first.completeRun('scheduled'), /simulated crash/);
+  const pendingCommit = await (first as unknown as AgentInternals).runCommits
+    .findByExecutionKey('owner', 'event:model-mode');
+  assert.equal(pendingCommit?.phase, 'goal_committed');
+  assert.equal(JSON.stringify(pendingCommit).includes('scheduled'), false);
   const receipt = await (first as unknown as AgentInternals).ledger.getReceipt<Record<string, unknown>>(
     'owner', 'event:model-mode',
   );

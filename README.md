@@ -339,6 +339,7 @@ Computer Use 默认完全关闭。启用后仍优先使用 Shell、Browser、Con
 | `/memory search <query>` | 搜索 private/workspace Wiki |
 | `/memory read <scope:id>` | 显式读取一页 Memory |
 | `/memory ingest <path>` | 导入一个 workspace Markdown/text 来源 |
+| `/memory refresh [1-50]` | 显式重编译 stale workspace 来源并保留旧 Revision |
 | `/memory lint`、`/memory reindex` | 检查 Wiki 或重建派生索引（保留控制账本） |
 | `/memory forget <scope:id>` | 遗忘页面并写 suppression |
 | `/plan` | 查看当前任务计划 |
@@ -356,15 +357,20 @@ Computer Use 默认完全关闭。启用后仍优先使用 Shell、Browser、Con
 
 完整会话保存在当前唯一数据根 `.mimi-agent/sessions/`。草稿不在该目录创建文件；`/sessions`、`/switch` 和显式 `MIMI_SESSION` 只选择已有 Session，`/new` 只替换内存草稿。每个真实 Session 独立保存 SDK transcript、mode、model、输出等级、最近运行检查点和上下文压缩档案；列表标题会综合多轮用户消息提炼并随主题演进，而不是复制第一句话。切换后按时间回放原始用户/助手消息，工具调用与结果仍保留在 FileSession 中。默认启动草稿不读取历史，已有 Session 快照只返回有界最近对话；`/history` 会通过多个小型本地 RPC 分块重组完整权威历史，避免长期 Session 超过 IPC 帧上限。若上次运行中断，底部显示恢复点和 `/resume` 入口。
 
-发送给模型的有效上下文分四层管理：较早 Tool Result 先做 microcompact；超过 `MIMI_HISTORY_LIMIT`（兼容旧 `HISTORY_LIMIT`）或 Token Budget 后把旧完整轮次持久化为 context archive；`/compact` 可主动执行 full compact 并保留最近两轮；仍超预算时才按完整用户轮次做 PTL truncation。窗口由当前模型 Profile 决定，切换或恢复模型时同步更新；完整预算包含动态 Instructions、历史、当前输入、Function Tool Schema、协议安全余量和输出预留，输出预留同时作为模型请求的 `maxTokens`。压缩只改变模型视图，不覆盖、删除或伪造原始 transcript。`/context` 会区分请求前估算、Provider 返回的上次请求实际 usage 与整轮累计 usage。
+发送给模型的有效上下文分四层管理：较早 Tool Result 先做 microcompact；超过 `MIMI_HISTORY_LIMIT`（兼容旧 `HISTORY_LIMIT`）或 Token Budget 后把旧完整轮次持久化为 context archive；`/compact` 可主动执行 full compact 并保留最近两轮；仍超预算时才按完整用户轮次做 PTL truncation。窗口由当前模型 Profile 决定，切换或恢复模型时同步更新；完整预算包含动态 Instructions、历史、当前输入、Function Tool Schema、协议安全余量和输出预留，输出预留同时作为模型请求的 `maxTokens`。每次请求都会生成不进入模型输入的 Context Manifest，记录估算器、输入预算、各 section 用量和确定性压缩记录；Provider 返回 usage 后只回填最近请求 actual，不反向篡改估算值。压缩只改变模型视图，不覆盖、删除或伪造原始 transcript。`/context` 会区分 Raw Session、Effective History、Request Estimate、Provider 返回的 Last Request Actual 与 Run Actual。
 
 每轮开始即写入带 runId/owner 的 `running` checkpoint，所有进展与终态写入都做 runId 比对；旧 Run 不能覆盖新 Run，成功 Run 也不会被迟到的失败回调翻转。统一 CLI 中，Esc 只向后台请求取消当前 Event；若外部 Tool 正在执行，Dispatcher 会等待它到达安全边界并完成结果落账，再中止模型并把 Host Run 记为 `interrupted`，不会直接杀掉正在执行的 Shell。`/resume` 合并 checkpoint、Goal、Plan 与 Team 状态，先核对工作区再发起新一轮任务；它是 best-effort 任务续跑，不声称能从任意模型或工具指令点精确恢复。
+
+Run 的各阶段通过显式 pipeline 和 state ports 装配。跨 FileSession、Goal、
+Task 与 RuntimeAction 的完成过程写入只含摘要和 phase 的 Run Commit Journal；
+完成回执一旦落盘，后续崩溃恢复会复用它而不会再次调用模型。JSON 状态本轮
+保持单读单写，不与 SQLite 长期双写。
 
 默认 CLI 交互不会阻塞输入：MimiAgent 执行时仍可继续提交消息。当前窗口指向同一 Session 的消息进入 FIFO 队列并依次执行；另一个窗口选择不同 Session 后，可在 `MIMI_SESSION_MAX_CONCURRENCY` 限制内同时运行，不必等待前一个 Session 结束。输入框支持多行编辑：`Shift+Enter` 插入换行，`Command+←/→` 跳到当前行首/行尾，只有手动 `Enter` 才发送；终端 bracketed paste 中自带的换行只会进入编辑区，不会触发提交。按 `Esc` 会请求后台在外部 Tool 的安全边界取消当前 Event，队列中的后续消息不受影响。长程或多阶段任务通过 `update_plan` 建立阶段任务，当前会话的完成数、当前步骤和最多 5 条附近任务会实时显示在输入框上方；长描述保持单行省略，全部完成后折叠为一行。输入 `/` 会展示命令面板，使用黑色活动光标配合 `↑` / `↓` 选择、`Tab` 补全。`/new`、`/clear` 会清理终端并保留项目顶部信息；会话切换则清理当前画面、恢复顶部信息、任务进度并回放目标会话的历史消息。
 
 简单问答、短操作以及你明确要在当前窗口看到结果的任务，会留在 Conversation actor 中流式执行。长程、大型、多阶段、持续等待或你明确无需立即结果的任务，主 MimiAgent 会调用 `delegate_background_task`：任务写入 SQLite 后立即返回 `taskId`，当前对话恢复可用，`TaskProcessSupervisor` 再用独立 Node.js 子进程和独立 Task Session 执行；`executor: "codex"` 是例外，它由 detached runner 启动独立 Codex CLI，不创建 Mimi Plan，也不进入 Mimi 的工具调用、重试或验收流程。到期 Schedule 与 Daily Routine 也复用同一 Task lane，而不是占用来源 Conversation。默认 `workspaceAccess=write`，写任务独占工作区；明确声明 `read` 的分析任务使用确定性只读工具，可与其他只读后台任务并行。Task 一旦被接受就不会因 snooze、静默时段或 Attention 预算被转成 Digest；这些设置控制的是新事件是否值得接受，不会吞掉执行队列。Task 内不再递归创建 durable 子任务；大型可拆分任务在同一 worker 内用有界 Ultra Team 汇总。只有 owner conversation root 的 write Task 可执行 Connector action；外部 source-policy work Task 不会看到必然被 Broker 拒绝的 action 工具，但完成结果仍由 Outbox 原路返回。发起 CLI 即使已退出，任务仍继续；完成结果由 Outbox 主动发往原渠道或系统通知。若任务确实缺少必要输入，它会持久化为 `blocked` 并主动问你，补充上下文后从原 Task Session 继续。运行中执行 `/task pause` 会先返回“已请求暂停”，并在当前 Tool 完成后的安全点落成 `paused`；pause/cancel 控制会在回复 CLI 前先写入 SQLite，即使 Kernel 或 worker 随后崩溃，重启恢复也不会继续执行已取消任务，已暂停任务仍保持 `paused`。不要为了“并行”把普通短任务强制后台化；用 `/tasks`、`/task <id>`、`/task pause <id>`、`/task resume <id> [context]` 和 `/task cancel <id>` 管理真正的后台工作。
 
-输入区固定在终端交互区域的最底部，以 `┊> ` 提示符展示。输入区正上方是常驻状态栏：空闲时显示就绪状态，执行时显示动态 Spinner，并持续展示当前模式、模型以及估算上下文 Token/窗口。如果存在等待消息，更上方会常驻显示 FIFO 队列中的每条对话内容，过长内容以 `...` 省略，消息开始执行后自动从队列区域移除。
+输入区固定在终端交互区域的最底部，以 `┊> ` 提示符展示。输入区正上方是常驻状态栏：空闲时显示就绪状态，执行时显示动态 Spinner，并持续展示当前模式、模型以及上下文 Token/窗口。数值后缀明确标记 `actual`、`est` 或 `raw`；有请求 Manifest 时不再用完整 transcript 冒充当前请求，发生压缩时同时显示压缩前后大小。如果存在等待消息，更上方会常驻显示 FIFO 队列中的每条对话内容，过长内容以 `...` 省略，消息开始执行后自动从队列区域移除。
 
 用户提交的内容不会随输入框清空而消失：空闲消息开始执行时会立即以 `> 内容` 写入终端对话历史；执行期间提交的消息先常驻等待队列，轮到执行时再移入历史区，避免插入并打断上一条流式回答。
 
@@ -532,6 +538,11 @@ Memory 编译与查询流程：
 复杂任务使用 `update_plan` 管理当前步骤：阶段开始前标记 `running`，结束后立即更新为 `completed` 或 `failed`，再推进下一阶段。Session、mode、model、运行状态和 Plan 当前进度会作为紧凑会话状态注入每轮模型上下文；`update_plan` 返回的完整列表则是本轮后续推理的权威进度。需要跨多轮或跨重启时使用 `set_goal`，并通过 `update_goal` 保存状态、checkpoint 和 next action。`/resume` 会从持久状态生成恢复输入。两者共享当前唯一数据根中的 `plans.json`（新安装通常为 `.mimi-agent/plans.json`），不会产生重复的 Todo 系统。
 
 通用模式可将独立研究或审查交给 `delegate_research`、`delegate_review`；Plan 与 Ultra 还提供只读 `delegate_architecture`。Ultra 的 `set_team_tasks` 与 `run_team` 才会启动 builder/tester 等角色。SubAgent 不继承 MCP、不包含委派工具，最终整合仍由主 Agent 负责。它们是当前 Run 内等待结果的 Runner，不是后台任务，也不会让当前对话提前返回。只有 `delegate_background_task` 会创建持久 Task 和 OS 进程，并通过 Outbox 异步通知。委派时可选 `executor: "codex"` 使用本机 Codex CLI：Mimi 只登记 Task、启动 detached runner 和展示进程/产物状态；Codex 独立完成工作并直接回写退出码、最终摘要、thread、PID、JSONL 与 summary 文件。Codex 缺失或失败不会回退给 Mimi，也不会触发相同任务的 Mimi Plan 或 Shell 重做。Ultra Team 借鉴 [Claude Code Agent Teams](https://code.claude.com/docs/en/agent-teams) 的 lead、共享任务和 mailbox 思想，但只保留本地 task list、依赖与有限并发，不引入复杂编排服务。
+
+这四类执行面不共享调度器，但共享 WorkUnit 观测与结果字段：状态、摘要、
+产物、证据和起止时间。终端、Trace 与 Completion Gate 因而不需要按
+SubAgent、Team、Background、Codex 分别猜测结果格式；原有权限、路径
+ownership、单层递归和 Codex 单 Attempt 约束保持不变。
 
 运行生命周期、SubAgent 和 Team worker 事件通过轻量 Hooks 写入 `.mimi-agent/traces/<session-id>.jsonl`。Trace 只记录公开运行事件与公开 reasoning summary，不保存模型隐藏思维链。
 

@@ -123,6 +123,7 @@ export interface CommandTarget {
   memoryIngest(path: string, signal?: AbortSignal): ReturnType<MimiAgent['memoryIngest']>;
   memoryCaptureRound(roundRef?: string): ReturnType<MimiAgent['memoryCaptureRound']>;
   memoryLint(): ReturnType<MimiAgent['memoryLint']>;
+  memoryRefresh(limit?: number): ReturnType<MimiAgent['memoryRefresh']>;
   memoryConflicts(limit?: number): ReturnType<MimiAgent['memoryConflicts']>;
   memoryAudit(limit?: number): ReturnType<MimiAgent['memoryAudit']>;
   memoryMaintain?(): MaybePromise<unknown>;
@@ -467,15 +468,27 @@ export class CommandHandler {
     }
     if (command === '/context') {
       const info = await this.agent.contextInfo();
+      const largestSections = [...(info.sections ?? [])]
+        .sort((left, right) => right.estimatedTokens - left.estimatedTokens)
+        .slice(0, 8)
+        .map((section) => `  - ${section.id}: ~${section.estimatedTokens}${section.truncated ? '（已截断）' : ''}`);
+      const compression = (info.compression ?? []).map((record) =>
+        `  - ${record.strategy}: ${record.beforeTokens}→${record.afterTokens} tokens · ${record.affectedItems} items`
+      );
       return this.handled([
         `历史条目  ${info.historyItems} / ${info.historyLimit}`,
-        `原始历史  ~${info.rawTokens ?? info.estimatedTokens} tokens`,
-        `${info.estimateScope === 'last_request' ? '最近请求估算' : '当前历史估算'} ~${info.effectiveTokens ?? info.estimatedTokens} tokens`,
+        `Raw Session  ~${info.rawTokens ?? info.estimatedTokens} tokens`,
+        `Effective History  ~${info.effectiveTokens ?? info.estimatedTokens} tokens`,
+        `Request Estimate  ${info.requestEstimateTokens ? `~${info.requestEstimateTokens} tokens` : '尚无请求 Manifest'}`,
         `上次请求实际 ${info.lastRequestInputTokens ? `${info.lastRequestInputTokens} input + ${info.lastRequestOutputTokens ?? 0} output` : 'Provider 未返回'}`,
         `上轮累计用量 ${info.runTotalTokens ? `${info.runTotalTokens} tokens（input ${info.runInputTokens ?? 0} / output ${info.runOutputTokens ?? 0}）` : 'Provider 未返回'}`,
-        `模型窗口  ${info.contextWindow} · 输入上限 ${info.inputBudget} · 输出预留 ${info.outputReserve}`,
+        `模型窗口  ${info.contextWindow} · Available Input Budget ${info.inputBudget} · 输出预留 ${info.outputReserve}`,
+        `估算器  ${info.estimator ?? 'mimi-char-v1'}${info.requestId ? ` · request ${info.requestId}` : ''}`,
+        ...(largestSections.length ? ['请求分项', ...largestSections] : []),
         `压缩归档  ${info.archivedItems ?? 0} 条 · ~${info.archiveTokens ?? 0} tokens`,
-        `压缩策略  ${info.contextStrategies?.join(', ') || '未触发'}`,
+        ...(compression.length ? ['压缩记录', ...compression] : [
+          `压缩策略  ${info.contextStrategies?.join(', ') || '未触发'}`,
+        ]),
         `最近压缩  ${info.compactedAt ?? '无'}`,
         `运行状态  ${info.runStatus ?? 'idle'}`,
         `长期记忆  ${info.memories}`,
@@ -542,6 +555,16 @@ export class CommandHandler {
       if (operation === 'lint') {
         const report = await this.agent.memoryLint();
         return this.handled(report.issues.map((issue) => `- [${issue.severity}] ${issue.code}: ${issue.message}`).join('\n') || `检查 ${report.checked} 页，无问题`);
+      }
+      if (operation === 'refresh') {
+        const limit = value ? Number(value) : 20;
+        if (!Number.isSafeInteger(limit) || limit < 1 || limit > 50) {
+          throw new Error('用法：/memory refresh [1-50]');
+        }
+        const receipts = await this.agent.memoryRefresh(limit);
+        return this.handled(receipts.length
+          ? `已刷新 ${receipts.length} 个 stale 来源 · ${receipts.reduce((total, receipt) => total + receipt.pageRefs.length, 0)} 页`
+          : '没有待刷新的 stale 来源');
       }
       if (operation === 'conflicts') {
         const limit = value ? Number(value) : 20;

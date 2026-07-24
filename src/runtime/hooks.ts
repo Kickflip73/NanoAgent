@@ -1,10 +1,12 @@
 import type { PlanStep } from '../core/plan.js';
+import type { WorkUnitObservation } from '../core/work-unit.js';
 
 export type RuntimeEvent =
   | { type: 'run_start'; sessionId: string; input: string }
   | { type: 'run_end'; sessionId: string; answer: string }
   | { type: 'run_error'; sessionId: string; error: string; interrupted?: boolean }
   | { type: 'subagent_event'; sessionId: string; agent: string; eventType: string }
+  | { type: 'work_unit_event'; sessionId: string; observation: WorkUnitObservation }
   | { type: 'plan_updated'; sessionId: string; steps: PlanStep[] }
   | {
       type: 'team_worker_event';

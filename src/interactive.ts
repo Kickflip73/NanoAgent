@@ -19,6 +19,8 @@ export interface RuntimeStatus {
   model: string;
   contextUsed: number;
   contextWindow: number;
+  contextSource?: 'actual' | 'estimate' | 'raw-history';
+  compressedFrom?: number;
 }
 
 type Key = { name?: string; ctrl?: boolean; shift?: boolean; meta?: boolean; sequence?: string };
@@ -571,7 +573,18 @@ export class InteractiveTerminal {
     const icon = this.busy ? '●' : '◇';
     const state = this.busy ? (this.transient || '运行中') : '就绪';
     const model = this.truncateDisplay(this.runtime.model, 24);
-    const text = `${icon} ${state} · 模式 ${this.runtime.mode} · 模型 ${model} · 上下文 ${this.formatTokens(this.runtime.contextUsed)}/${this.formatTokens(this.runtime.contextWindow)}`;
+    const contextLabel = this.runtime.contextSource === 'estimate'
+      ? '上下文 ~'
+      : this.runtime.contextSource === 'raw-history' ? '历史 ~' : '上下文 ';
+    const sourceLabel = this.runtime.contextSource === 'actual'
+      ? ' actual'
+      : this.runtime.contextSource === 'estimate'
+        ? ' est'
+        : this.runtime.contextSource === 'raw-history' ? ' raw' : '';
+    const compression = this.runtime.compressedFrom
+      ? ` · 已压缩 ${this.formatTokens(this.runtime.compressedFrom)}→${this.formatTokens(this.runtime.contextUsed)}`
+      : '';
+    const text = `${icon} ${state} · 模式 ${this.runtime.mode} · 模型 ${model} · ${contextLabel}${this.formatTokens(this.runtime.contextUsed)}${sourceLabel}/${this.formatTokens(this.runtime.contextWindow)}${compression}`;
     return `\x1b[90m${this.truncateDisplay(text, Math.max(24, (this.output.columns ?? 80) - 1))}\x1b[0m`;
   }
 

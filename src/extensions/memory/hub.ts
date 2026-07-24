@@ -32,7 +32,9 @@ import { DefaultWikiCompiler } from './wiki-compiler.js';
 import { DocumentSource } from './document-source.js';
 import { SqliteMemoryCatalog } from './sqlite-catalog.js';
 import { WikiVault } from './wiki-vault.js';
+import { parsePage, serializePage } from './wiki-vault.js';
 import { cutoverLegacyMemory } from './cutover.js';
+import { MemoryCompilationCoordinator } from './compilation-coordinator.js';
 
 const AUTOMATIC_EMBEDDING_TIMEOUT_MS = 1_500;
 
@@ -79,6 +81,11 @@ function mergeStatus(privateStatus: MemoryStatusSnapshot, workspaceStatus: Memor
     decisions: (privateStatus.decisions ?? 0) + (workspaceStatus.decisions ?? 0),
     pageLimitReached: Boolean(privateStatus.pageLimitReached || workspaceStatus.pageLimitReached),
     episodes: (privateStatus.episodes ?? 0) + (workspaceStatus.episodes ?? 0),
+    candidates: (privateStatus.candidates ?? 0) + (workspaceStatus.candidates ?? 0),
+    revisions: (privateStatus.revisions ?? 0) + (workspaceStatus.revisions ?? 0),
+    pendingCompilations: (privateStatus.pendingCompilations ?? 0) + (workspaceStatus.pendingCompilations ?? 0),
+    uncertainCompilations: (privateStatus.uncertainCompilations ?? 0)
+      + (workspaceStatus.uncertainCompilations ?? 0),
   };
 }
 
@@ -115,6 +122,8 @@ class DefaultMemoryHub implements MemoryHub {
   private readonly workspaceCatalog: SqliteMemoryCatalog;
   private readonly documents: DocumentSource;
   private readonly compiler: DefaultWikiCompiler;
+  private readonly privateCompilation: MemoryCompilationCoordinator;
+  private readonly workspaceCompilation: MemoryCompilationCoordinator;
   private readonly embeddingModel: string;
   private readonly evidence = new Map<string, Awaited<ReturnType<DocumentSource['read']>>>();
 
@@ -135,14 +144,31 @@ class DefaultMemoryHub implements MemoryHub {
     this.privateCatalog = new SqliteMemoryCatalog(path.join(profileRoot, 'memory.db'), 'private', options.profileId);
     this.workspaceCatalog = new SqliteMemoryCatalog(path.join(workspaceCatalogRoot, 'memory.db'), 'workspace');
     this.documents = new DocumentSource(this.workspaceRoot, this.dataRoot);
+    const workspaceId = stableDirectoryId(this.workspaceRoot);
+    this.privateCompilation = new MemoryCompilationCoordinator(
+      this.privateCatalog,
+      this.privateVault,
+      workspaceId,
+    );
+    this.workspaceCompilation = new MemoryCompilationCoordinator(
+      this.workspaceCatalog,
+      this.workspaceVault,
+      workspaceId,
+    );
     this.compiler = new DefaultWikiCompiler(
-      this.privateVault, this.workspaceVault, this.privateCatalog, this.workspaceCatalog, this.documents,
+      this.privateVault,
+      this.workspaceVault,
+      this.privateCatalog,
+      this.workspaceCatalog,
+      this.documents,
+      workspaceId,
     );
     this.embeddingModel = options.embeddingModel ?? process.env.EMBEDDING_MODEL ?? 'text-embedding-3-small';
   }
 
   async initialize(): Promise<void> {
     await Promise.all([this.privateVault.initialize(), this.workspaceVault.initialize()]);
+    await this.compiler.recover();
     await this.syncIndexes();
   }
 
@@ -303,14 +329,66 @@ class DefaultMemoryHub implements MemoryHub {
       createdAt: existing?.metadata.createdAt ?? timestamp,
       updatedAt: timestamp,
     };
-    const page = await vault.write(metadata, normalized.content, existing?.digest);
     const embedding = await this.embedDocument(`${metadata.title}\n${normalized.content}`);
-    catalog.index(page, embedding);
+    const coordinator = scope === 'private' ? this.privateCompilation : this.workspaceCompilation;
+    const prepared = coordinator.prepare({
+      operation: 'remember',
+      scope,
+      title: normalized.title,
+      content: normalized.content,
+      kind: normalized.kind,
+      confidence: metadata.confidence,
+      sourceRefs: sources,
+      metadata,
+      targetDigest: parsePage(serializePage(metadata, normalized.content)).digest,
+      createdBy: normalized.autonomous ? 'runtime' : 'owner',
+      reasonCode: normalized.autonomous ? 'autonomous_future_value' : 'owner_explicit',
+      context,
+    });
+    let page;
+    try {
+      page = await vault.write(metadata, normalized.content, existing?.digest);
+    } catch (error) {
+      coordinator.fail(prepared, error);
+      throw error;
+    }
+    try {
+      coordinator.commit(prepared, page, embedding);
+    } catch (error) {
+      coordinator.fail(prepared, error, true);
+      throw error;
+    }
     for (const [supersededId, previous] of supersededPages) {
-      const updated = await vault.write({
+      const supersededMetadata = {
         ...previous.metadata, status: 'superseded', validUntil: timestamp, updatedAt: timestamp,
-      }, previous.body, previous.digest);
-      catalog.index(updated);
+      } as MemoryPageMetadata;
+      const supersededPrepared = coordinator.prepare({
+        operation: 'remember',
+        scope,
+        title: previous.metadata.title,
+        content: previous.body,
+        kind: previous.metadata.kind,
+        confidence: previous.metadata.confidence,
+        sourceRefs: previous.metadata.sourceRefs,
+        metadata: supersededMetadata,
+        targetDigest: parsePage(serializePage(supersededMetadata, previous.body)).digest,
+        createdBy: 'owner',
+        reasonCode: 'owner_superseded',
+        context,
+      });
+      let updated;
+      try {
+        updated = await vault.write(supersededMetadata, previous.body, previous.digest);
+      } catch (error) {
+        coordinator.fail(supersededPrepared, error);
+        throw error;
+      }
+      try {
+        coordinator.commit(supersededPrepared, updated);
+      } catch (error) {
+        coordinator.fail(supersededPrepared, error, true);
+        throw error;
+      }
       catalog.recordDecision('correct', 'owner_superseded', supersededId);
     }
     catalog.recordDecision('remember', normalized.autonomous ? 'autonomous_future_value' : 'owner_explicit', ref.id);
@@ -375,6 +453,27 @@ class DefaultMemoryHub implements MemoryHub {
       throw new Error('Workspace capture 只接受明确文件来源');
     }
     return this.compiler.capture(input, context);
+  }
+
+  async refreshStale(limit: number, context: RunMemoryContext) {
+    this.validate(context);
+    if ((context.cause?.trust ?? 'owner') !== 'owner' && context.cause?.trust !== 'system') {
+      throw new Error('只有 owner/system 能 refresh stale Memory');
+    }
+    const bounded = Math.max(1, Math.min(50, Math.trunc(limit)));
+    await this.syncIndexes();
+    const sourcePaths = [...new Set(
+      this.workspaceCatalog.staleDocuments(bounded)
+        .flatMap((page) => page.metadata.sourceRefs)
+        .filter((source) => source.type === 'file')
+        .map((source) => source.id),
+    )].slice(0, bounded);
+    const receipts = [];
+    for (const sourcePath of sourcePaths) {
+      const current = await this.documents.read(sourcePath);
+      receipts.push(await this.compiler.ingest(current.sourceRef, context));
+    }
+    return receipts;
   }
 
   async reject(sourceRefs: SourceRef[], reasonCode: string, context: RunMemoryContext) {
@@ -543,6 +642,9 @@ class RoutedMemoryHub implements MemoryHub {
   forget(ref: MemoryRef, context: RunMemoryContext) { return this.forContext(context).then((hub) => hub.forget(ref, context)); }
   ingest(sourcePath: string, context: RunMemoryContext) { return this.forContext(context).then((hub) => hub.ingest(sourcePath, context)); }
   capture(input: CaptureInput, context: RunMemoryContext) { return this.forContext(context).then((hub) => hub.capture(input, context)); }
+  refreshStale(limit: number, context: RunMemoryContext) {
+    return this.forContext(context).then((hub) => hub.refreshStale(limit, context));
+  }
   reject(sourceRefs: SourceRef[], reasonCode: string, context: RunMemoryContext) { return this.forContext(context).then((hub) => hub.reject(sourceRefs, reasonCode, context)); }
   recordEpisode(input: EpisodeInput, context: RunMemoryContext) { return this.forContext(context).then((hub) => hub.recordEpisode(input, context)); }
   conflicts(context: RunMemoryContext, limit?: number) { return this.forContext(context).then((hub) => hub.conflicts(context, limit)); }

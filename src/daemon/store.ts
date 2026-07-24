@@ -5,6 +5,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { assertSessionId } from '../core/session-id.js';
 import { EventStore } from './event-store.js';
 import { EventRouter } from './event-router.js';
+import { boundedMemoryEvidenceSnapshot } from './persistence/memory-evidence.js';
 import { createFreshV12Schema } from './persistence/schema/current.js';
 import {
   ensureMemoryLintSchemaV13,
@@ -12,6 +13,10 @@ import {
   upgradeMemoryObservationsV13,
 } from './persistence/schema/migrations/v13-memory-observations.js';
 import { repairDigestedTaskRoutesV14 } from './persistence/schema/migrations/v14-task-route-repair.js';
+import {
+  hasMemoryEvidenceSnapshot,
+  upgradeMemoryEvidenceSnapshotV15,
+} from './persistence/schema/migrations/v15-memory-evidence-snapshot.js';
 import { prepareLegacyEventSchemaForV12 } from './persistence/schema/migrations/v3-v11-legacy-event-preparation.js';
 import {
   assertEmptyPartialEventTaskV12Tables,
@@ -32,6 +37,7 @@ import type {
   MimiEventSummary,
   MemoryObservation,
   MemoryObservationCard,
+  MemoryEvidenceSnapshot,
   MemoryObservationStatus,
   MimiOutboxSummary,
   MimiRunSummary,
@@ -247,6 +253,7 @@ export class MimiStore {
     this.taskStore = new TaskStore(this.database);
     this.backupBeforeMemoryHubCutover();
     this.backupBeforeTaskRouteRepairV14();
+    this.backupBeforeMemoryEvidenceV15();
     this.migrate();
     this.eventRouter = new EventRouter(this, 'ingress-v1');
     chmodSync(this.file, 0o600);
@@ -327,11 +334,10 @@ export class MimiStore {
   listMemoryObservations(profileId: string, limit = MEMORY_MAINTENANCE_BATCH_SIZE): MemoryObservationCard[] {
     const bounded = Math.max(1, Math.min(MEMORY_MAINTENANCE_BATCH_SIZE, limit));
     const rows = this.database.prepare(`
-      SELECT observation.*, task.objective_json, task.result_json, task.error
-      FROM memory_observations observation
-      JOIN tasks task ON task.id = observation.task_id
-      WHERE observation.profile_id = ? AND observation.compiled_at IS NULL
-      ORDER BY observation.observed_at ASC, observation.source_key ASC
+      SELECT *
+      FROM memory_observations
+      WHERE profile_id = ? AND compiled_at IS NULL
+      ORDER BY observed_at ASC, source_key ASC
       LIMIT ?
     `).all(profileId, bounded) as Row[];
     return rows.map((row) => this.memoryObservationFromRow(row));
@@ -2285,6 +2291,8 @@ export class MimiStore {
   }
 
   private memoryObservationFromRow(row: Row): MemoryObservationCard {
+    const evidenceSnapshot = parseJson<MemoryEvidenceSnapshot>(row.evidence_snapshot_json)
+      ?? { objective: null };
     const observation: MemoryObservation = {
       sourceKey: String(row.source_key),
       eventId: String(row.event_id),
@@ -2308,9 +2316,10 @@ export class MimiStore {
         occurredAt: observation.observedAt,
         trust: observation.trust,
       },
-      objective: parseJson(row.objective_json),
-      result: parseJson(row.result_json),
-      error: optional(row.error)?.slice(0, 2_000),
+      evidenceSnapshot,
+      objective: evidenceSnapshot.objective,
+      result: evidenceSnapshot.result,
+      error: evidenceSnapshot.error,
     };
   }
 
@@ -2332,15 +2341,16 @@ export class MimiStore {
     const event = this.eventStore.get(eventId) ?? this.eventStore.get(task.authorityEventId);
     if (!event) throw new Error(`Memory observation 缺少来源 Event：${eventId}`);
     const digest = digestJson(content);
+    const evidenceSnapshot = boundedMemoryEvidenceSnapshot(task.objective, content, task.error);
     const sourceKey = `${event.id}:${task.id}:${String(run.id)}:${MEMORY_COMPILER_VERSION}`;
     this.database.prepare(`
       INSERT OR IGNORE INTO memory_observations (
         source_key, event_id, task_id, run_id, session_id, profile_id, outcome,
-        trust, content_digest, observed_at, compiled_at, receipt_id
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+        trust, content_digest, observed_at, compiled_at, receipt_id, evidence_snapshot_json
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)
     `).run(
       sourceKey, event.id, task.id, String(run.id), String(run.session_key), task.profileId,
-      outcome, event.trust, digest, timestamp,
+      outcome, event.trust, digest, timestamp, JSON.stringify(evidenceSnapshot),
     );
   }
 
@@ -2355,12 +2365,22 @@ export class MimiStore {
 
   private migrate(): void {
     const version = Number((this.database.prepare('PRAGMA user_version').get() as Row).user_version);
-    if (version > 14) throw new Error(`不支持的 MimiAgent 数据库版本：${version}`);
+    if (version > 15) throw new Error(`不支持的 MimiAgent 数据库版本：${version}`);
+    if (version === 15) {
+      if (!hasFinalEventTaskV12Schema(this.database)
+        || !hasMemoryObservationSourceKey(this.database)
+        || !hasMemoryEvidenceSnapshot(this.database)) {
+        throw new Error('MimiAgent 数据库标记为 v15，但缺少最终 Event/Task 或 Memory observation schema');
+      }
+      ensureMemoryLintSchemaV13(this.database);
+      return;
+    }
     if (version === 14) {
       if (!hasFinalEventTaskV12Schema(this.database) || !hasMemoryObservationSourceKey(this.database)) {
         throw new Error('MimiAgent 数据库标记为 v14，但缺少最终 Event/Task 或 Memory observation schema');
       }
       ensureMemoryLintSchemaV13(this.database);
+      upgradeMemoryEvidenceSnapshotV15(this.database);
       return;
     }
     if (version === 13) {
@@ -2369,12 +2389,14 @@ export class MimiStore {
       }
       ensureMemoryLintSchemaV13(this.database);
       repairDigestedTaskRoutesV14(this.database);
+      upgradeMemoryEvidenceSnapshotV15(this.database);
       return;
     }
     if (version === 12) {
       if (hasFinalEventTaskV12Schema(this.database)) {
         upgradeMemoryObservationsV13(this.database);
         repairDigestedTaskRoutesV14(this.database);
+        upgradeMemoryEvidenceSnapshotV15(this.database);
         return;
       }
       if (!hasLegacyEventTaskSchema(this.database)) {
@@ -2387,12 +2409,14 @@ export class MimiStore {
       });
       upgradeMemoryObservationsV13(this.database);
       repairDigestedTaskRoutesV14(this.database);
+      upgradeMemoryEvidenceSnapshotV15(this.database);
       return;
     }
     if (version === 0) {
       createFreshV12Schema(this.database);
       upgradeMemoryObservationsV13(this.database);
       repairDigestedTaskRoutesV14(this.database);
+      upgradeMemoryEvidenceSnapshotV15(this.database);
       return;
     }
     prepareLegacyEventSchemaForV12(this.database, version);
@@ -2401,6 +2425,28 @@ export class MimiStore {
     });
     upgradeMemoryObservationsV13(this.database);
     repairDigestedTaskRoutesV14(this.database);
+    upgradeMemoryEvidenceSnapshotV15(this.database);
+  }
+
+  private backupBeforeMemoryEvidenceV15(): void {
+    const version = Number((this.database.prepare('PRAGMA user_version').get() as Row).user_version);
+    if (version !== 14 || !hasFinalEventTaskV12Schema(this.database)) return;
+    this.database.exec('PRAGMA wal_checkpoint(FULL);');
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const backupRoot = path.join(
+      path.dirname(this.file),
+      'backups',
+      `memory-evidence-v15-${stamp}-${randomUUID().slice(0, 8)}`,
+    );
+    mkdirSync(backupRoot, { recursive: true, mode: 0o700 });
+    chmodSync(backupRoot, 0o700);
+    for (const suffix of ['', '-wal', '-shm']) {
+      const source = `${this.file}${suffix}`;
+      if (!existsSync(source)) continue;
+      const target = path.join(backupRoot, `${path.basename(this.file)}${suffix}`);
+      copyFileSync(source, target);
+      chmodSync(target, 0o600);
+    }
   }
 
   private backupBeforeTaskRouteRepairV14(): void {

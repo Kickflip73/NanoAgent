@@ -3,18 +3,15 @@ import { fileURLToPath } from 'node:url';
 import OpenAI from 'openai';
 import { preferredEnvironmentValue, type AppConfig } from '../config.js';
 import { ContextManager } from '../core/context.js';
-import { ExecutionLedger } from '../core/execution-ledger.js';
 import { ProjectGuidanceLoader, SoulLoader } from '../core/guidance.js';
 import type { MemoryHub } from '../core/memory.js';
-import { PlanStore } from '../core/plan.js';
-import { TeamTaskStore } from '../core/team.js';
-import { TraceStore } from '../core/trace.js';
 import { isMcpConfigurationTrusted, MCPManager } from '../extensions/mcp.js';
 import { createRoutedMemoryHub } from '../extensions/memory/hub.js';
 import { SkillLoader } from '../extensions/skills.js';
 import { ComputerManager } from '../extensions/computer/manager.js';
 import { CuaDriverClient } from '../extensions/computer/cua-driver-client.js';
 import { createModel, type ModelRuntime } from './model.js';
+import { createFileRuntimeStatePorts, type RuntimeStatePorts } from './state-ports.js';
 
 export interface RuntimeComponents {
   modelRuntime: ModelRuntime;
@@ -23,10 +20,7 @@ export interface RuntimeComponents {
   projectGuidance: ProjectGuidanceLoader;
   memory: MemoryHub;
   skills: SkillLoader;
-  plans: PlanStore;
-  team: TeamTaskStore;
-  traces: TraceStore;
-  ledger: ExecutionLedger;
+  state: RuntimeStatePorts;
   mcp: MCPManager;
   sessionId: string;
   computer?: ComputerManager;
@@ -76,6 +70,7 @@ export async function createRuntimeComponents(
   });
   const packagedSoulFile = fileURLToPath(new URL('../../MIMI.md', import.meta.url));
   const soul = new SoulLoader(path.join(config.dataRoot, 'MIMI.md'), packagedSoulFile);
+  const state = createFileRuntimeStatePorts(config, sessionId);
   const memory = createRoutedMemoryHub({
     workspaceRoot: config.workspaceRoot,
     dataRoot: config.dataRoot,
@@ -98,10 +93,7 @@ export async function createRuntimeComponents(
     projectGuidance: new ProjectGuidanceLoader(config.workspaceRoot),
     memory,
     skills,
-    plans: new PlanStore(path.join(config.dataRoot, 'plans.json'), sessionId),
-    team: new TeamTaskStore(path.join(config.dataRoot, 'teams.json'), sessionId),
-    traces: new TraceStore(path.join(config.dataRoot, 'traces')),
-    ledger: new ExecutionLedger(path.join(config.dataRoot, 'execution-ledger.json')),
+    state,
     mcp,
     sessionId,
     ...(config.computer ? {

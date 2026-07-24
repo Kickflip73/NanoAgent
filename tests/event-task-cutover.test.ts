@@ -474,7 +474,7 @@ test('v11 cutover atomically preserves Task, Run and Outbox ownership without pa
   }
   const database = new DatabaseSync(file, { readOnly: true });
   try {
-    assert.equal((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 14);
+    assert.equal((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 15);
     assert.equal(database.prepare("SELECT name FROM sqlite_master WHERE name = 'events_v2'").get(), undefined);
     assert.equal(database.prepare("SELECT name FROM sqlite_master WHERE name = 'task_attempts'").get(), undefined);
     assert.equal((database.prepare('PRAGMA foreign_key_check').all() as unknown[]).length, 0);
@@ -512,7 +512,7 @@ test('v14 removes only artifact-free digested Tasks and repairs their route rece
 
   const database = new DatabaseSync(file, { readOnly: true });
   try {
-    assert.equal((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 14);
+    assert.equal((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 15);
     assert.equal((database.prepare('PRAGMA foreign_key_check').all() as unknown[]).length, 0);
   } finally {
     database.close();

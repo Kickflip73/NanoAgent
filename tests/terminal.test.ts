@@ -318,3 +318,39 @@ test('renders Ultra Team worker assignments and results as lifecycle events', ()
   assert.match(status.value, /\x1b\[92m└ 结果\x1b\[0m  子代理 explorer · inspect  完成：确认 mode、model 和输出等级均按会话恢复/);
   assert.match(status.value, /\x1b\[91m× 失败\x1b\[0m  子代理 tester · test  失败：npm test 失败/);
 });
+
+test('renders unified WorkUnit result events', () => {
+  const status = new BufferWriter();
+  status.isTTY = true;
+  const renderer = new TerminalRenderer(status, new BufferWriter(), 'tools');
+  renderer.handleRuntimeEvent({
+    type: 'work_unit_event',
+    sessionId: 'demo',
+    observation: {
+      descriptor: {
+        id: 'inspect',
+        kind: 'subagent',
+        parentRunId: 'run-1',
+        objective: 'inspect',
+        role: 'reviewer',
+        dependencies: [],
+        capabilities: ['read'],
+        workspaceAccess: 'read',
+        paths: [],
+      },
+      status: 'completed',
+      observedAt: '2026-07-24T00:00:00.000Z',
+      result: {
+        id: 'inspect',
+        status: 'completed',
+        summary: 'review passed',
+        artifacts: [],
+        evidence: [],
+        startedAt: '2026-07-24T00:00:00.000Z',
+        completedAt: '2026-07-24T00:00:01.000Z',
+      },
+    },
+  });
+  renderer.stop();
+  assert.match(status.value, /subagent reviewer · inspect.*review passed/);
+});

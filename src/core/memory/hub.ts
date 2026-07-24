@@ -24,6 +24,7 @@ export interface MemoryHub {
   forget(ref: MemoryRef, context: RunMemoryContext): Promise<ForgetReceipt>;
   ingest(sourcePath: string, context: RunMemoryContext): Promise<CompilationReceipt>;
   capture(input: CaptureInput, context: RunMemoryContext): Promise<CompilationReceipt>;
+  refreshStale(limit: number, context: RunMemoryContext): Promise<CompilationReceipt[]>;
   reject(sourceRefs: import('./types.js').SourceRef[], reasonCode: string, context: RunMemoryContext): Promise<CompilationReceipt>;
   recordEpisode(input: EpisodeInput, context: RunMemoryContext): Promise<MemoryRef>;
   conflicts(context: RunMemoryContext, limit?: number): Promise<MemoryHit[]>;

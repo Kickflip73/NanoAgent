@@ -472,6 +472,19 @@ export class TerminalRenderer {
   }
 
   handleRuntimeEvent(event: RuntimeEvent): void {
+    if (event.type === 'work_unit_event' && this.levelRank >= 2) {
+      const unit = event.observation;
+      const result = unit.result;
+      const name = `${unit.descriptor.kind} ${unit.descriptor.role ?? 'worker'} · ${unit.descriptor.id}`;
+      this.renderStatus(
+        unit.status === 'failed' || unit.status === 'uncertain' ? 'failure' : 'success',
+        name,
+        compact(result?.summary ?? unit.status, 180),
+        result?.summary,
+        '父执行单元继续整合',
+      );
+      return;
+    }
     if (event.type !== 'team_worker_event' || this.levelRank < 2) return;
     const name = `子代理 ${event.role} · ${event.taskId}`;
     if (event.eventType === 'start') {

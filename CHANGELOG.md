@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- add a per-request Context Manifest with section-level estimates, deterministic
+  compression records, provider actual-usage backfill, and a structured
+  `actual`/`estimate`/`raw-history` chat status; daemon protocol 10 retains the
+  derived `contextUsed` field for one compatibility cycle
+- add Memory compilation V2 candidates, jobs, immutable page revisions and
+  terminal receipts across remember/capture/ingest/maintenance, with digest-based
+  crash recovery, explicit stale refresh, and bounded immutable Task evidence
+  snapshots in the Daemon v15 migration
+- split the main run into testable scope/state/capability/context/tool/request/
+  commit stages, centralize file-backed state behind ports, and add a digest-only
+  Run Commit Journal that preserves completion receipts across later failures
+- unify SubAgent, Team worker, durable Background and detached Codex observations
+  as WorkUnit results consumed by Trace, terminal progress and Completion Gate
 - expose `mimi daemon start`, `stop`, and `restart` as supported one-command
   lifecycle operations with idempotent stop, readiness-confirmed startup, and a
   durable workspace binding so service management works from any directory

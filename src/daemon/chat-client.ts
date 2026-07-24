@@ -538,6 +538,10 @@ export class RemoteCommandTarget implements CommandTarget {
     return this.client.invoke('memory.lint', undefined, this.sessionId);
   }
 
+  memoryRefresh(limit = 20): Promise<CommandMethodResult<'memoryRefresh'>> {
+    return this.client.invoke('memory.refresh', limit, this.sessionId, 20 * 60_000);
+  }
+
   memoryConflicts(limit = 20): Promise<CommandMethodResult<'memoryConflicts'>> {
     return this.client.invoke('memory.conflicts', limit, this.sessionId);
   }

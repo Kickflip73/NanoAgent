@@ -4,6 +4,7 @@ import type { DaemonHealthSnapshot } from './health-model.js';
 import type { MemoryHit, SourceRef } from '../core/memory.js';
 import type { PlanStep } from '../core/plan.js';
 import type { RunCheckpoint } from '../core/session.js';
+import type { MimiContextStatus } from '../core/context.js';
 
 export type EventTrust = 'owner' | 'trusted' | 'external' | 'public' | 'system';
 export type EventKind = 'command' | 'alert' | 'ambient' | 'schedule' | 'webhook';
@@ -172,8 +173,15 @@ export interface MemoryObservation {
   receiptId?: string;
 }
 
+export interface MemoryEvidenceSnapshot {
+  objective: unknown;
+  result?: unknown;
+  error?: string;
+}
+
 export interface MemoryObservationCard extends MemoryObservation {
   sourceRef: SourceRef;
+  evidenceSnapshot: MemoryEvidenceSnapshot;
   objective: unknown;
   result?: unknown;
   error?: string;
@@ -304,8 +312,8 @@ export interface MimiSchedulePage {
   total: number;
 }
 
-// Protocol 9 completes the MemoryHub control surface and maintenance status.
-export const DAEMON_PROTOCOL_VERSION = 9;
+// Protocol 10 adds structured actual/estimate/raw context status while retaining contextUsed.
+export const DAEMON_PROTOCOL_VERSION = 10;
 
 export interface DaemonTaskWorkerStatus {
   taskId: string;
@@ -434,6 +442,7 @@ export interface MimiChatSnapshot {
   outputLevel: 'answer' | 'thinking' | 'tools' | 'trace';
   contextUsed: number;
   contextWindow: number;
+  contextStatus?: MimiContextStatus;
   items: AgentInputItem[];
   plan: PlanStep[];
   recovery?: RunCheckpoint;

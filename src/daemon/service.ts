@@ -184,8 +184,9 @@ export async function createMimiChatSnapshot(
     model: snapshot.runtime.model,
     mode: snapshot.runtime.mode.label,
     outputLevel: snapshot.runtime.outputLevel,
-    contextUsed: snapshot.context.estimatedTokens,
+    contextUsed: snapshot.context.status.value,
     contextWindow: snapshot.context.contextWindow,
+    contextStatus: snapshot.context.status,
     items: boundedChatItems(snapshot.items, itemLimit),
     plan: snapshot.plan.slice(0, 20).map((step) => ({
       ...step,
@@ -1240,6 +1241,11 @@ export async function runMimiDaemon(config: AppConfig): Promise<void> {
           sessionId: draftSessionId,
           draft: true,
           contextUsed: 0,
+          contextStatus: {
+            value: 0,
+            source: 'raw-history',
+            contextWindow: snapshot.contextWindow,
+          },
           items: [],
           plan: [],
           recovery: undefined,
@@ -1318,6 +1324,7 @@ export async function runMimiDaemon(config: AppConfig): Promise<void> {
               return agent.memoryCaptureRound(roundRef);
             }
             if (operation === 'memory.lint') return agent.memoryLint();
+            if (operation === 'memory.refresh') return agent.memoryRefresh(limit(params.value, 20));
             if (operation === 'memory.conflicts') return agent.memoryConflicts(limit(params.value, 20));
             if (operation === 'memory.audit') return agent.memoryAudit(limit(params.value, 20));
             if (operation === 'memory.maintain') {

@@ -4,6 +4,11 @@ import { Agent, Runner, tool, type Tool } from '@openai/agents';
 import { z } from 'zod';
 import type { TeamRole, TeamTask, TeamTaskStore } from '../core/team.js';
 import { teamRoleToolNames } from '../core/tool-role-policy.js';
+import type {
+  WorkUnitDescriptor,
+  WorkUnitObservation,
+  WorkUnitResult,
+} from '../core/work-unit.js';
 import type { AgentModel } from './model-port.js';
 
 const ROLE_INSTRUCTIONS: Record<TeamRole, string> = {
@@ -14,10 +19,9 @@ const ROLE_INSTRUCTIONS: Record<TeamRole, string> = {
   reviewer: '审查正确性、兼容性、安全性和测试缺口，按严重程度给出证据；保持只读。',
 };
 
-export interface TeamWorkerResult {
+export interface TeamWorkerResult extends WorkUnitResult {
   taskId: string;
   role: TeamRole;
-  status: 'completed' | 'failed';
   output: string;
 }
 
@@ -28,11 +32,73 @@ export interface TeamToolsOptions {
   workspaceRoot: string;
   persistentInstructions?: string;
   maxConcurrency?: number;
+  parentRunId?: string;
   signal?: AbortSignal;
   allowUnsandboxedShell?: boolean;
   workerToolFactory?: (task: TeamTask) => Tool[];
   onEvent?: (task: TeamTask, event: 'start' | 'end' | 'error') => void | Promise<void>;
+  onWorkUnit?: (observation: WorkUnitObservation) => void | Promise<void>;
   runWorker?: (task: TeamTask, prompt: string, tools: Tool[], signal?: AbortSignal) => Promise<string>;
+}
+
+export function teamWorkerDescriptor(task: TeamTask, parentRunId: string): WorkUnitDescriptor {
+  const writable = task.role === 'builder';
+  return {
+    id: task.id,
+    kind: 'team-worker',
+    parentRunId,
+    objective: task.description,
+    role: task.role,
+    dependencies: [...task.dependencies],
+    capabilities: writable ? ['read', 'write', 'execute'] : ['read'],
+    workspaceAccess: writable ? 'write' : 'read',
+    paths: [...task.paths],
+  };
+}
+
+function teamWorkerResult(
+  task: TeamTask,
+  status: 'completed' | 'failed',
+  output: string,
+): TeamWorkerResult {
+  return {
+    id: task.id,
+    taskId: task.id,
+    role: task.role,
+    status,
+    summary: output,
+    output,
+    artifacts: task.role === 'builder' ? task.paths.map((artifactPath) => ({ path: artifactPath })) : [],
+    evidence: [
+      {
+        type: 'team-task-claim',
+        ref: `team:${task.id}:claim:${task.claimId ?? 'unknown'}`,
+      },
+      ...(task.role === 'tester'
+        ? [{ type: 'test', ref: `team:${task.id}:result` }]
+        : task.role === 'reviewer' ? [{ type: 'review', ref: `team:${task.id}:result` }] : []),
+    ],
+    ...(status === 'failed' ? { error: output } : {}),
+    startedAt: task.claimedAt ?? task.updatedAt,
+    completedAt: task.updatedAt,
+  };
+}
+
+async function emitWorkUnit(
+  options: TeamToolsOptions,
+  task: TeamTask,
+  result: TeamWorkerResult,
+): Promise<void> {
+  try {
+    await options.onWorkUnit?.({
+      descriptor: teamWorkerDescriptor(task, options.parentRunId ?? 'unbound-run'),
+      status: result.status,
+      observedAt: result.completedAt ?? task.updatedAt,
+      result,
+    });
+  } catch {
+    // WorkUnit observers are telemetry and cannot change worker state.
+  }
 }
 
 export function createTeamTaskTools(store: TeamTaskStore): Tool[] {
@@ -227,7 +293,8 @@ export async function runTeamWave(options: TeamToolsOptions, taskIds: string[]):
         signal.throwIfAborted();
         const completed = await options.store.update(task.id, 'completed', output, task.claimId);
         await emitWorkerEvent(options, completed, 'end');
-        results[index] = { taskId: task.id, role: task.role, status: 'completed', output };
+        results[index] = teamWorkerResult(completed, 'completed', output);
+        await emitWorkUnit(options, completed, results[index]!);
       } catch (error) {
         let output = error instanceof Error ? error.message : String(error);
         let failed = task;
@@ -240,7 +307,8 @@ export async function runTeamWave(options: TeamToolsOptions, taskIds: string[]):
             .find((item) => item.id === task.id) ?? task;
         }
         await emitWorkerEvent(options, failed, 'error');
-        results[index] = { taskId: task.id, role: task.role, status: 'failed', output };
+        results[index] = teamWorkerResult(failed, 'failed', output);
+        await emitWorkUnit(options, failed, results[index]!);
       } finally {
         workerControllers.delete(task.id);
       }

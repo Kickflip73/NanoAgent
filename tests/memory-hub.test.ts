@@ -264,6 +264,22 @@ test('MemoryHub marks compiled pages stale when a mutable source digest changes'
   await hub.reindex(context(root));
   const hits = await hub.search('Current decision', context(root), { scope: 'workspace' });
   assert.equal(hits[0]?.stale, true);
+  const receipts = await hub.refreshStale(20, context(root));
+  assert.equal(receipts.length, 1);
+  const refreshed = await hub.search('option B', context(root), { scope: 'workspace' });
+  assert.equal(refreshed[0]?.stale, undefined);
+  const catalog = new SqliteMemoryCatalog(path.join(
+    dataRoot,
+    'memory',
+    'workspaces',
+    stableDirectoryId(root),
+    'memory.db',
+  ), 'workspace');
+  try {
+    assert.equal(catalog.currentRevision(refreshed[0]!.ref.id)?.revision, 2);
+  } finally {
+    catalog.close();
+  }
 });
 
 test('episode retention keeps the newest window plus episodes referenced by active Wiki pages', async () => {

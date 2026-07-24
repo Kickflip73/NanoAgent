@@ -944,7 +944,7 @@ test('budgets the complete model request including input, instructions, tools an
   assert.ok(budget.toolSchemaTokens >= estimateTokens(tools));
   assert.equal(
     budget.inputBudget,
-    contextWindow - outputReserveTokens - budget.toolSchemaTokens,
+    contextWindow - outputReserveTokens - budget.toolSchemaTokens - budget.protocolReserveTokens,
   );
 
   const instructionBudget = Math.min(800, budget.inputBudget);
@@ -971,6 +971,7 @@ test('budgets the complete model request including input, instructions, tools an
     estimateTokens(instructions)
       + estimateTokens(effective)
       + budget.toolSchemaTokens
+      + budget.protocolReserveTokens
       + budget.outputReserveTokens
       <= contextWindow,
   );
@@ -1003,6 +1004,37 @@ test('reports raw, effective and archived context with non-overlapping semantics
   assert.equal(stats.archiveTokens, archive.compactedTokens);
   assert.equal(stats.coveredItems, archive.coveredItems);
   assert.ok(stats.strategies.includes('context-collapse'));
+});
+
+test('records context sections and deterministic compression actions for a request manifest', () => {
+  const manager = new ContextManager(4, 4_000, 0.5);
+  const instructions = manager.buildInstructionsResult({
+    baseInstructions: 'base rules',
+    sessionState: 'session state',
+    historySummary: '',
+    skillCatalog: 'skill catalog',
+    memories: [],
+    plan: [{ id: '1', description: 'ship', status: 'running' }],
+  }, 1_000);
+  assert.equal(instructions.sections[0]?.id, 'base-instructions');
+  assert.ok(instructions.sections.some((section) => section.id === 'goal-plan-team'));
+  assert.ok(instructions.sections.some((section) => section.id === 'skill-catalog'));
+
+  const history = Array.from({ length: 4 }, (_, index) => [
+    { role: 'user', content: `question-${index}` },
+    { type: 'function_call', name: 'read_file', callId: `call-${index}`, arguments: '{}' },
+    { type: 'function_call_result', name: 'read_file', callId: `call-${index}`, output: 'x'.repeat(1_500) },
+    { role: 'assistant', content: `answer-${index}` },
+  ]).flat() as unknown as AgentInputItem[];
+  const result = manager.effectiveHistoryResult(
+    history,
+    [{ role: 'user', content: 'next' } as AgentInputItem],
+    undefined,
+    700,
+  );
+  assert.equal(result.effectiveTokens, estimateTokens(result.items));
+  assert.ok(result.records.some((record) => record.strategy === 'microcompact'));
+  assert.ok(result.records.some((record) => record.strategy === 'turn-truncation'));
 });
 
 test('drops an oversized tool-heavy turn instead of violating the token budget', async () => {
