@@ -1,10 +1,13 @@
 import path from 'node:path';
 import type { AppConfig } from '../config.js';
-import type { MimiSchedulePage } from './types.js';
+import type { DaemonStatus, MimiSchedulePage } from './types.js';
 
 export function daemonHelp(): string {
-  return `MimiAgent 后台维护（正常使用只需运行 mimi）：
-  mimi daemon status                      查看状态
+  return `MimiAgent 后台服务：
+  mimi daemon start                       一键初始化并启动后台服务
+  mimi daemon stop                        安全停止后台服务
+  mimi daemon restart                     安全重启后台服务
+  mimi daemon status [--json]             查看可读状态；--json 输出完整数据
   mimi daemon doctor                      检查本机就绪度与下一步
   mimi daemon diagnostics [输出文件]       生成不含正文、目标、Token 和私人 Memory 的脱敏诊断包
   mimi daemon backup [输出目录]            创建带哈希清单和 SQLite 完整性检查的恢复备份
@@ -31,6 +34,88 @@ export function daemonHelp(): string {
 
 function output(value: unknown): void {
   process.stdout.write(`${JSON.stringify(value, null, 2)}\n`);
+}
+
+function duration(value: number): string {
+  const seconds = Math.max(0, Math.floor(value / 1_000));
+  if (seconds < 60) return `${seconds} 秒`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} 分钟`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} 小时 ${minutes % 60} 分钟`;
+  const days = Math.floor(hours / 24);
+  return `${days} 天 ${hours % 24} 小时`;
+}
+
+function displayedHealthState(
+  health: DaemonStatus['health'],
+): NonNullable<DaemonStatus['health']>['state'] | undefined {
+  if (health?.state !== 'unhealthy') return health?.state;
+  const activeErrors = health.risks.filter((risk) =>
+    risk.severity === 'error'
+    && risk.code !== 'task_dead_letters'
+    && risk.code !== 'outbox_dead_letters');
+  return activeErrors.length === 0 ? 'degraded' : 'unhealthy';
+}
+
+function statusLabel(state: NonNullable<DaemonStatus['health']>['state'] | undefined): string {
+  if (state === 'ready') return '● 就绪';
+  if (state === 'degraded') return '⚠ 需关注';
+  if (state === 'unhealthy') return '✕ 异常';
+  return '○ 未知';
+}
+
+export function formatDaemonStatus(status: DaemonStatus, now = Date.now()): string {
+  const startedAt = Date.parse(status.startedAt);
+  const uptime = Number.isFinite(startedAt) ? duration(now - startedAt) : '未知';
+  const tasks = status.tasks;
+  const outbox = status.outbox;
+  const health = status.health;
+  const connectors = health?.connectors ?? { enabled: 0, online: 0, ready: 0 };
+  const attention = status.attention ?? {};
+  const snoozeValue = attention.snooze;
+  const snoozeActive = Boolean(
+    snoozeValue && typeof snoozeValue === 'object'
+      && (snoozeValue as Record<string, unknown>).active === true,
+  );
+  const pendingDigest = typeof attention.pendingDigest === 'number' ? attention.pendingDigest : 0;
+  const activeEventCount = status.activeEventCount ?? 0;
+  const activeTaskCount = status.activeTaskCount ?? 0;
+  const taskWorkers = status.taskWorkers ?? [];
+  const lines = [
+    'MimiAgent 后台状态',
+    '────────────────────────────────',
+    `状态       ${statusLabel(displayedHealthState(health))}`,
+    `进程       PID ${status.pid} · 已运行 ${uptime}`,
+    `版本       ${status.buildVersion ?? '未知'} · 协议 ${status.protocolVersion}`,
+    `工作区     ${status.workspaceRoot}`,
+    `安全       ${status.securityProfile?.label ?? '未报告'} · ${status.permissionMode ?? '未知'}`,
+    `Connector  已启用 ${connectors.enabled} · 在线 ${connectors.online} · 就绪 ${connectors.ready} · 总配置 ${status.connectorCount ?? 0}`,
+    `任务       排队 ${tasks.queued} · 运行 ${tasks.running} · 暂停 ${tasks.paused} · 阻塞 ${tasks.blocked} · 失败 ${tasks.failed} · 死信 ${tasks.dead_letter}`,
+    `投递       待发送 ${outbox.pending} · 发送中 ${outbox.sending} · 死信 ${outbox.dead_letter}`,
+    `计划       ${status.enabledSchedules} 个启用 · 待简报 ${pendingDigest}`,
+    `免打扰     静默时段 ${attention.quiet === true ? '开启' : '关闭'} · Snooze ${snoozeActive ? '开启' : '关闭'}`,
+  ];
+  if (activeEventCount > 0 || activeTaskCount > 0) {
+    lines.push(`活动       Event ${activeEventCount} · Task ${activeTaskCount} · Worker ${taskWorkers.length}`);
+  }
+  if ((health?.risks.length ?? 0) > 0) {
+    lines.push('', '需要关注');
+    for (const risk of health?.risks ?? []) {
+      lines.push(`- ${risk.message}${risk.nextAction ? `（建议：${risk.nextAction}）` : ''}`);
+    }
+  } else if (health) {
+    lines.push('', '没有需要处理的健康风险。');
+  } else {
+    lines.push('', '当前后台版本未提供统一健康信息，建议升级后重新查看。');
+  }
+  lines.push('', '详细信息：mimi daemon status --json');
+  return `${lines.join('\n')}\n`;
+}
+
+function unavailableDaemon(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException).code;
+  return ['ECONNREFUSED', 'ECONNRESET', 'ENOENT', 'ENOTCONN'].includes(String(code ?? ''));
 }
 
 function durationMs(value: string): number {
@@ -110,13 +195,24 @@ export async function runDaemonCommand(config: AppConfig, args: string[]): Promi
   }
   if (command === 'start') {
     const { startMimiDaemon } = await import('./service.js');
-    output(await startMimiDaemon(config));
+    const status = await startMimiDaemon(config);
+    process.stdout.write(
+      `MimiAgent 后台已启动（PID ${status.pid}，工作区 ${status.workspaceRoot}）。\n`,
+    );
     return;
   }
   if (command === 'stop') {
     const { stopMimiDaemon } = await import('./service.js');
-    await stopMimiDaemon(config);
-    process.stdout.write('MimiAgent 已收到停止请求。\n');
+    const stopped = await stopMimiDaemon(config);
+    process.stdout.write(stopped ? 'MimiAgent 后台已安全停止。\n' : 'MimiAgent 后台未运行。\n');
+    return;
+  }
+  if (command === 'restart') {
+    const { restartMimiDaemon } = await import('./service.js');
+    const status = await restartMimiDaemon(config);
+    process.stdout.write(
+      `MimiAgent 后台已重启（PID ${status.pid}，工作区 ${status.workspaceRoot}）。\n`,
+    );
     return;
   }
   if (command === 'install') {
@@ -130,7 +226,15 @@ export async function runDaemonCommand(config: AppConfig, args: string[]): Promi
     return;
   }
   if (command === 'status') {
-    output(await mimiRpc(socket, 'status'));
+    try {
+      const status = await mimiRpc<DaemonStatus>(socket, 'status');
+      if (args.includes('--json')) output(status);
+      else process.stdout.write(formatDaemonStatus(status));
+    } catch (error) {
+      if (!unavailableDaemon(error)) throw error;
+      if (args.includes('--json')) output({ running: false });
+      else process.stdout.write('MimiAgent 后台状态\n────────────────────────────────\n状态       ○ 未运行\n\n启动：mimi daemon start\n');
+    }
     return;
   }
   if (command === 'activity') {

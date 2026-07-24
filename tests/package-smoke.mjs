@@ -130,7 +130,7 @@ try {
   });
   await statusServer.start();
   try {
-    const status = await execFileAsync(cliCommand, [...cliArguments, 'daemon', 'status'], {
+    const status = await execFileAsync(cliCommand, [...cliArguments, 'daemon', 'status', '--json'], {
       cwd: temporary,
       env: {
         ...process.env,

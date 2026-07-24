@@ -1,6 +1,6 @@
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import { chmodSync, closeSync, existsSync, mkdirSync, openSync } from 'node:fs';
-import { access, chmod, link, mkdir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { access, chmod, link, lstat, mkdir, readFile, realpath, rename, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
@@ -8,6 +8,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { parse as parseDotenv } from 'dotenv';
 import {
+  adoptWorkspaceConfig,
   preferredEnvironmentValue,
   resolveEnvironmentFile,
   securityProfileSummary,
@@ -251,6 +252,7 @@ function truncateUtf8(value: string, maximumBytes: number): string {
 }
 
 const LAUNCH_AGENT_LABEL = 'com.mimiagent.daemon';
+const DAEMON_WORKSPACE_FILE = 'workspace.json';
 
 export type DaemonStartupMode = 'launchd' | 'detached';
 
@@ -303,6 +305,63 @@ export async function reconcileMimiDaemon(
 
 function launchAgentFile(): string {
   return path.join(os.homedir(), 'Library', 'LaunchAgents', `${LAUNCH_AGENT_LABEL}.plist`);
+}
+
+function daemonWorkspaceFile(config: AppConfig): string {
+  return path.join(mimiPaths(config).root, DAEMON_WORKSPACE_FILE);
+}
+
+function parseDaemonWorkspace(value: unknown): string {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('MimiAgent 后台工作区绑定必须是对象');
+  }
+  const record = value as Record<string, unknown>;
+  if (record.version !== 1 || typeof record.workspaceRoot !== 'string'
+    || !path.isAbsolute(record.workspaceRoot) || record.workspaceRoot.length > 4096) {
+    throw new Error('MimiAgent 后台工作区绑定无效');
+  }
+  return path.resolve(record.workspaceRoot);
+}
+
+async function readDaemonWorkspace(config: AppConfig): Promise<string | undefined> {
+  const file = daemonWorkspaceFile(config);
+  let info;
+  try {
+    info = await lstat(file);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw error;
+  }
+  if (!info.isFile() || info.isSymbolicLink()) {
+    throw new Error(`MimiAgent 后台工作区绑定必须是普通文件：${file}`);
+  }
+  const workspaceRoot = parseDaemonWorkspace(JSON.parse(await readFile(file, 'utf8')) as unknown);
+  await chmod(file, 0o600);
+  return workspaceRoot;
+}
+
+async function rememberDaemonWorkspace(config: AppConfig): Promise<void> {
+  const file = daemonWorkspaceFile(config);
+  await mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
+  await chmod(path.dirname(file), 0o700);
+  await writeAtomicJson(file, { version: 1, workspaceRoot: path.resolve(config.workspaceRoot) });
+}
+
+export async function resolveDaemonWorkspaceConfig(config: AppConfig): Promise<AppConfig> {
+  const paths = mimiPaths(config);
+  let liveWorkspace: string | undefined;
+  try {
+    const status = await mimiRpc<DaemonStatusWire>(paths.socket, 'status', undefined, 500);
+    if (typeof status.workspaceRoot === 'string' && status.workspaceRoot.trim()) {
+      liveWorkspace = path.resolve(status.workspaceRoot);
+    }
+  } catch {
+    // An offline service falls back to the last durable workspace binding.
+  }
+  const workspaceRoot = liveWorkspace ?? await readDaemonWorkspace(config);
+  const resolved = workspaceRoot ? adoptWorkspaceConfig(config, workspaceRoot) : config;
+  if (liveWorkspace) await rememberDaemonWorkspace(resolved);
+  return resolved;
 }
 
 const CONNECTOR_TEMPLATE_ROOTS = [
@@ -991,6 +1050,7 @@ ${environmentXml}
 
 export async function installMimiLaunchAgent(config: AppConfig): Promise<string> {
   if (process.platform !== 'darwin') throw new Error('自动登录启动当前仅支持 macOS launchd');
+  config = await resolveDaemonWorkspaceConfig(config);
   await initializeMimi(config);
   requireProviderApiKey(config);
   await requireLaunchAgentProviderApiKey(config);
@@ -1490,7 +1550,9 @@ async function waitForDaemonOffline(
 }
 
 export async function startMimiDaemon(config: AppConfig): Promise<DaemonStatus> {
+  config = await resolveDaemonWorkspaceConfig(config);
   await initializeMimi(config);
+  await rememberDaemonWorkspace(config);
   requireProviderApiKey(config);
   let paths = mimiPaths(config);
   const expectedPermissionMode = config.permissionMode ?? 'trusted';
@@ -1585,8 +1647,35 @@ export async function startMimiDaemon(config: AppConfig): Promise<DaemonStatus> 
   throw new Error(`MimiAgent 启动失败，请查看 ${paths.stderrLog}：${lastError instanceof Error ? lastError.message : String(lastError)}`);
 }
 
-export async function stopMimiDaemon(config: AppConfig): Promise<void> {
-  await mimiRpc(mimiPaths(config).socket, 'shutdown');
+export async function stopMimiDaemon(config: AppConfig): Promise<boolean> {
+  config = await resolveDaemonWorkspaceConfig(config);
+  const paths = mimiPaths(config);
+  let existing: DaemonStatusWire;
+  try {
+    existing = await mimiRpc<DaemonStatusWire>(paths.socket, 'status', undefined, 500);
+  } catch {
+    return false;
+  }
+  assertDaemonWorkspace(existing.workspaceRoot, config.workspaceRoot);
+  await mimiRpc(paths.socket, 'shutdown', undefined, 2_000);
+  const replacement = await waitForDaemonOffline(
+    paths.socket,
+    existing.workerId,
+    existing.pid,
+    config.workspaceRoot,
+    config.permissionMode ?? 'trusted',
+    false,
+  );
+  if (replacement) {
+    throw new Error(`MimiAgent 后台在停止过程中被重新启动（PID ${replacement.pid}）。`);
+  }
+  return true;
+}
+
+export async function restartMimiDaemon(config: AppConfig): Promise<DaemonStatus> {
+  config = await resolveDaemonWorkspaceConfig(config);
+  await stopMimiDaemon(config);
+  return startMimiDaemon(config);
 }
 
 export async function waitForRemoteTask(

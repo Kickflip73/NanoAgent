@@ -24,6 +24,9 @@ const diskMinPercent = numberEnv('MACOS_SYSTEM_DISK_MIN_PERCENT', 10, 0, 100);
 const diskMinBytes = numberEnv('MACOS_SYSTEM_DISK_MIN_GB', 10, 0, 100_000) * 1024 ** 3;
 const configuredDiskPath = process.env.MACOS_SYSTEM_DISK_PATH || '/';
 const diskPath = path.isAbsolute(configuredDiskPath) ? configuredDiskPath : '/';
+const pollFreshForMs = pollIntervalMs > 0
+  ? Math.min(7 * 86_400_000, Math.max(1_000, pollIntervalMs * 3))
+  : undefined;
 
 const ACTIONS = new Set(['system_snapshot', 'battery_status', 'network_status', 'storage_status']);
 
@@ -39,6 +42,16 @@ function numberEnv(name, fallback, minimum, maximum) {
 
 function write(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
+}
+
+function writeReadiness(inbound) {
+  write({
+    type: 'status',
+    inbound,
+    outbound: 'ready',
+    deliveryConfirmed: true,
+    ...(pollFreshForMs ? { freshForMs: pollFreshForMs } : {}),
+  });
 }
 
 function errorText(error) {
@@ -276,10 +289,12 @@ async function poll() {
     }
     lastStorageLow = currentStorageLow;
     lastPollError = '';
+    writeReadiness('ready');
   } catch (error) {
     const message = errorText(error);
     if (message !== lastPollError) process.stderr.write(`[macos-system] poll failed: ${message}\n`);
     lastPollError = message;
+    writeReadiness('unavailable');
   } finally {
     polling = false;
   }
@@ -316,6 +331,8 @@ if (pollIntervalMs > 0) {
   void poll();
   pollTimer = setInterval(() => void poll(), pollIntervalMs);
   pollTimer.unref();
+} else {
+  writeReadiness('unavailable');
 }
 
 for (const signal of ['SIGINT', 'SIGTERM']) {

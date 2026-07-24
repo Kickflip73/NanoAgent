@@ -304,6 +304,10 @@ export class MimiAgent {
       // Local JSONL traces stay provider-independent and avoid sending tool data elsewhere.
       tracingDisabled: true,
       traceIncludeSensitiveData: false,
+      // A provider may occasionally emit a stale or hallucinated tool name. Feed the
+      // failure back to the model so it can retry with the advertised tools instead
+      // of aborting the entire user run before any tool executes.
+      toolNotFoundBehavior: 'return_error_to_model',
     });
     this.hooks.on(async (event) => {
       const traceType = event.type === 'run_start'

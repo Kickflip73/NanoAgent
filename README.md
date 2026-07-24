@@ -159,13 +159,19 @@ DEEPSEEK_BASE_URL=https://api.deepseek.com
 DEEPSEEK_MODEL=deepseek-v4-pro
 ```
 
-编辑 `~/.mimi-agent/.env` 填入所选 Provider 的配置，然后启动：
+编辑 `~/.mimi-agent/.env` 填入所选 Provider 的配置，然后一键启动后台：
+
+```bash
+mimi daemon start
+```
+
+打开交互界面：
 
 ```bash
 mimi
 ```
 
-就这一种启动方式。`mimi` 首次运行会自动初始化并启动后台 Kernel，之后所有终端输入、IM、语音和外部事件都进入同一个 MimiAgent 系统。未显式设置 `MIMI_WORKSPACE` 或兼容的 `AGENT_WORKSPACE` 时，从其他目录再次运行 `mimi` 会继续连接并采用已有 Kernel 的工作区，不会另起一套控制面。不同 Session 可以同时运行；同一 Session 的消息仍按 FIFO 处理。CLI 退出只关闭当前终端，不会关闭 MimiAgent 或它已接手的后台任务。macOS 上只要 Provider Key 保存在 `~/.mimi-agent/.env`（或显式 `MIMI_ENV_FILE`），首次运行还会自动安装用户级 LaunchAgent，使 MimiAgent 在登录后启动并在异常退出后恢复；不需要单独管理服务启动。
+`mimi daemon start` 会完成初始化、选择 macOS LaunchAgent 或安全的 detached 后台模式、等待控制端点健康后再返回。`start`、`stop`、`restart` 和 `status` 是全局服务命令：Daemon 首次启动后会以私有原子文件持久保存工作区绑定，之后从任意目录执行都会自动采用该工作区，不要求先 `cd`。`stop` 会等待后台真正退出，重复执行也不会报错；`restart` 会安全停止后重新启动。直接运行 `mimi` 仍会在需要时自动启动同一个后台 Kernel。之后所有终端输入、IM、语音和外部事件都进入同一个 MimiAgent 系统。未显式设置 `MIMI_WORKSPACE` 或兼容的 `AGENT_WORKSPACE` 时，从其他目录再次运行 `mimi` 会继续连接并采用已有 Kernel 的工作区，不会另起一套控制面。不同 Session 可以同时运行；同一 Session 的消息仍按 FIFO 处理。CLI 退出只关闭当前终端，不会关闭 MimiAgent 或它已接手的后台任务。macOS 上只要 Provider Key 保存在 `~/.mimi-agent/.env`（或显式 `MIMI_ENV_FILE`），启动命令会安装用户级 LaunchAgent，使 MimiAgent 在登录后启动并在异常退出后恢复。
 
 `mimi` 默认先进入不落盘的新对话草稿，发送第一条普通消息时才创建真实 Session；如果直接用 `/sessions` 或 `/switch` 切到已有对话，草稿不会留下空 Session。`/model`、`/mode`、`/sessions`、`/history`、`/skills`、`/mcp`、`/memory`、`/plan`、`/goal`、`/tasks` 和 `/task` 等命令与长期运行事件共用同一套实现和 FileSession 原始记录。
 
@@ -175,9 +181,12 @@ mimi
 mimi "读取 package.json 并介绍这个项目"
 ```
 
-下面是维护与诊断命令，不是其他启动方式：
+后台生命周期和维护命令：
 
 ```bash
+mimi daemon start
+mimi daemon stop
+mimi daemon restart
 mimi daemon status
 mimi daemon doctor
 mimi daemon diagnostics ./mimi-diagnostics.json
@@ -185,6 +194,8 @@ mimi daemon backup ./mimi-backup
 mimi daemon backup verify ./mimi-backup
 mimi daemon --help
 ```
+
+`mimi daemon status` 默认输出适合终端阅读的健康摘要；脚本、自动化和完整排障数据使用 `mimi daemon status --json`。
 
 首次 `mimi` 会执行幂等初始化：创建权限为 `0700` 的 MimiAgent 数据目录、`0600` 的策略/Connector 配置和本机数据库，并把发布包内的 Connector 目录物化为当前安装位置的绝对路径。macOS 默认只启用无界面的 System Connector；Calendar、Mail、Messages、Contacts、Notes、Shortcuts、Desktop、Browser、Screen 和 Voice 都必须显式启用，Daemon 启动不会把任何 GUI App 放进 Dock。旧版自动启用的 canonical 本机 Connector 会一次性切换到该无界面默认，后续用户显式启停仍会保留；Calendar/Reminders 与 Mail 即使被启用，也不会为了后台轮询重新打开已关闭的 App。需要 Token 或额外数据源配置的大象、QQ、OpenClaw 微信、Radar 等同样保持关闭。QQ/微信不默认启用 AppleScript、截图、OCR、键盘或点击式 Connector，正式 IM 接入必须使用后台 API/协议桥。后续升级会补齐缺失的默认本机 Connector，并为仍指向同名内置脚本的 Connector 补充新 action；同名内置脚本的旧 `command: "node"` 会迁移成当前安装所用的绝对 Node 路径，避免 launchd 找不到命令。已有 owner 路径、环境、来源和 action 描述保持不变，自定义 command 也不会被覆盖。`syncTemplateActions: false` 可固定自定义 action 集合。空闲 Task/Outbox 检查频率由每 250ms 降至每秒一次，System 状态采样由每分钟降至每五分钟一次，减少长期唤醒。`mimi daemon doctor` 只读检查模型 Key、脚本、系统命令、后台、运行中 Connector、dead letter、容量阈值和 launchd 状态，不读取邮件、消息或屏幕，也不触发系统授权。`mimi daemon diagnostics [输出文件]` 生成权限为 `0600` 的 JSON 诊断包；它只包含健康度、readiness 计数和文件容量元数据，不包含 Event/消息正文、reply target、Token、环境值、Connector 参数、Session/Run 内容、私人 Memory 正文或本机路径，并拒绝覆盖已有文件。
 

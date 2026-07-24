@@ -5,11 +5,14 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import {
+  Agent,
   getAllMcpTools,
   invalidateServerToolsCache,
   RunContext,
+  Usage,
   type AgentInputItem,
   type MCPServer,
+  type Model,
 } from '@openai/agents';
 import { ContextManager, estimateTokens } from '../src/core/context.js';
 import { ProjectGuidanceLoader, SoulLoader } from '../src/core/guidance.js';
@@ -182,6 +185,55 @@ test('releases the active run when asynchronous Runner setup rejects', async () 
   try {
     await assert.rejects(agent.stream('start'), /async runner setup failed/);
     await assert.doesNotReject(agent.switchSession('after-failure'));
+  } finally {
+    await agent.close();
+  }
+});
+
+test('returns unknown model tool calls to the model instead of aborting the run', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mimi-unknown-tool-recovery-'));
+  const agent = await MimiAgent.create({
+    provider: 'openai', workspaceRoot: root, dataRoot: path.join(root, '.mimi-agent'),
+    skillsRoot: path.join(root, 'skills'), mcpConfig: path.join(root, 'mcp.json'),
+    historyLimit: 40, maxTurns: 20,
+  });
+  try {
+    const runner = (agent as unknown as {
+      runner: {
+        config: { toolNotFoundBehavior?: string };
+        run: (runtimeAgent: Agent, input: string) => Promise<{ finalOutput?: unknown }>;
+      };
+    }).runner;
+    assert.equal(runner.config.toolNotFoundBehavior, 'return_error_to_model');
+
+    let calls = 0;
+    const model: Model = {
+      async getResponse() {
+        calls += 1;
+        return {
+          usage: new Usage(),
+          output: calls === 1
+            ? [{
+                type: 'function_call' as const,
+                callId: 'unknown-shell-call',
+                name: 'shell',
+                arguments: '{}',
+              }]
+            : [{
+                type: 'message' as const,
+                role: 'assistant' as const,
+                status: 'completed' as const,
+                content: [{ type: 'output_text' as const, text: 'recovered' }],
+              }],
+        };
+      },
+      async *getStreamedResponse() {
+        throw new Error('streaming is not used by this regression test');
+      },
+    };
+    const result = await runner.run(new Agent({ name: 'unknown-tool-test', model }), 'start');
+    assert.equal(result.finalOutput, 'recovered');
+    assert.equal(calls, 2);
   } finally {
     await agent.close();
   }

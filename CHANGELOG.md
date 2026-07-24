@@ -9,7 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- expose `mimi daemon start`, `stop`, and `restart` as supported one-command
+  lifecycle operations with idempotent stop, readiness-confirmed startup, and a
+  durable workspace binding so service management works from any directory
+- make `mimi daemon status` human-readable by default, retain full machine output
+  behind `--json`, show a direct start hint when the service is offline, and
+  distinguish retained failures that need attention from an unavailable daemon
 - macOS 日历与提醒事项 Connector 改用 EventKit 原生后台访问，轮询和操作不再启动或激活 Calendar/Reminders App。
+- let the model recover from stale or hallucinated tool names instead of aborting
+  the entire run with `Tool ... not found`
 
 ## [0.12.0] - 2026-07-24
 

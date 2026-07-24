@@ -16,6 +16,10 @@ interface ProtocolMessage {
   payload?: Record<string, unknown>;
   result?: Record<string, unknown>;
   error?: string;
+  inbound?: string;
+  outbound?: string;
+  deliveryConfirmed?: boolean;
+  freshForMs?: number;
 }
 
 async function waitFor(
@@ -113,6 +117,14 @@ process.stdout.write("Now drawing from 'Battery Power'\\n -InternalBattery-0 (id
     assert.equal(storageEvent.kind, 'alert');
     assert.equal(storageEvent.priority, 90);
     assert.equal(typeof (storageEvent.payload?.storage as Record<string, unknown>).freeBytes, 'number');
+    const readiness = await waitFor(messages, (message) => message.type === 'status');
+    assert.deepEqual(readiness, {
+      type: 'status',
+      inbound: 'ready',
+      outbound: 'ready',
+      deliveryConfirmed: true,
+      freshForMs: 3_000,
+    });
 
     child.stdin.write(`${JSON.stringify({ type: 'action', id: 'snapshot-1', action: 'system_snapshot', target: 'system', payload: {} })}\n`);
     const snapshot = await waitFor(messages, (message) => message.id === 'snapshot-1');

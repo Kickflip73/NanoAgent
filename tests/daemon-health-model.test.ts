@@ -115,19 +115,19 @@ test('distinguishes an online process from degraded connector readiness and capa
   assert.deepEqual(health.connectors.unknown, ['unknown']);
 });
 
-test('dead letters make daemon health unhealthy and provide bounded recovery commands', () => {
+test('retained dead letters degrade daemon health without implying the process is down', () => {
   const health = buildDaemonHealth({
     tasks: taskCounts({ dead_letter: 2 }),
     outbox: outboxCounts({ dead_letter: 3 }),
   });
 
-  assert.equal(health.state, 'unhealthy');
+  assert.equal(health.state, 'degraded');
   assert.deepEqual(health.risks.map((risk) => ({
     code: risk.code,
     severity: risk.severity,
     nextAction: risk.nextAction,
   })), [
-    { code: 'task_dead_letters', severity: 'error', nextAction: 'mimi daemon tasks' },
-    { code: 'outbox_dead_letters', severity: 'error', nextAction: 'mimi daemon outbox' },
+    { code: 'task_dead_letters', severity: 'warning', nextAction: 'mimi daemon tasks' },
+    { code: 'outbox_dead_letters', severity: 'warning', nextAction: 'mimi daemon outbox' },
   ]);
 });

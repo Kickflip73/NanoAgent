@@ -81,7 +81,7 @@ export function buildDaemonHealth(input: DaemonHealthInput): DaemonHealthSnapsho
   if (taskDeadLetters > 0) {
     risks.push({
       code: 'task_dead_letters',
-      severity: 'error',
+      severity: 'warning',
       message: `${taskDeadLetters} 个任务进入 dead letter`,
       nextAction: 'mimi daemon tasks',
     });
@@ -89,7 +89,7 @@ export function buildDaemonHealth(input: DaemonHealthInput): DaemonHealthSnapsho
   if (outboxDeadLetters > 0) {
     risks.push({
       code: 'outbox_dead_letters',
-      severity: 'error',
+      severity: 'warning',
       message: `${outboxDeadLetters} 个消息投递进入 dead letter`,
       nextAction: 'mimi daemon outbox',
     });
