@@ -97,6 +97,12 @@ function sameTask(stored: TaskRecord, input: TaskInput): boolean {
 export interface TaskListSelector {
   type?: TaskRecord['type'];
   idPrefix?: string;
+  profileId?: string;
+  sessionKey?: string;
+  query?: string;
+  scheduleId?: string;
+  excludeId?: string;
+  offset?: number;
 }
 
 export class TaskStore {
@@ -156,10 +162,22 @@ export class TaskStore {
       clauses.push('substr(id, 1, length(?)) = ?');
       parameters.push(selector.idPrefix, selector.idPrefix);
     }
-    parameters.push(limit);
+    for (const [column, value] of [['profile_id', selector.profileId], ['session_key', selector.sessionKey]] as const) {
+      if (value) { clauses.push(`${column} = ?`); parameters.push(value); }
+    }
+    if (selector.query) {
+      clauses.push('(instr(lower(objective_json), lower(?)) > 0 OR instr(lower(coalesce(result_json, \'\')), lower(?)) > 0)');
+      parameters.push(selector.query, selector.query);
+    }
+    if (selector.excludeId) { clauses.push('id != ?'); parameters.push(selector.excludeId); }
+    if (selector.scheduleId) {
+      clauses.push("json_extract(objective_json, '$.scheduleId') = ?");
+      parameters.push(selector.scheduleId);
+    }
+    parameters.push(limit, selector.offset ?? 0);
     const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
     return (this.database.prepare(`
-      SELECT * FROM tasks ${where} ORDER BY created_at DESC, rowid DESC LIMIT ?
+      SELECT * FROM tasks ${where} ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?
     `).all(...parameters) as Row[]).map(taskFromRow);
   }
 

@@ -1536,8 +1536,8 @@ export function createTools(
         assertPathAllowed(target, pathAccess.protectedPaths),
         assertWritablePath(workspaceRoot, target, access.writablePaths),
       ]).then(() => undefined), access.mutationObserver);
-      if (access.postWriteDiagnostics === false) return result;
-      return { result, diagnostics: await diagnoseWrittenFiles(workspaceRoot, [target]) };
+      if (access.postWriteDiagnostics === false) return { path: target, result };
+      return { path: target, result, diagnostics: await diagnoseWrittenFiles(workspaceRoot, [target]) };
     },
   });
 

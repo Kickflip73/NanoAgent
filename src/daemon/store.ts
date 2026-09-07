@@ -11,8 +11,10 @@ import { runFailureRecord, type RunFailureRecord } from '../core/run-failure.js'
 import type { RunFinalizationRecord } from '../core/run-finalization.js';
 import { EventStore, listEventSummaries } from './event-store.js';
 import { EventRouter } from './event-router.js';
+import { taskCompletionRoute } from './task-continuation.js';
 import { sanitizedMemoryEvidenceSnapshot } from './memory-evidence.js';
 import { createFreshV16Schema } from './persistence/schema/current.js';
+import { upgradeScheduleContextV17 } from './persistence/schema/migrations/v17-schedule-context.js';
 import {
   ensureMemoryLintSchemaV13,
   hasMemoryObservationSourceKey,
@@ -168,7 +170,7 @@ export class MimiStore extends ActivityStore {
     super(database);
     this.file = resolved;
     const version = Number((database.prepare('PRAGMA user_version').get() as Row).user_version);
-    if (version > 16) {
+    if (version > 17) {
       database.close();
       throw new Error(`不支持的 MimiAgent 数据库版本：${version}`);
     }
@@ -336,8 +338,14 @@ export class MimiStore extends ActivityStore {
   }
 
   readyTasks(selector: TaskSelector = {}, limit = 50, at = new Date()): TaskRecord[] {
+    const timestamp = at.toISOString();
+    // Preemption and worker polls are reads while no lease needs recovery.
+    // Avoid taking the cross-process writer lock every 250ms when idle.
+    const expired = this.database.prepare(`
+      SELECT 1 FROM tasks WHERE status = 'running' AND lease_until <= ? LIMIT 1
+    `).get(timestamp);
+    if (!expired) return this.taskStore.listReady(selector, timestamp, managementLimit(limit));
     return this.transaction(() => {
-      const timestamp = at.toISOString();
       this.recoverExpiredTasks(timestamp);
       return this.taskStore.listReady(selector, timestamp, managementLimit(limit));
     });
@@ -497,6 +505,7 @@ export class MimiStore extends ActivityStore {
       }
       this.finishTaskAttempt(current, attemptId, 'completed', result, undefined, timestamp);
       const task = this.taskStore.get(taskId)!;
+      this.schedules.recordOutcome(task, result, timestamp);
       if (task.type === 'briefing' && task.triggerEventId) {
         this.database.prepare(`
           UPDATE digest_items SET digested_at = ?
@@ -511,9 +520,10 @@ export class MimiStore extends ActivityStore {
             first_changed_at=NULL, last_lint_at=excluded.last_lint_at
         `).run(task.profileId, timestamp);
       }
-      this.appendTaskLifecycleEvent(task, 'task.completed', timestamp, { resultAvailable: result !== undefined });
+      const completion = this.appendTaskLifecycleEvent(task, 'task.completed', timestamp, { resultAvailable: result !== undefined });
       this.memoryObservations.recordTask(task, 'completed', result, attemptId, timestamp);
-      if (delivery) this.insertOutbox(taskId, delivery.route, delivery.payload, timestamp);
+      const reviewQueued = this.eventStore.getReceipt(completion.id)?.taskIds.length;
+      if (delivery && !reviewQueued) this.insertOutbox(taskId, delivery.route, delivery.payload, timestamp);
       return task;
     });
   }
@@ -1278,10 +1288,13 @@ export class MimiStore extends ActivityStore {
       correlationId: task.triggerEventId ?? task.id,
       causationEventId: task.triggerEventId,
       profileId: task.profileId,
+      replyRoute: this.eventStore.get(task.authorityEventId)?.replyRoute,
       occurredAt: timestamp,
       receivedAt: timestamp,
     }, timestamp).event;
-    this.eventRouter.routeEvent(event.id);
+    this.eventRouter.routeEvent(event.id, taskCompletionRoute(
+      task, event, this.eventStore.get(task.authorityEventId),
+    ));
     return event;
   }
 
@@ -1334,7 +1347,7 @@ export class MimiStore extends ActivityStore {
       const failure: RunFailureRecord = {
         code: 'task.lease_expired',
         disposition: {
-          phase: 'runtime', kind: 'transient', retryable: true, dispatchStarted: false,
+          phase: 'runtime', kind: 'transient', retryable: true, dispatchStarted: true,
         },
       };
       const terminal = task.attemptCount >= task.maxAttempts;
@@ -1363,7 +1376,11 @@ export class MimiStore extends ActivityStore {
 
   private migrate(): void {
     const version = Number((this.database.prepare('PRAGMA user_version').get() as Row).user_version);
-    if (version === 0) return void createFreshV16Schema(this.database);
+    if (version === 0) {
+      createFreshV16Schema(this.database);
+      upgradeScheduleContextV17(this.database);
+      return;
+    }
     if (version >= 13 && (!hasFinalEventTaskV12Schema(this.database)
       || !hasMemoryObservationSourceKey(this.database))) {
       throw new Error(`MimiAgent 数据库标记为 v${version}，但缺少最终 Event/Task 或 Memory observation schema`);
@@ -1371,7 +1388,7 @@ export class MimiStore extends ActivityStore {
     if (version >= 15 && !hasMemoryEvidenceSnapshot(this.database)) {
       throw new Error(`MimiAgent 数据库标记为 v${version}，但缺少 Memory evidence schema`);
     }
-    if (version === 16 && !hasTaskExecutorOwnershipV16(this.database)) {
+    if (version >= 16 && !hasTaskExecutorOwnershipV16(this.database)) {
       throw new Error('MimiAgent 数据库标记为 v16，但缺少 executor schema');
     }
     if (version === 12) {
@@ -1396,7 +1413,11 @@ export class MimiStore extends ActivityStore {
     if (version < 14) repairDigestedTaskRoutesV14(this.database);
     if (version < 15) upgradeMemoryEvidenceSnapshotV15(this.database, sanitizedMemoryEvidenceSnapshot);
     if (version < 16) upgradeTaskExecutorOwnershipV16(this.database, validTaskRoute);
-    else repairExistingTaskExecutorOwnershipV16(this.database);
+    else if (version === 16) repairExistingTaskExecutorOwnershipV16(this.database);
+    if (version < 17) upgradeScheduleContextV17(this.database);
+    if (!this.database.prepare('PRAGMA table_info(schedules)').all().some((row) => row.name === 'context_json')) {
+      throw new Error('MimiAgent 数据库标记为 v17，但缺少 schedule context schema');
+    }
   }
 
   private backupBeforeMigrations(): void {
@@ -1412,6 +1433,7 @@ export class MimiStore extends ActivityStore {
       ...(version === 13 && finalEventSchema ? ['task-route-v14'] : []),
       ...(version === 14 && finalEventSchema ? ['memory-evidence-v15'] : []),
       ...(version === 15 && finalEventSchema ? ['task-executor-v16'] : []),
+      ...(version === 16 && finalEventSchema ? ['schedule-context-v17'] : []),
       ...(finalEventSchema ? existingV16Repairs : []),
     ];
     for (const label of labels) this.backupDatabase(label);

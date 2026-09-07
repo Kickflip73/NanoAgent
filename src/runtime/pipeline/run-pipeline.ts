@@ -230,16 +230,17 @@ export async function executeRunPipeline(
     await run.session.repairToolPairs();
     const recovery = canReadSessionContext ? await run.session.getCheckpoint() : undefined;
     run.recoveryRunId = recovery?.runId;
+    const resumesCheckpoint = recovery !== undefined
+      && recovery.status !== 'completed'
+      && (recovery.input.trim() === textInput.trim() || options?.resumeState === true);
     await run.session.beginRun(
       textInput,
       run.runId,
       run.ownerId,
       options?.retainExecutionLedger === true,
+      resumesCheckpoint,
     );
     began = true;
-    const resumesCheckpoint = recovery !== undefined
-      && recovery.status !== 'completed'
-      && (recovery.input.trim() === textInput.trim() || options?.resumeState === true);
     await host.hooks.emit({ type: 'run_start', sessionId: run.sessionId, input: textInput });
     if (binding) {
       await emitModelBinding(
@@ -612,7 +613,11 @@ export async function executeRunPipeline(
         ? []
         : capabilityRegistry.gatewayTools(classifiedTools.deferred),
     );
-    const modelTools = run.facts.wrap(selectedModelTools);
+    const modelTools = run.facts.wrap(selectedModelTools, async (call) => {
+      await run.session.recordToolProgress(redactActiveEphemeralData({
+        ...call, sessionId: run.sessionId, runId: executionRunId,
+      }, run.ephemeralSensitiveAccess), run.runId);
+    });
     run.availableToolNames = capabilityRegistry.authorizedTools().map((candidate) => candidate.name);
     const availableSkillNames = host.components.skills.list()
       .filter((candidate) => {
@@ -755,7 +760,7 @@ export async function executeRunPipeline(
       plan: activePlan,
       goal,
       teamSummary: activeTeamSummary,
-      recoverySummary: resumesCheckpoint ? recoverySummary(recovery) : '',
+      recoverySummary: recoverySummary(recovery, resumesCheckpoint),
     }, instructionBudget, requiredInstructionBudget);
     const instructions = builtInstructions.text;
     const semanticSummarizer = host.contextSemanticSummarizer

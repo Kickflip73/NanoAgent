@@ -55,7 +55,7 @@ const READ_TASK_CAPABILITIES = [
 ] as const satisfies readonly ToolCapability[];
 
 const READ_TASK_TOOLS = [
-  'current_time', 'calculate',
+  'current_time', 'calculate', 'task_history',
   'read_file', 'list_directory', 'search_files', 'inspect_processes',
   'http_get', 'web_search',
   'memory_search', 'memory_read', 'memory_links',
@@ -91,7 +91,7 @@ const WORK_SOURCE_POLICY_CAPABILITIES = [
 ] as const satisfies readonly ToolCapability[];
 
 const WORK_SOURCE_POLICY_TOOLS = [
-  'current_time', 'calculate',
+  'current_time', 'calculate', 'task_history',
   'read_file', 'write_file', 'edit_file', 'move_file', 'list_directory', 'search_files',
   'inspect_processes', 'run_shell',
   'http_get', 'web_search', 'http_request',
@@ -289,7 +289,7 @@ function backgroundTaskPlaybook(backgroundTask: boolean): string {
   if (!backgroundTask) return '';
   return [
     '## MimiAgent 后台 Task Lead 执行契约',
-    '你是同一个 MimiAgent 的后台执行部分，不是另一个人格，也不负责维持闲聊。只专注完成当前已持久化目标；开始时建立或恢复 Goal/Plan，持续把关键进展写入 checkpoint。',
+    '你是同一个 MimiAgent 的后台执行部分，只专注当前目标。Task 已经持久化，后台身份不要求再建 Goal/Plan。简单工作直接执行、核实后结束，不调用 prepare_task/set_goal/finish_task；多阶段工作按需维护 Plan，确实需要跨轮恢复的复杂工作才建立 Goal/checkpoint。已有属于本任务的未完 Goal 则继续遵守其完成契约。',
     '当前目标已经是后台任务，绝不能调用 delegate_background_task 建立持久子任务，也不要交回前台。需要拆分时只使用当前 Task 内的只读 SubAgent 或 Ultra Team，并验证、整合结果；workspaceAccess=read 的任务没有 Team，只能使用只读 SubAgent 或自行完成分析。',
     '完成时返回：实际结果、产物位置、验证证据和仍存在的风险。只有缺少无法自行取得且不可推断的关键输入时，调用 request_background_task_input 后停止本次执行；不得只在文字里说“需要输入”、不得假装完成，也不要切换、清空或冒充原始用户 Session。',
   ].join('\n');

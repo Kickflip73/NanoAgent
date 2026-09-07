@@ -753,11 +753,12 @@ export async function runMimiDaemon(config: AppConfig): Promise<void> {
       pauseEvent: pauseTask,
       takeEphemeralSecrets: (eventId, sessionId, references) =>
         ephemeralSecrets.take(eventId, sessionId, references),
-      resolveWorkspace: async (event, sessionId) => {
+      resolveWorkspace: async (event, sessionId, task) => {
         const current = host!.workspaceRootFor(sessionId);
-        if (event.trust !== 'owner') return current ?? config.workspaceRoot;
-        const payload = event.payload && typeof event.payload === 'object' && !Array.isArray(event.payload)
-          ? event.payload as Record<string, unknown>
+        const authority = store.getImmutableEvent(task.authorityEventId);
+        if (authority?.trust !== 'owner') return current ?? config.workspaceRoot;
+        const payload = task.objective && typeof task.objective === 'object' && !Array.isArray(task.objective)
+          ? task.objective as Record<string, unknown>
           : {};
         const requestedWorkspaceRoot = optionalAbsoluteDirectory(
           payload.workspaceRoot,
@@ -785,7 +786,7 @@ export async function runMimiDaemon(config: AppConfig): Promise<void> {
         taskWorkerRuntime,
         activeHostMutations: mutationGate.active,
       };
-      const activity = store.activitySnapshot(1);
+      const activity = store.healthSnapshot();
       const effectiveCapability = host?.currentCapabilitySnapshot();
       const providerHealth = host?.providerHealth();
       const providerHealthRoutes = host?.providerHealthRoutes();
@@ -960,6 +961,7 @@ export async function runMimiDaemon(config: AppConfig): Promise<void> {
       if (method === 'activity.get') {
         return sanitizeSensitiveData(store.activitySnapshot(limit(object(rawParams).limit, 10)));
       }
+      if (method === 'usage.get') return store.usageReport(Number(object(rawParams).days ?? 7));
       if (method === 'chat.bootstrap') {
         const params = object(rawParams);
         const draftSessionId = assertSessionId(requiredString(params.draftSessionId, 'draftSessionId'));

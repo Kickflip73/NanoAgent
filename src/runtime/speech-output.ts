@@ -1,8 +1,11 @@
-import { execFile } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
-import { access, chmod, mkdir, stat, unlink, writeFile } from 'node:fs/promises';
+import { access, chmod, mkdir, realpath, stat, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { z } from 'zod';
+import { AtomicJsonStore } from '../core/state-file.js';
+import { runManagedCommand } from '../core/managed-process.js';
+import { PRE_MIMI_DATA_DIRECTORY } from '../core/mimi-legacy.js';
 import type { TtsConfig } from '../config.js';
 
 export type SpeechEngine = 'auto' | 'chattts' | 'kokoro';
@@ -26,11 +29,27 @@ export interface SpeechSynthesisOptions {
 export interface SpeechAudio {
   id: string;
   file: string;
-  format: 'wav';
-  engine: Exclude<SpeechEngine, 'auto'>;
+  format: 'wav' | 'm4a' | 'mp3' | 'aiff' | 'flac' | 'ogg';
+  engine: Exclude<SpeechEngine, 'auto'> | 'unknown';
   voice?: string;
   language: SpeechLanguage;
   createdAt: string;
+}
+
+const audioSchema = z.object({
+  id: z.string().uuid(), file: z.string(), format: z.literal('wav'),
+  engine: z.enum(['chattts', 'kokoro']), voice: z.string().optional(),
+  language: z.enum(['auto', 'zh', 'en', 'ja']), createdAt: z.string(),
+}).strict();
+const renderSchema = z.object({
+  status: z.enum(['started', 'ready', 'uncertain']), audio: audioSchema,
+  error: z.string().max(2_000).optional(),
+}).strict();
+const rendersSchema = z.object({ version: z.literal(1), entries: z.record(z.string(), renderSchema) }).strict();
+type RenderRecord = z.infer<typeof renderSchema>;
+
+export class SpeechRenderUncertainError extends Error {
+  constructor(readonly audio: SpeechAudio, message: string) { super(message); }
 }
 
 type ValidatedSpeechOptions = Required<Pick<
@@ -75,29 +94,6 @@ export type SpeechCommandRunner = (
   args: readonly string[],
   options: { environment?: NodeJS.ProcessEnv; timeoutMs: number; signal?: AbortSignal },
 ) => Promise<CommandResult>;
-
-function runCommand(
-  command: string,
-  args: readonly string[],
-  options: { environment?: NodeJS.ProcessEnv; timeoutMs: number; signal?: AbortSignal },
-): Promise<CommandResult> {
-  return new Promise((resolve, reject) => {
-    execFile(command, args, {
-      env: options.environment,
-      timeout: options.timeoutMs,
-      signal: options.signal,
-      encoding: 'utf8',
-      maxBuffer: 1024 * 1024,
-    }, (error, stdout, stderr) => {
-      if (error) {
-        const detail = String(stderr).trim();
-        reject(new Error(detail ? `${error.message}: ${detail}` : error.message, { cause: error }));
-        return;
-      }
-      resolve({ stdout: String(stdout), stderr: String(stderr) });
-    });
-  });
-}
 
 function validateOptions(options: SpeechSynthesisOptions): ValidatedSpeechOptions {
   let engine = options.engine ?? 'auto';
@@ -153,14 +149,18 @@ export class SpeechOutput {
   private playbackTail = Promise.resolve();
   private queuedPlayback = 0;
   private lastError?: string;
-  private readonly audio = new Map<string, SpeechAudio>();
+  private readonly renders: AtomicJsonStore<z.infer<typeof rendersSchema>>;
 
   constructor(
     private readonly config: TtsConfig,
     private readonly outputDirectory: string,
-    private readonly commandRunner: SpeechCommandRunner = runCommand,
+    private readonly commandRunner: SpeechCommandRunner = runManagedCommand,
   ) {
     this.enabled = config.enabled;
+    this.renders = new AtomicJsonStore(path.join(outputDirectory, 'renders.json'), {
+      defaultValue: () => ({ version: 1, entries: {} }), decode: (value) => rendersSchema.parse(value),
+      preserveSchemaMismatch: true, recoverCorrupt: false,
+    });
   }
 
   listVoices(): SpeechVoice[] {
@@ -197,11 +197,30 @@ export class SpeechOutput {
     await this.assertCommandsAvailable(false);
     const selected = resolveOptions(text, validateOptions(options));
     await mkdir(this.outputDirectory, { recursive: true, mode: 0o700 });
+    const fingerprint = createHash('sha256').update(JSON.stringify({ text, selected, renderer: this.config.command })).digest('hex');
     const id = randomUUID();
     const input = path.join(this.outputDirectory, `.${id}.txt`);
     const output = path.join(this.outputDirectory, `${id}.wav`);
-    await writeFile(input, text, { encoding: 'utf8', mode: 0o600 });
+    const proposed: RenderRecord = { status: 'started', audio: {
+      id, file: output, format: 'wav', engine: selected.engine, language: selected.language,
+      ...(selected.voice ? { voice: selected.voice } : {}), createdAt: new Date().toISOString(),
+    } };
+    const claimed = await this.renders.updateWhen((state) => {
+      const existing = state.entries[fingerprint];
+      if (existing) return { result: existing, changed: false };
+      state.entries[fingerprint] = proposed;
+      return { result: proposed, changed: true };
+    });
+    if (claimed.audio.id !== id) {
+      if (claimed.status === 'ready') {
+        await this.existingAudioFile(claimed.audio.file, true);
+        return { ...claimed.audio };
+      }
+      throw new SpeechRenderUncertainError(claimed.audio,
+        '同一内容和音色已有未确认的生成操作；先 inspect 该 audioId，不要重复合成或更换引擎启动副本。');
+    }
     try {
+      await writeFile(input, text, { encoding: 'utf8', mode: 0o600 });
       const result = await this.commandRunner(
         this.config.command,
         [input, '--no-play', output],
@@ -230,13 +249,18 @@ export class SpeechOutput {
         language: selected.language,
         createdAt: new Date().toISOString(),
       };
-      this.audio.set(id, audio);
+      await this.renders.update((state) => {
+        state.entries[fingerprint] = { status: 'ready', audio: audioSchema.parse(audio) };
+      });
       this.lastError = undefined;
       return { ...audio };
     } catch (error) {
-      await unlink(output).catch(() => undefined);
       this.rememberError(error);
-      throw error;
+      await this.renders.update((state) => {
+        state.entries[fingerprint] = { ...proposed, status: 'uncertain', error: this.lastError?.slice(0, 2_000) };
+      });
+      throw new SpeechRenderUncertainError(proposed.audio,
+        `${this.lastError}；生成结果尚未确认，文件可能稍后到达。先 inspect ${id}，不要自动重新生成。`);
     } finally {
       await unlink(input).catch(() => undefined);
     }
@@ -244,13 +268,12 @@ export class SpeechOutput {
 
   play(audio: SpeechAudio | string, signal?: AbortSignal): Promise<SpeechAudio> {
     this.assertEnabled();
-    const selected = typeof audio === 'string' ? this.audio.get(audio) : audio;
-    if (!selected) return Promise.reject(new Error(`TTS 音频不存在：${audio}`));
     const previous = this.playbackTail;
     this.queuedPlayback += 1;
     const playback = previous.then(async () => {
       this.assertEnabled();
       signal?.throwIfAborted();
+      const selected = await this.resolveAudio(audio);
       await access(selected.file, fsConstants.R_OK);
       await this.commandRunner(this.config.playbackCommand, [selected.file], {
         timeoutMs: this.config.playbackTimeoutMs,
@@ -266,6 +289,48 @@ export class SpeechOutput {
     });
     this.playbackTail = playback.then(() => undefined, () => undefined);
     return playback;
+  }
+
+  async inspect(id?: string) {
+    const entries = Object.values((await this.renders.read()).entries);
+    const selected = id ? entries.filter((entry) => entry.audio.id === id) : entries.slice(-20);
+    return Promise.all(selected.map(async (entry) => ({ ...entry,
+      fileExists: await stat(entry.audio.file).then((info) => info.isFile() && info.size > 0).catch(() => false),
+      retryable: false,
+      next: entry.status === 'ready' ? 'play existing audioId or file; do not synthesize again'
+        : 'This is the local receipt, not a live backend job query. Report the original audioId and unconfirmed status; do not loop over unchanged receipts or regenerate. File existence alone does not confirm completion.',
+    })));
+  }
+
+  private async resolveAudio(audio: SpeechAudio | string): Promise<SpeechAudio> {
+    if (typeof audio !== 'string') return this.resolveAudio(audio.id);
+    const entries = Object.values((await this.renders.read()).entries);
+    const recorded = entries.find((entry) => entry.audio.id === audio || entry.audio.file === audio);
+    if (recorded) {
+      if (recorded.status !== 'ready') throw new SpeechRenderUncertainError(recorded.audio, '音频生成尚未确认，先 inspect 同一操作。');
+      await this.existingAudioFile(recorded.audio.file, true);
+      return recorded.audio;
+    }
+    if (!path.isAbsolute(audio)) throw new Error(`TTS 音频不存在：${audio}`);
+    const file = await this.existingAudioFile(audio, false);
+    const info = await stat(file);
+    return { id: randomUUID(), file, format: path.extname(file).slice(1) as SpeechAudio['format'],
+      engine: 'unknown', language: 'auto', createdAt: info.mtime.toISOString() };
+  }
+
+  private async existingAudioFile(file: string, registered: boolean): Promise<string> {
+    const resolved = await realpath(file);
+    const info = await stat(resolved);
+    if (!info.isFile() || info.size === 0) throw new Error('音频文件不存在或为空');
+    if (!registered && (resolved.split(path.sep).some((part) => part === '.mimi-agent' || part === PRE_MIMI_DATA_DIRECTORY)
+      || !/\.(wav|m4a|mp3|aiff|flac|ogg)$/iu.test(resolved))) {
+      throw new Error('只能播放已登记音频或私有运行目录之外的现有音频文件');
+    }
+    if (registered && path.dirname(resolved) !== await realpath(this.outputDirectory)) {
+      throw new Error('已登记音频不能通过符号链接越出产物目录');
+    }
+    await access(resolved, fsConstants.R_OK);
+    return resolved;
   }
 
   async speak(

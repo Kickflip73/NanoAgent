@@ -1,5 +1,6 @@
 import type { Tool } from '@openai/agents';
 import type { ExecutionCallRecord } from '../../core/execution-ledger.js';
+import { toolResultFailure, toolResultUncertain } from '../../core/tool-result.js';
 
 type InvokableTool = Tool & {
   name: string;
@@ -14,7 +15,7 @@ interface ObservedCall {
   toolName: string;
   callId: string;
   argumentsJson: string;
-  status: 'succeeded' | 'failed';
+  status: 'succeeded' | 'failed' | 'uncertain';
   output?: unknown;
   error?: string;
 }
@@ -23,33 +24,12 @@ function invokable(candidate: Tool): candidate is InvokableTool {
   return 'invoke' in candidate && typeof candidate.invoke === 'function';
 }
 
-function record(value: unknown): Record<string, unknown> | undefined {
-  return value !== null && typeof value === 'object' && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : undefined;
-}
-
-function semanticFailure(value: unknown): string | undefined {
-  const output = record(value);
-  if (!output) return undefined;
-  const failed = output.mimiStatus === 'tool_input_rejected'
-    || output.mimiStatus === 'action_uncertain'
-    || output.outcome === 'failed'
-    || output.outcome === 'uncertain'
-    || output.status === 'failed'
-    || output.status === 'uncertain';
-  if (!failed) return undefined;
-  const message = [output.message, output.error, output.code]
-    .find((candidate) => typeof candidate === 'string' && candidate.trim());
-  return typeof message === 'string' ? message.slice(0, 2_000) : '工具返回结构化失败';
-}
-
 /** Captures every model-visible tool result without turning reads into replay-protected effects. */
 export class RunFactCollector {
   private readonly observed: ObservedCall[] = [];
   private sequence = 0;
 
-  wrap(tools: readonly Tool[]): Tool[] {
+  wrap(tools: readonly Tool[], persist?: (call: ObservedCall) => Promise<void>): Tool[] {
     return tools.map((candidate) => {
       if (!invokable(candidate)) return candidate;
       const invoke = candidate.invoke.bind(candidate);
@@ -57,29 +37,31 @@ export class RunFactCollector {
         ...candidate,
         invoke: async (context, input, details) => {
           const callId = details?.toolCall?.callId ?? `observed:${++this.sequence}`;
+          let output: unknown;
           try {
-            const output = await invoke(context, input, details);
-            const error = semanticFailure(output);
-            this.observed.push({
-              toolName: candidate.name,
-              callId,
-              argumentsJson: input,
-              status: error ? 'failed' : 'succeeded',
-              output,
-              ...(error ? { error } : {}),
-            });
-            return output;
+            output = await invoke(context, input, details);
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
-            this.observed.push({
+            const observed: ObservedCall = {
               toolName: candidate.name,
               callId,
               argumentsJson: input,
               status: 'failed',
               error: message.slice(0, 2_000),
-            });
+            };
+            this.observed.push(observed);
+            await persist?.(observed);
             throw error;
           }
+          const error = toolResultFailure(output);
+          const observed: ObservedCall = {
+            toolName: candidate.name, callId, argumentsJson: input,
+            status: toolResultUncertain(output) ? 'uncertain' : error ? 'failed' : 'succeeded',
+            output, ...(error ? { error } : {}),
+          };
+          this.observed.push(observed);
+          await persist?.(observed);
+          return output;
         },
       } as Tool;
     });
@@ -105,6 +87,7 @@ export function mergeRunCalls(
     const [modelFact] = remaining.splice(match, 1);
     return {
       ...durable,
+      ...(durable.status === 'succeeded' && modelFact?.status !== undefined ? { status: modelFact.status } : {}),
       ...(modelFact?.output !== undefined ? { output: modelFact.output } : {}),
       ...(durable.error === undefined && modelFact?.error ? { error: modelFact.error } : {}),
     };

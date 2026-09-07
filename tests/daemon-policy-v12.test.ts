@@ -189,6 +189,9 @@ test('background task policies preserve read/write separation and remove recursi
   assert.ok(writable.options?.policy?.allowedTools?.includes('connector_action'));
   assert.equal(writable.options?.policy?.allowedTools?.includes('delegate_background_task'), false);
   assert.equal(writable.options?.policy?.allowMcp, true);
+  assert.match(instructions(writable), /后台身份不要求再建 Goal\/Plan/);
+  assert.match(instructions(writable), /简单工作直接执行、核实后结束/);
+  assert.doesNotMatch(instructions(writable), /开始时建立或恢复 Goal\/Plan/);
 
   const external = decideEvent(event(), [], undefined, 'work', false, task());
   assert.ok(external.options?.policy?.allowedTools?.includes('run_shell'));

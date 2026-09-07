@@ -7,6 +7,7 @@ export const RUN_SOURCE_CATEGORIES = [
   'briefing',
   'maintenance',
   'routine',
+  'task_follow_up',
   'eval',
   'unknown',
 ] as const;
@@ -57,6 +58,7 @@ export function classifyRunSource(input: Pick<RunUsageFact, 'taskType' | 'source
     || input.source === 'attention:routine'
     || input.source === 'attention:routine-authority') return 'routine';
   if (input.source === 'system:connector-health') return 'health';
+  if (input.source === 'mimi:task') return 'task_follow_up';
   if (input.source.startsWith('eval:')
     || input.source.startsWith('mimi:eval')
     || input.source.startsWith('m1:eval')) return 'eval';

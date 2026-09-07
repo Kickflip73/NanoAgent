@@ -12,6 +12,8 @@ import {
 import { assertSessionId } from './session-id.js';
 import { AtomicJsonStore, StateFileCorruptError } from './state-file.js';
 import { modelTargetSchema, type ModelTarget } from './model-routing.js';
+import { resultArtifactSchema, resultArtifacts, toolProgress, toolProgressSchema, type ResultArtifact, type ToolProgress } from './tool-result.js';
+import type { ExecutionCallRecord } from './execution-ledger.js';
 import {
   runFinalizationRecordSchema,
   type RunFinalizationRecord,
@@ -57,6 +59,8 @@ function redactAttachmentData(item: AgentInputItem): AgentInputItem {
 }
 
 export interface RunCheckpoint {
+  toolProgress?: ToolProgress[];
+  artifacts?: ResultArtifact[];
   runId: string;
   status: RunStatus;
   input: string;
@@ -239,6 +243,8 @@ const sessionFileSchema = z.object({
   updatedAt: z.string(),
   items: z.array(z.record(z.string(), z.unknown())),
   checkpoint: z.object({
+    toolProgress: z.array(toolProgressSchema).max(12).optional(),
+    artifacts: z.array(resultArtifactSchema).max(100).optional(),
     runId: z.string(),
     status: z.enum(['running', 'completed', 'interrupted', 'failed']),
     input: z.string(),
@@ -461,6 +467,7 @@ export class FileSession implements Session {
     runId?: string,
     ownerId?: string,
     rollbackIncompleteItems = false,
+    resumeProgress = false,
   ): Promise<RunCheckpoint> {
     return this.mutate((session) => {
       if (session.checkpoint?.status === 'running' && checkpointOwnerIsLive(session.checkpoint)) {
@@ -468,6 +475,7 @@ export class FileSession implements Session {
       }
       const now = new Date().toISOString();
       const checkpoint: RunCheckpoint = {
+        ...(resumeProgress ? { toolProgress: session.checkpoint?.toolProgress, artifacts: session.checkpoint?.artifacts } : {}),
         runId: runId ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
         status: 'running',
         input: input.trim().slice(0, 8_000),
@@ -505,6 +513,21 @@ export class FileSession implements Session {
       };
       session.updatedAt = session.checkpoint.updatedAt;
       return { result: { ...session.checkpoint }, changed: true };
+    });
+  }
+
+  async recordToolProgress(call: ExecutionCallRecord, expectedRunId: string): Promise<void> {
+    await this.mutateWhen((session) => {
+      const checkpoint = session.checkpoint;
+      if (!checkpoint || checkpoint.status !== 'running' || checkpoint.runId !== expectedRunId
+        || call.sessionId !== this.id) return { result: undefined, changed: false };
+      checkpoint.toolProgress = [...(checkpoint.toolProgress ?? []), toolProgress(call)].slice(-12);
+      const artifacts = new Map((checkpoint.artifacts ?? []).map((item) => [item.path, item]));
+      resultArtifacts([call]).forEach((item) => artifacts.set(item.path, item));
+      checkpoint.artifacts = [...artifacts.values()].slice(-100);
+      checkpoint.updatedAt = new Date().toISOString();
+      session.updatedAt = checkpoint.updatedAt;
+      return { result: undefined, changed: true };
     });
   }
 

@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import type { ExecutionCallRecord } from './execution-ledger.js';
+import { resultArtifactSchema, resultArtifacts, toolResultFailure, toolResultUncertain } from './tool-result.js';
 
 const digestSchema = z.string().regex(/^[a-f0-9]{64}$/u);
 export const runOutcomeSchema = z.enum([
@@ -30,6 +31,7 @@ export const runFinalizationRecordSchema = z.object({
   reason: z.string().trim().min(1).max(2_000).optional(),
   nextAction: z.string().trim().min(1).max(2_000).optional(),
   evidenceRefs: z.array(z.string().trim().min(1).max(500)).max(100).default([]),
+  artifacts: z.array(resultArtifactSchema).max(100).optional(),
   // Preserve durable evidence written by builds with the optional media subsystem.
   mediaAnchors: z.array(z.unknown()).max(100).optional(),
   mediaAnchorsTruncated: z.literal(true).optional(),
@@ -118,6 +120,9 @@ function unresolvedFailures(calls: readonly ExecutionCallRecord[]): ExecutionCal
 }
 
 export function classifyRunOutcome(input: RunOutcomeInput): RunOutcome {
+  input = { ...input, calls: input.calls.map((call) => call.status !== 'succeeded' ? call
+    : toolResultUncertain(call.output) ? { ...call, status: 'uncertain' }
+      : toolResultFailure(call.output) ? { ...call, status: 'failed' } : call) };
   if (input.calls.some((call) => call.status === 'started' || call.status === 'uncertain')) {
     return 'uncertain';
   }
@@ -217,7 +222,8 @@ export function toolExecutionManifest(
     ...(call.modelCallId ?? call.modelCallIds?.[0]
       ? { modelCallId: call.modelCallId ?? call.modelCallIds?.[0] }
       : {}),
-    status: call.status,
+    status: call.status !== 'succeeded' ? call.status
+      : toolResultUncertain(call.output) ? 'uncertain' : toolResultFailure(call.output) ? 'failed' : 'succeeded',
     argumentsDigest: digest(call.argumentsJson),
     ...(outcomeDigest(call) ? { outcomeDigest: outcomeDigest(call) } : {}),
   }));
@@ -245,6 +251,7 @@ export function createRunFinalization(input: {
     ...(input.reason ? { reason: input.reason } : {}),
     ...(input.nextAction ? { nextAction: input.nextAction } : {}),
     evidenceRefs: input.evidenceRefs ?? runEvidenceRefs(input.calls),
+    artifacts: resultArtifacts(input.calls),
     ...(input.completionDecision ? { completionDecision: input.completionDecision } : {}),
     toolManifest: toolExecutionManifest(input.calls),
   });

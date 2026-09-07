@@ -483,7 +483,7 @@ test('v11 cutover atomically preserves Task, Run and Outbox ownership without pa
   }
   const database = new DatabaseSync(file, { readOnly: true });
   try {
-    assert.equal((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 16);
+    assert.equal((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 17);
     assert.equal(database.prepare("SELECT name FROM sqlite_master WHERE name = 'events_v2'").get(), undefined);
     assert.equal(database.prepare("SELECT name FROM sqlite_master WHERE name = 'task_attempts'").get(), undefined);
     assert.equal((database.prepare('PRAGMA foreign_key_check').all() as unknown[]).length, 0);
@@ -521,7 +521,7 @@ test('v14 removes only artifact-free digested Tasks and repairs their route rece
 
   const database = new DatabaseSync(file, { readOnly: true });
   try {
-    assert.equal((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 16);
+    assert.equal((database.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 17);
     assert.equal((database.prepare('PRAGMA foreign_key_check').all() as unknown[]).length, 0);
   } finally {
     database.close();
@@ -626,7 +626,7 @@ test('v16 migrates only the known queued Briefing route and records unresolved c
     migrated.close();
   }
   const verified = new DatabaseSync(file, { readOnly: true });
-  assert.equal((verified.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 16);
+  assert.equal((verified.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 17);
   assert.equal(
     (verified.prepare('PRAGMA integrity_check').get() as { integrity_check: string }).integrity_check,
     'ok',
@@ -723,6 +723,7 @@ test('existing v16 databases backfill failure facts once with backup and audit',
   }
   const legacy = new DatabaseSync(file);
   legacy.exec(`
+    PRAGMA user_version=16;
     UPDATE tasks SET status='dead_letter', error='historical explanation', result_json=NULL
       WHERE id='v16-legacy-dead';
   `);
@@ -839,6 +840,9 @@ test('existing v16 databases compact historical health Digests once with backup 
     store.close();
   }
 
+  const legacyVersion = new DatabaseSync(file);
+  legacyVersion.exec('PRAGMA user_version=16;');
+  legacyVersion.close();
   const dryRun = new DatabaseSync(file, { readOnly: true });
   assert.deepEqual(analyzeHistoricalHealthDigestCompactionV16(dryRun), {
     pendingHealthDigestItems: 7,
@@ -1000,11 +1004,11 @@ test('rejects a future database version without modifying the file', async () =>
   const store = new MimiStore(file);
   store.close();
   const database = new DatabaseSync(file);
-  database.exec('PRAGMA journal_mode=DELETE; PRAGMA user_version=17;');
+  database.exec('PRAGMA journal_mode=DELETE; PRAGMA user_version=18;');
   database.close();
   const before = await readFile(file);
 
-  assert.throws(() => new MimiStore(file), /不支持的 MimiAgent 数据库版本：17/);
+  assert.throws(() => new MimiStore(file), /不支持的 MimiAgent 数据库版本：18/);
   assert.deepEqual(await readFile(file), before);
   assert.deepEqual(await readdir(root), ['mimi.db']);
 });

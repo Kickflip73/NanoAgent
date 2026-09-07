@@ -1,3 +1,4 @@
+import { APIConnectionError } from 'openai';
 import { isTerminalRunInterruption } from '../runtime/run-outcome.js';
 import {
   runFailureDisposition,
@@ -72,6 +73,11 @@ export function classifyRunFailureRecord(error: unknown): RunFailureRecord {
   } };
   if (code === 'EAGAIN' || code === 'ENOMEM') return { code: `runtime.${code.toLowerCase()}`, disposition: {
     phase: 'runtime', kind: 'transient', retryable: true, dispatchStarted: false,
+  } };
+  // The SDK subclasses Error without changing .name; timeout errors also
+  // inherit APIConnectionError. Preserve their type rather than parsing text.
+  if (error instanceof APIConnectionError) return { code: 'provider.connection', disposition: {
+    phase: 'provider', kind: 'transient', retryable: true, dispatchStarted: false,
   } };
   return { code: 'runtime.unclassified', disposition: {
     phase: 'runtime', kind: 'unclassified', retryable: false, dispatchStarted: false,

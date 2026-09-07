@@ -288,6 +288,7 @@ export interface ScheduleRecord {
   profileId: string;
   sessionKey?: string;
   authorityEventId?: string;
+  context?: { workspaceRoot?: string; summary?: string; lastResult?: string; lastCheckedAt?: string };
   replyRoute?: ReplyRoute;
   trust: EventTrust;
   enabled: boolean;

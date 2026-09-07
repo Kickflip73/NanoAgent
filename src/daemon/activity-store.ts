@@ -83,6 +83,79 @@ function runUsageFact(row: Row): RunUsageFact {
 
 export class ActivityStore extends SqliteDomain {
 
+  usageReport(days = 7, at = new Date()) {
+    if (!Number.isInteger(days) || days < 1 || days > 90) throw new Error('统计天数必须是 1–90 的整数');
+    const since = new Date(at.getTime() - days * 86_400_000).toISOString();
+    const until = at.toISOString();
+    const tasks = this.database.prepare(`
+      SELECT type, status, COUNT(*) AS count, SUM(MAX(0, attempt_count - 1)) AS retries
+      FROM tasks WHERE created_at >= ? AND created_at <= ? GROUP BY type, status
+    `).all(since, until) as Row[];
+    const runs = this.database.prepare(`
+      SELECT tasks.type, runs.status, runs.started_at, runs.completed_at,
+        json_extract(runs.answer_json, '$.usage.runInputTokens') AS input_tokens,
+        json_extract(runs.answer_json, '$.usage.runOutputTokens') AS output_tokens
+      FROM runs JOIN tasks ON tasks.id = runs.task_id
+      WHERE runs.started_at >= ? AND runs.started_at <= ?
+    `).all(since, until) as Row[];
+    const failures = this.database.prepare(`
+      SELECT type, COALESCE(json_extract(result_json, '$.failure.code'), 'unclassified') AS code,
+        COUNT(*) AS count FROM tasks WHERE created_at >= ? AND created_at <= ?
+        AND status IN ('failed', 'dead_letter') GROUP BY type, code ORDER BY count DESC LIMIT 20
+    `).all(since, until) as Row[];
+    const types: TaskType[] = ['conversation', 'background', 'scheduled', 'briefing', 'memory_maintenance'];
+    return {
+      since, until,
+      scope: '保留数据中在窗口内创建的 Task；耗时和 Token 按窗口内启动的 Run 统计。completed 是执行结束，不代表回答正确或用户满意。',
+      byType: types.map((type) => {
+        const rows = tasks.filter((row) => row.type === type);
+        const attempts = runs.filter((row) => row.type === type);
+        const durationMs = attempts.filter((row) => typeof row.completed_at === 'string')
+          .map((row) => Date.parse(String(row.completed_at)) - Date.parse(String(row.started_at)))
+          .filter((value) => Number.isFinite(value) && value >= 0).sort((a, b) => a - b);
+        const metered = attempts.filter((row) => typeof row.input_tokens === 'number'
+          && typeof row.output_tokens === 'number' && row.input_tokens >= 0 && row.output_tokens >= 0);
+        const percentile = (p: number) => durationMs.length
+          ? durationMs[Math.max(0, Math.ceil(durationMs.length * p) - 1)]! : null;
+        return {
+          type, tasks: rows.reduce((sum, row) => sum + Number(row.count), 0),
+          statuses: Object.fromEntries(rows.map((row) => [String(row.status), Number(row.count)])),
+          retries: rows.reduce((sum, row) => sum + Number(row.retries), 0),
+          runs: attempts.length,
+          durationMs: { samples: durationMs.length, p50: percentile(0.5), p95: percentile(0.95) },
+          tokens: { sampledRuns: metered.length, unmeteredRuns: attempts.length - metered.length,
+            input: metered.length ? metered.reduce((sum, row) => sum + Number(row.input_tokens), 0) : null,
+            output: metered.length ? metered.reduce((sum, row) => sum + Number(row.output_tokens), 0) : null },
+        };
+      }),
+      failures: failures.map((row) => ({ type: String(row.type), code: String(row.code), count: Number(row.count) })),
+    };
+  }
+
+  healthSnapshot(at = new Date()): Pick<MimiActivitySnapshot,
+    'generatedAt' | 'pendingDigest' | 'unknownRunSources' | 'autonomousBudgetExhaustions'> {
+    // Status is a liveness probe. Do not read result bodies, historical cost
+    // trends, or dead-letter payloads on every CLI connection.
+    const sources = this.database.prepare(`
+      SELECT tasks.type, COALESCE(trigger_event.source, authority_event.source) AS source,
+        COALESCE(trigger_event.trust, authority_event.trust) AS trust, COUNT(*) AS count
+      FROM runs JOIN tasks ON tasks.id = runs.task_id
+      LEFT JOIN events trigger_event ON trigger_event.id = tasks.trigger_event_id
+      JOIN events authority_event ON authority_event.id = tasks.authority_event_id
+      WHERE runs.started_at >= ? GROUP BY 1, 2, 3
+    `).all(new Date(at.getTime() - 24 * 60 * 60_000).toISOString()) as Row[];
+    return {
+      generatedAt: at.toISOString(),
+      pendingDigest: Number((this.database.prepare(
+        'SELECT COUNT(*) AS count FROM digest_items WHERE digested_at IS NULL',
+      ).get() as Row).count),
+      unknownRunSources: sources.reduce((sum, row) => sum + (
+        classifyRunSource(runUsageFact(row)) === 'unknown' ? Number(row.count) : 0
+      ), 0),
+      autonomousBudgetExhaustions: this.activeAutonomousBudgetExhaustions(at),
+    };
+  }
+
   private runUsageFactsSince(since: Date): RunUsageFact[] {
     return (this.database.prepare(`
       SELECT tasks.type,

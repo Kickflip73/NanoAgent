@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- query retained conversation, background and scheduled results through one
+  owner-scoped `task_history` tool, including observed file references and explicit
+  pagination; reuse existing outputs without interpreting a lookup miss as a new task
+- preserve bounded, redacted tool progress in Session checkpoints across interrupted
+  attempts; show unfinished-run facts for model-decided conversational continuation
+- classify nonzero process exits and structured failures by their actual result,
+  not by whether the tool Promise resolved; keep finalization manifests consistent
+- persist speech render receipts and audio IDs across runtimes, play existing audio
+  files without synthesis, coalesce identical generation requests, and expose
+  uncertain status instead of duplicating a timed-out render; clean owned command
+  process groups on completion, timeout and cancellation
+
+- resume the original conversation after newly delegated background work completes,
+  so Mimi can inspect results and arrange requested follow-ups before reporting
+- persist schedule workspace/context and the last outcome, and coalesce checks
+  while an earlier occurrence remains outstanding (backed-up SQLite v17 migration)
+- add `mimi daemon usage [days]` and model-readable usage statistics, distinguishing
+  conversations, background tasks, scheduled checks, retries, latency and missing Token samples
+- keep status probes lightweight, avoid write locks in idle task polling, and
+  recognize real SDK connection errors for bounded retry
+- remove mandatory Goal/Plan setup for simple background work; keep durable
+  completion contracts for complex or resumed Goals
+
 - keep every natural-language request on the main model path while making common
   file, shell, Web, Browser, Computer, artifact, and Memory tools direct and
   discovering lower-frequency capabilities on demand without injecting the full

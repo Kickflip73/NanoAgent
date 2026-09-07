@@ -42,7 +42,7 @@ const delegationSchema = z.object({
   strategy: z.enum(['single', 'team']).default('single')
     .describe('single 由一个 Task Lead 完成；可安全拆分的大型任务才使用 team'),
   executor: z.enum(['mimi', 'codex']).default('mimi')
-    .describe('mimi（默认）由 MimiAgent 执行；codex 由独立 Codex CLI 进程自主执行，MimiAgent 只登记、启动和追踪'),
+    .describe('mimi（默认）由 MimiAgent 执行；codex 由独立 Codex CLI 执行。完成后均由 Mimi 回到原对话核查结果和安排原目标要求的后续步骤'),
   modelTarget: modelTargetSchema.optional()
     .describe('仅当用户明确指定 Mimi 后台任务模型时填写精确 providerId/modelId；省略时按 background.default 场景路由。只适用于 executor=mimi'),
   workspaceAccess: z.enum(['read', 'write']).default('write')
@@ -418,10 +418,14 @@ export function createBackgroundTaskTools(context: BackgroundTaskToolContext): T
   return [
     tool({
       name: 'delegate_background_task',
-      description: '把无需在当前对话立即得到结果的长程、大型、多阶段、持续等待或定时型工作持久化为后台任务。executor=mimi 时由 Task Lead 执行；executor=codex 时 MimiAgent 只登记、启动并追踪独立 Codex CLI，不参与其 Plan、工具调用、重试或验收，也不会失败后回退给 Mimi。成功后立即返回 taskId；当前对话不得等待、轮询或重复执行。',
+      description: '把长程或多阶段工作持久化为后台任务。mimi 由 Task Lead 执行；codex 由独立 Codex CLI 执行，不干预执行器内部过程或失败后自动切换执行器。完成后 Mimi 会回到原对话核查结果、处理原目标要求的后续步骤。完整保留用户的观察/跟进要求。成功后立即返回 taskId；当前对话无需等待或轮询。',
       parameters: delegationSchema,
       execute: async (input) => {
         const normalized = delegationSchema.parse(input);
+        const parentObjective = context.task.objective as Record<string, unknown> | null;
+        const continuationDepth = typeof parentObjective?.continuationDepth === 'number'
+          ? parentObjective.continuationDepth : 0;
+        if (continuationDepth >= 3) throw new Error('连续核查已达到三轮，请总结已完成项和剩余卡点，让用户决定后续方向');
         const workspaceAccess = effectiveWorkspaceAccess(normalized);
         const effectiveInput = { ...normalized, workspaceAccess };
         if (normalized.executor === 'codex' && normalized.modelTarget) {
@@ -477,6 +481,8 @@ export function createBackgroundTaskTools(context: BackgroundTaskToolContext): T
             requiredCapabilities: normalized.requiredCapabilities,
             ...(context.workspaceRoot ? { workspaceRoot: context.workspaceRoot } : {}),
             originSessionId: context.sessionId,
+            returnToOwner: true,
+            continuationDepth,
             replyRoute: context.replyRoute ?? context.event.replyRoute ?? { channel: 'system' },
           },
           executor: normalized.executor === 'codex' ? 'codex' : 'isolated_worker',

@@ -68,6 +68,7 @@ export interface DispatcherOptions {
   resolveWorkspace?: (
     event: ImmutableEvent,
     sessionId: string,
+    task: TaskRecord,
   ) => MaybePromise<string | undefined>;
 }
 
@@ -430,7 +431,7 @@ export class MimiDispatcher {
         return;
       }
       const sessionId = decision.sessionId!;
-      const workspaceRoot = await this.options.resolveWorkspace?.(event, sessionId);
+      const workspaceRoot = await this.options.resolveWorkspace?.(event, sessionId, task);
       this.store.bindRunningTaskSession(task.id, this.workerId, sessionId);
       if (this.activeSessions.has(sessionId)) {
         this.store.requeueTask(task.id, this.workerId, `同 Session ${sessionId} 已有活动 Run，保持 FIFO 等待`);

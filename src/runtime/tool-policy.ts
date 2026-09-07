@@ -136,6 +136,7 @@ const TOOL_DESCRIPTOR_DEFINITIONS = {
   remove_mimi_standing_order: { capabilities: ['state-write'], sideEffect: true },
   finish_mimi_silently: { capabilities: ['delivery-control'], modes: ALL_MODES },
   inspect_mimi_activity: { capabilities: ['state-read'], modes: ALL_MODES },
+  task_history: { capabilities: ['state-read'], modes: ALL_MODES },
   inspect_mimi_session_activity: { capabilities: ['state-read'], modes: ALL_MODES },
   cancel_interrupted_mimi_task: { capabilities: ['state-write'], sideEffect: true },
   list_mimi_schedules: { capabilities: ['state-read'], modes: ALL_MODES },

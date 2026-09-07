@@ -9,7 +9,8 @@ export function createMimiActivityTools(store: MimiStore): Tool[] {
     description: '读取 MimiAgent 当前积压、失败、近期事件/执行/投递状态和状态变化。counts 是持久库当前保留窗口内的记录，不是本次进程启动以来的计数器。tasks 是所有可执行工作单元的统计，其中 conversation 表示一次需 Agent 处理的对话，并不等于后台任务；只有 background 才是委派的后台任务。回答数量时必须结合 tasksByType 和 recentTasks.source/eventType 区分，不要把 tasks.completed 总数称为后台任务数。只返回有界运行元数据，不返回其他事务正文、答案、投递内容或目标。',
     parameters: z.object({
       limit: z.number().int().min(1).max(20).describe('每类近期记录返回数量，通常使用 10'),
+      days: z.number().int().min(1).max(90).optional().describe('附带最近多少天的使用统计；区分对话/后台/定时、重试、耗时与 Token 采样，默认 7 天'),
     }),
-    execute: async ({ limit }) => store.activitySnapshot(limit),
+    execute: async ({ limit, days }) => ({ ...store.activitySnapshot(limit), usage: store.usageReport(days ?? 7) }),
   })];
 }

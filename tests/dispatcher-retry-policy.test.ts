@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { APIConnectionError, APIConnectionTimeoutError } from 'openai';
 import { TerminalRunInterruptedError } from '../src/runtime/run-outcome.js';
 import {
   classifyRunFailure,
@@ -75,6 +76,14 @@ test('dispatcher retry policy preserves retries for transient and server failure
   assert.equal(eventFailureAttemptLimit(Object.assign(new Error('too early'), { status: 425 }), 1, 5), 5);
   assert.equal(eventFailureAttemptLimit(Object.assign(new Error('unavailable'), { status: 500 }), 1, 5), 5);
   assert.equal(eventFailureAttemptLimit(Object.assign(new Error('network reset'), { code: 'ECONNRESET' }), 1, 5), 5);
+});
+
+test('real SDK connection errors retain bounded retries even when their name is Error', () => {
+  for (const error of [new APIConnectionError({}), new APIConnectionTimeoutError()]) {
+    assert.equal(error.name, 'Error');
+    assert.equal(classifyRunFailure(error).phase, 'provider');
+    assert.equal(eventFailureAttemptLimit(error, 1, 5), 5);
+  }
 });
 
 test('dispatcher retry policy handles pre-claim failures without producing a zero-attempt limit', () => {

@@ -76,6 +76,7 @@ test('activity groups every Run and token into the stable M1 source taxonomy', a
       ['routine', 'attention:routine', 'owner', 'scheduled'],
       ['eval', 'eval:m1', 'system', 'background'],
       ['unknown', 'system:mystery', 'system', 'background'],
+      ['follow-up', 'mimi:task', 'system', 'conversation'],
     ];
     fixtures.forEach(([id, source, trust, type], index) => completeRun(store, {
       id, source, trust, type, tokens: index + 1, at: new Date(now.getTime() - 60_000 + index),
@@ -83,7 +84,7 @@ test('activity groups every Run and token into the stable M1 source taxonomy', a
 
     const snapshot = store.activitySnapshot(10, now);
     assert.deepEqual(snapshot.runUsageBySource.map((item) => item.category), [
-      'owner_conversation', 'connector', 'health', 'briefing', 'maintenance', 'routine', 'eval', 'unknown',
+      'owner_conversation', 'connector', 'health', 'briefing', 'maintenance', 'routine', 'task_follow_up', 'eval', 'unknown',
     ]);
     for (const item of snapshot.runUsageBySource) {
       assert.equal(item.runs, 1);
@@ -92,6 +93,7 @@ test('activity groups every Run and token into the stable M1 source taxonomy', a
     assert.equal(snapshot.runUsageBySource.find((item) => item.category === 'owner_conversation')?.totalTokens, 2);
     assert.equal(snapshot.runUsageBySource.find((item) => item.category === 'unknown')?.totalTokens, 9);
     assert.equal(snapshot.unknownRunSources, 1);
+    assert.equal(store.healthSnapshot(now).unknownRunSources, snapshot.unknownRunSources);
     const health = buildDaemonHealth({
       tasks: snapshot.tasks,
       outbox: snapshot.outbox,

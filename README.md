@@ -44,6 +44,7 @@ MimiAgent 不是一次性工具调用样例，也不想变成重量级工作流�
 - MCP 工具、Resources、连接容错、状态检查与热重载
 - SQLite FTS5/BM25 + `sqlite-vec` vec0 + RRF 混合检索；Vec、Embedding 或 reindex 异常时自动回退词法通道
 - 多步骤 Plan，以及跨重启 Goal、Checkpoint 与 `/resume`
+- 跨会话查询对话、后台及定时任务结果，复用已有文件；中断检查点保留有界工具进度
 - 所有执行型任务的 Completion Contract 与 Host 终态门控，按真实工具回执、产物、测试和 Plan 状态验收
 - 通用 / Plan / Ultra Team 三种有真实工具边界的运行模式
 - 单层 SubAgent 与持久 Team task list，支持依赖、原子领取和最多 4 路并行
@@ -411,6 +412,10 @@ Full Owner 在本机发现兼容 Cua Driver 时自动启用 Computer Use，也�
 
 ## 会话与上下文
 
+模型可用 `task_history` 分页查询本人已保留的对话、后台和定时任务结果，并检查历史工具报告的文件路径。它不会自动载入其他会话全文，也不把“任务 completed”或“没查到文件”分别当作交付成功或重新生成的指令。普通聊天接续会提供上一轮未完成的工具进度，由大模型判断是否相关；显式恢复仍使用原有检查点和执行账本。
+
+原生 `speech` 支持持久音频 ID、已有音频绝对路径播放和生成状态查询。重启或换会话不会丢失新生成音频的 ID；相同文本、音色及渲染配置复用同一生成记录。超时返回原操作 ID 和未确认状态，不自行换引擎生成副本。受管命令的子进程组会被清理，但独立后台服务不一定随客户端结束；没有后台完成回执时仍需核查，不能把文件刚出现当作整段合成已完成。旧版只有内存记录的 ID 不会凭空恢复，仍可通过已有可访问音频文件定位结果。
+
 默认 `mimi` 连接常驻 MimiAgent 后展示一个仅存在于当前 CLI 内存中的新对话草稿，不读取旧对话，也不创建 Session 文件。第一条普通消息被后台接受后，草稿 ID 才成为真实 Session；在此之前执行 `/exit`，或用 `/sessions`、`/switch` 进入已有 Session，都不会留下空会话。全部内置命令通过本地 Socket 读写同一个 Kernel；`/new` 重新准备一个草稿，`/switch` 只选择已存在的 Session actor，不创建第二个控制面。`/exit` 只关闭终端，Esc 会请求后台安全取消当前 Task；若外部 Tool 正在执行，会先等待其结果落账再结束，不把不确定事务当作可重放失败。
 
 一个 `MIMI_DAEMON_DATA_DIR` 对应一个常驻 Kernel 控制面，但一个 Kernel 可以承载多个项目工作区。工作区只由可信 Host 的结构化绝对目录选择：当前 CLI Event 携带的启动目录优先，其次是 Session 已绑定目录，最后是 Runtime 默认目录。MimiAgent 不从自然语言中抽取项目名、绝对路径片段、“新建”或“继续”意图，不搜索候选仓库，也不自动创建 `~/MimiWorkspace` 目录；无效结构化目录会直接失败关闭。当前仓库中的分析以及随任务创建的文档、报告和脚本都留在选定工作区。`MIMI_SESSION`（兼容 `AGENT_SESSION`）会选择 CLI 首次连接的 Session；未设置时使用稳定 Owner Session。
@@ -472,7 +477,7 @@ Task 与 RuntimeAction 的完成过程写入只含摘要和 phase 的 Run Commit
 
 默认 CLI 交互不会阻塞输入：MimiAgent 执行时仍可继续提交消息。当前窗口指向同一 Session 的普通 `Enter` 消息进入 FIFO 队列并依次执行；发现当前方向有误时可用 `Command+Enter` 立即发送新指引，后台会先持久化新 Event，再在外部 Tool 的安全边界结束旧 Run 并按新方向继续。Apple Terminal 默认不会把 Command 修饰键传给 TTY，需要在当前 Profile 的 `Keyboard` 设置中把 `Command+Return` 映射为 `ESC+Return`；MimiAgent 会在 readline 拆分按键前识别这组字节以及兼容终端的 CSI-u 序列。另一个窗口选择不同 Session 后，可在 `MIMI_SESSION_MAX_CONCURRENCY` 限制内同时运行，不必等待前一个 Session 结束。输入框支持多行编辑：`Shift+Enter` 插入换行，`Command+←/→` 跳到当前行首/行尾；终端 bracketed paste 中自带的换行只会进入编辑区，不会触发提交。长文本只渲染光标附近的有界视窗并标注隐藏行数，发送时仍提交完整内容，避免粘贴大段文本时反复刷新整个终端；Apple Terminal 上使用不会产生物理软换行的单行视窗，并关闭可能撞入输入法 marked-text 生命周期的自主动画重绘。草稿非空时到达的并发回答会暂存到内存，在 `Enter` 提交或草稿清空后的安全点按原顺序显示，完整长文本和多行输入都不会丢失。按 `Esc` 会请求后台在外部 Tool 的安全边界取消当前 Event，队列中的后续消息不受影响。长程或多阶段任务通过 `update_plan` 建立阶段任务，当前会话的完成数、当前步骤和最多 5 条附近任务会实时显示在输入框上方；长描述保持单行省略，全部完成后任务面板会自动消失。普通 Run 若仍拥有 `running`、`pending` 或 `failed` 的 Plan 步骤，Host 会拒绝把该 Run 标记为完成。输入 `/` 会展示命令面板，使用黑色活动光标配合 `↑` / `↓` 选择、`Tab` 补全。`/new`、`/clear` 会清理终端并保留项目顶部信息；会话切换则清理当前画面、恢复顶部信息、任务进度并回放目标会话的历史消息。
 
-简单问答、短操作以及你明确要在当前窗口看到结果的任务，会留在 Conversation actor 中流式执行。长程、大型、多阶段、持续等待或你明确无需立即结果的任务，主 MimiAgent 会调用 `delegate_background_task`：任务写入 SQLite 后立即返回 `taskId`，当前对话恢复可用，`TaskProcessSupervisor` 再用独立 Node.js 子进程和独立 Task Session 执行。默认省略 `modelTarget`，由 `background.default` 场景路由选择模型；用户明确指定模型时，`executor: "mimi"` 可携带精确 `{ providerId, modelId }`，worker 会按严格 WorkUnit target 解析并在 Provider 未注册、凭据缺失或能力不兼容时失败关闭，不会把裸 modelId 发给当前 Provider。`executor: "codex"` 是例外，它由 detached runner 启动独立 Codex CLI，不使用 Mimi Provider registry，也不创建 Mimi Plan 或进入 Mimi 的工具调用、重试和验收流程。到期 Schedule 与 Daily Routine 也复用同一 Task lane，而不是占用来源 Conversation。默认 `workspaceAccess=write`，写任务独占工作区；明确声明 `read` 的分析任务使用确定性只读工具，可与其他只读后台任务并行。Task 一旦被接受就不会因 snooze、静默时段或 Attention 预算被转成 Digest；这些设置控制的是新事件是否值得接受，不会吞掉执行队列。Task 内不再递归创建 durable 子任务；大型可拆分任务在同一 worker 内用有界 Ultra Team 汇总。只有 owner conversation root 的 write Task 可执行 Connector action；外部 source-policy work Task 不会看到必然被 Broker 拒绝的 action 工具，但完成结果仍由 Outbox 原路返回。发起 CLI 即使已退出，任务仍继续；完成结果由 Outbox 主动发往原渠道或系统通知。若任务确实缺少必要输入，它会持久化为 `blocked` 并主动问你，补充上下文后从原 Task Session 继续。运行中执行 `/task pause` 会先返回“已请求暂停”，并在当前 Tool 完成后的安全点落成 `paused`；pause/cancel 控制会在回复 CLI 前先写入 SQLite，即使 Kernel 或 worker 随后崩溃，重启恢复也不会继续执行已取消任务，已暂停任务仍保持 `paused`。不要为了“并行”把普通短任务强制后台化；用 `/tasks`、`/task <id>`、`/task pause <id>`、`/task resume <id> [context]` 和 `/task cancel <id>` 管理真正的后台工作。
+简单问答、短操作以及你明确要在当前窗口看到结果的任务，会留在 Conversation actor 中流式执行。长程、大型、多阶段、持续等待或你明确无需立即结果的任务，主 MimiAgent 会调用 `delegate_background_task`：任务写入 SQLite 后立即返回 `taskId`，当前对话恢复可用，`TaskProcessSupervisor` 再用独立 Node.js 子进程和独立 Task Session 执行。默认省略 `modelTarget`，由 `background.default` 场景路由选择模型；用户明确指定模型时，`executor: "mimi"` 可携带精确 `{ providerId, modelId }`，worker 会按严格 WorkUnit target 解析并在 Provider 未注册、凭据缺失或能力不兼容时失败关闭，不会把裸 modelId 发给当前 Provider。`executor: "codex"` 是例外，它由 detached runner 启动独立 Codex CLI，不使用 Mimi Provider registry，也不创建 Mimi Plan 或进入 Mimi 的工具调用和重试流程；新任务完成后会唤醒原对话的 Mimi 核查产物、按原目标安排后续检查，再汇报核实结果。到期 Schedule 与 Daily Routine 也复用同一 Task lane，而不是占用来源 Conversation。默认 `workspaceAccess=write`，写任务独占工作区；明确声明 `read` 的分析任务使用确定性只读工具，可与其他只读后台任务并行。Task 一旦被接受就不会因 snooze、静默时段或 Attention 预算被转成 Digest；这些设置控制的是新事件是否值得接受，不会吞掉执行队列。Task 内不再递归创建 durable 子任务；大型可拆分任务在同一 worker 内用有界 Ultra Team 汇总。只有 owner conversation root 的 write Task 可执行 Connector action；外部 source-policy work Task 不会看到必然被 Broker 拒绝的 action 工具，但完成结果仍由 Outbox 原路返回。发起 CLI 即使已退出，任务仍继续；完成结果由 Outbox 主动发往原渠道或系统通知。若任务确实缺少必要输入，它会持久化为 `blocked` 并主动问你，补充上下文后从原 Task Session 继续。运行中执行 `/task pause` 会先返回“已请求暂停”，并在当前 Tool 完成后的安全点落成 `paused`；pause/cancel 控制会在回复 CLI 前先写入 SQLite，即使 Kernel 或 worker 随后崩溃，重启恢复也不会继续执行已取消任务，已暂停任务仍保持 `paused`。不要为了“并行”把普通短任务强制后台化；用 `/tasks`、`/task <id>`、`/task pause <id>`、`/task resume <id> [context]` 和 `/task cancel <id>` 管理真正的后台工作。
 
 后台 Task 的自然语言错误只用于说明，不参与重试判断：确定性错误进入 `failed`，明确 transient 只在耗尽重试后进入 `dead_letter`，已经开始且结果 uncertain 的副作用直接进入 `dead_letter` 等待人工核对；只有 Owner 或系统显式终止才进入 `cancelled`。
 

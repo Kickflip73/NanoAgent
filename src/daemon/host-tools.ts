@@ -2,6 +2,7 @@ import type { Tool } from '@openai/agents';
 import type { BrowserRunManager } from '../extensions/browser/manager.js';
 import { createBrowserTools } from '../extensions/browser/tools.js';
 import { createMimiActivityTools } from './activity-tools.js';
+import { createTaskHistoryTools } from './task-history-tools.js';
 import { AttentionEngine } from './attention.js';
 import { createMimiAttentionRuleTools } from './attention-rule-tools.js';
 import { createMimiBriefingTools } from './briefing-tools.js';
@@ -70,13 +71,14 @@ function browserLifecycleReady(connectors: ConnectorManager | undefined): boolea
 export function createMimiHostTools(context: MimiHostToolContext): Tool[] {
   return [
     ...createMimiActivityTools(context.store),
+    ...createTaskHistoryTools(context.store, context.event, context.task.id),
     ...createMemoryMaintenanceTools(context.store, context.task, context.memoryMaintenance),
     ...createMimiAttentionRuleTools(context.attention),
     ...createMimiBriefingTools(context.attention),
     ...createMimiDeliveryTools(context.task, context.event, context.deliveryControl),
     ...createMimiPeopleTools(context.attention),
     ...createMimiRoutineTools(context.attention),
-    ...createMimiScheduleTools(context.store, context.task, context.event, context.replyRoute, context.sessionId),
+    ...createMimiScheduleTools(context.store, context.task, context.event, context.replyRoute, context.sessionId, context.workspaceRoot),
     ...createMimiSessionActivityTools(context.store, context.sessionId),
     ...createMimiSettingsTools(context.attention),
     ...createMimiSourcePolicyTools(context.attention),

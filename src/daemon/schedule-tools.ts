@@ -2,6 +2,7 @@ import type { Tool } from '@openai/agents';
 import { z } from 'zod';
 import { tool } from '../tool-factory.js';
 import { MimiStore } from './store.js';
+import { scheduleRunPrompt } from './schedule-store.js';
 import type { ImmutableEvent, ReplyRoute, ScheduleRecord, TaskRecord } from './types.js';
 
 const MAX_ENABLED_SCHEDULES = 100;
@@ -30,6 +31,8 @@ function baseSchedule(
   event: ImmutableEvent,
   fallbackRoute?: ReplyRoute,
   activeSessionKey?: string,
+  workspaceRoot?: string,
+  summary?: string,
 ) {
   const authority = conversationAuthority(store, task);
   const objective = task.objective && typeof task.objective === 'object'
@@ -44,6 +47,10 @@ function baseSchedule(
     replyRoute: event.replyRoute ?? fallbackRoute ?? { channel: 'system' },
     trust: authority.trust,
     authorityEventId: authority.id,
+    context: {
+      ...(workspaceRoot ? { workspaceRoot } : {}),
+      ...(summary ? { summary } : {}),
+    },
   };
 }
 
@@ -75,7 +82,7 @@ export function isAuthenticScheduleTask(
     && payload.scheduleId === schedule.id
     && payload.scheduleType === schedule.type
     && payload.name === schedule.name
-    && payload.prompt === schedule.prompt
+    && payload.prompt === scheduleRunPrompt(schedule)
     && payload.objective === schedule.prompt
     && payload.strategy === 'single'
     && payload.workspaceAccess === 'write';
@@ -97,6 +104,7 @@ export function createMimiScheduleTools(
   event: ImmutableEvent,
   fallbackRoute?: ReplyRoute,
   activeSessionKey?: string,
+  workspaceRoot?: string,
 ): Tool[] {
   const followUp = tool({
     name: 'schedule_mimi_follow_up',
@@ -105,8 +113,9 @@ export function createMimiScheduleTools(
       name: z.string().min(1).max(100),
       prompt: z.string().min(1).max(4_000).describe('到点后 MimiAgent 要完成的具体任务，而不只是模糊提醒'),
       runAt: z.string().min(1).max(100).describe('带时区的 ISO 8601 时间，例如 2026-07-15T18:30:00+08:00'),
+      context: z.string().max(8_000).optional().describe('下次接续需要的进展、文件位置、判断依据；不复制整段对话'),
     }),
-    execute: async ({ name, prompt, runAt }) => {
+    execute: async ({ name, prompt, runAt, context }) => {
       assertScheduleCapacity(store);
       const target = Date.parse(runAt);
       const now = Date.now();
@@ -114,7 +123,7 @@ export function createMimiScheduleTools(
       if (target < now + MIN_FOLLOW_UP_DELAY_MS) throw new Error('后续唤醒至少应在 5 秒之后');
       if (target > now + MAX_FOLLOW_UP_DELAY_MS) throw new Error('后续唤醒不能超过 5 年');
       return store.schedules.add({
-        ...baseSchedule(store, task, event, fallbackRoute, activeSessionKey),
+        ...baseSchedule(store, task, event, fallbackRoute, activeSessionKey, workspaceRoot, context),
         name, prompt, type: 'at', value: new Date(target).toISOString(),
         nextRunAt: new Date(target).toISOString(),
       });
@@ -128,12 +137,13 @@ export function createMimiScheduleTools(
       name: z.string().min(1).max(100),
       prompt: z.string().min(1).max(4_000).describe('每次唤醒时要检查、判断和必要时通知的完整任务'),
       everyMinutes: z.number().int().min(MIN_ROUTINE_MINUTES).max(525_600),
+      context: z.string().max(8_000).optional().describe('后续检查需要的当前进展和判断依据'),
     }),
-    execute: async ({ name, prompt, everyMinutes }) => {
+    execute: async ({ name, prompt, everyMinutes, context }) => {
       assertScheduleCapacity(store);
       const interval = everyMinutes * 60_000;
       return store.schedules.add({
-        ...baseSchedule(store, task, event, fallbackRoute, activeSessionKey),
+        ...baseSchedule(store, task, event, fallbackRoute, activeSessionKey, workspaceRoot, context),
         name, prompt, type: 'interval', value: String(interval),
         nextRunAt: new Date(Date.now() + interval).toISOString(),
       });
@@ -148,8 +158,9 @@ export function createMimiScheduleTools(
       check: z.string().min(1).max(1_500).describe('每次唤醒需要检查、判断和可直接执行的具体动作'),
       stopWhen: z.string().min(1).max(1_500).describe('可客观判断的结束条件，例如“收到对方明确回复且没有未处理问题”'),
       everyMinutes: z.number().int().min(MIN_ROUTINE_MINUTES).max(525_600),
+      context: z.string().max(8_000).optional().describe('已有进展、检查位置与判断依据'),
     }),
-    execute: async ({ name, check, stopWhen, everyMinutes }) => {
+    execute: async ({ name, check, stopWhen, everyMinutes, context }) => {
       assertScheduleCapacity(store);
       const interval = everyMinutes * 60_000;
       const prompt = [
@@ -159,7 +170,7 @@ export function createMimiScheduleTools(
         '直接使用可用工具完成能推进的步骤。若结束条件已成立，调用 complete_current_mimi_schedule 停止后续检查并汇报结果；若尚未成立且没有值得 owner 关注的新变化，调用 finish_mimi_silently。',
       ].join('\n');
       return store.schedules.add({
-        ...baseSchedule(store, task, event, fallbackRoute, activeSessionKey),
+        ...baseSchedule(store, task, event, fallbackRoute, activeSessionKey, workspaceRoot, context),
         name, prompt, type: 'watch', value: String(interval),
         nextRunAt: new Date(Date.now() + interval).toISOString(),
       });
